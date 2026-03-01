@@ -10,12 +10,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      # We could use services here, but since the project has its own docker-compose.yml
-      # which builds a custom image for postgres + pgmqtt, it's better to use docker compose.
-      # Docker is already installed on ubuntu-latest runners.
-      pass:
-
     steps:
       - uses: actions/checkout@v4
 
