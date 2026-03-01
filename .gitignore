@@ -1,0 +1,14 @@
+# Build output
+dist/
+
+# Docker install-test staging
+docker/install-artifacts/
+
+# Node / npm
+node_modules/
+tests/integration/node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+.pytest_cache/

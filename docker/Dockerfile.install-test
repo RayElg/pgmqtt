@@ -1,0 +1,38 @@
+# Dockerfile.install-test — Simulate a DBA installing pgmqtt from a pre-built tarball.
+#
+# This image starts from stock Postgres (no Rust, no pgrx) and installs
+# only the compiled extension artifacts.  It proves the tarball is self-contained.
+#
+# Usage:
+#   # First, extract the tarball for the target PG version and arch:
+#   tar xzf dist/pgmqtt-pg16-arm64.tar.gz -C pg-docker/install-artifacts
+#
+#   docker build --build-arg PG_MAJOR=16 --build-arg ARCH=arm64 \
+#       -f pg-docker/Dockerfile.install-test \
+#       -t pgmqtt-install-test-pg16 \
+#       pg-docker
+
+ARG PG_MAJOR=16
+ARG ARCH=amd64
+FROM postgres:${PG_MAJOR}-bookworm
+
+ARG PG_MAJOR=16
+ARG ARCH=amd64
+
+# Copy the pre-built extension artifacts into the Postgres directories
+COPY install-artifacts/pgmqtt-pg${PG_MAJOR}-${ARCH}/lib/pgmqtt.so \
+     /usr/lib/postgresql/${PG_MAJOR}/lib/pgmqtt.so
+COPY install-artifacts/pgmqtt-pg${PG_MAJOR}-${ARCH}/extension/ \
+     /usr/share/postgresql/${PG_MAJOR}/extension/
+
+# Configure PostgreSQL for pgmqtt
+RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample
+
+# Auto-create the extension on first startup
+RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \
+    echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pgmqtt;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
+    chmod +x /docker-entrypoint-initdb.d/01-create-extension.sh

@@ -1,0 +1,321 @@
+//! WebSocket (RFC 6455) transport for MQTT-over-WebSocket (port 9001).
+//!
+//! Provides:
+//!   - `handshake()` — performs the HTTP Upgrade negotiation on a raw TcpStream.
+//!   - `WsStream`    — wraps a TcpStream and implements Read/Write in terms of
+//!                     WebSocket data frames, so the rest of the server can treat
+//!                     it identically to a plain TCP connection.
+//!
+//! Only binary/text data frames and the three control frames (Ping, Pong, Close)
+//! are handled.  All frames from the client are masked (RFC 6455 §5.1);
+//! server-to-client frames are unmasked.
+
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// Opcodes
+const OP_CONT: u8 = 0x0;
+const OP_TEXT: u8 = 0x1;
+const OP_BIN: u8 = 0x2;
+const OP_CLOSE: u8 = 0x8;
+const OP_PING: u8 = 0x9;
+const OP_PONG: u8 = 0xA;
+
+// ── Handshake ─────────────────────────────────────────────────────────────────
+
+/// Read the HTTP Upgrade request from `stream` and send a `101 Switching
+/// Protocols` response.  Returns `Ok(leftover_bytes)` on success, `Err` otherwise.
+///
+/// We intentionally use a hand-rolled parser instead of httparse to avoid
+/// strict token-character validation that rejects valid MQTT-over-WebSocket
+/// clients (e.g. `Connection: Upgrade, keep-alive`).
+pub fn handshake(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    // Accumulate bytes until we see the end-of-headers marker \r\n\r\n.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 1024];
+
+    let header_end_pos = loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed during WebSocket handshake",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Check for end-of-headers
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+
+        // Bail if the request is unreasonably large
+        if buf.len() > 16_384 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket Upgrade request too large",
+            ));
+        }
+    };
+
+    // Any bytes after \r\n\r\n are part of the first WebSocket frame(s).
+    let leftover = buf[header_end_pos..].to_vec();
+
+    // Convert to string — allow lossy UTF-8 so non-ASCII header values don't abort
+    let request = String::from_utf8_lossy(&buf[..header_end_pos]);
+
+    // Extract Sec-WebSocket-Key by scanning header lines
+    let key = request
+        .lines()
+        .find_map(|line| {
+            // Case-insensitive prefix match
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("sec-websocket-key:") {
+                line.find(':').map(|idx| line[idx + 1..].trim().to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket Upgrade missing Sec-WebSocket-Key header",
+            )
+        })?;
+
+    // Compute Sec-WebSocket-Accept = base64(SHA-1(key + magic))
+    let accept = compute_accept(&key);
+
+    // Send 101 response
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\
+         Sec-WebSocket-Protocol: mqtt\r\n\
+         \r\n",
+        accept
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(leftover)
+}
+
+fn compute_accept(key: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.trim().as_bytes());
+    hasher.update(WS_MAGIC.as_bytes());
+    let hash = hasher.finalize();
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash)
+}
+
+// ── WsStream ──────────────────────────────────────────────────────────────────
+
+/// A thin WebSocket framing wrapper around a `TcpStream`.
+///
+/// `Read` returns the payload bytes of incoming data frames (Text or Binary),
+/// stripped of their frame header and unmasked.
+///
+/// `Write` wraps the supplied bytes as a single unmasked Binary data frame.
+pub struct WsStream {
+    inner: TcpStream,
+    /// Leftover unprocessed payload from a previous `read` call.
+    read_buf: Vec<u8>,
+    /// True once a Close frame has been sent or received.
+    closed: bool,
+}
+
+impl WsStream {
+    pub fn new(stream: TcpStream, initial_data: Vec<u8>) -> Self {
+        Self {
+            inner: stream,
+            read_buf: initial_data,
+            closed: false,
+        }
+    }
+
+    /// Borrow the underlying stream (e.g. to set timeouts / non-blocking mode).
+    pub fn get_ref(&self) -> &TcpStream {
+        &self.inner
+    }
+
+    #[allow(dead_code)]
+    pub fn get_mut(&mut self) -> &mut TcpStream {
+        &mut self.inner
+    }
+
+    // ── Frame reader ──────────────────────────────────────────────────────────
+
+    /// Read exactly `n` bytes from the inner stream into `dst`.
+    fn read_exact_inner(&mut self, dst: &mut [u8]) -> io::Result<()> {
+        let mut pos = 0;
+        while pos < dst.len() {
+            match self.inner.read(&mut dst[pos..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ws eof")),
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && pos == 0 => {
+                    return Err(e);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // partial read — keep going (blocking for the rest is fine
+                    // because we know there should be more bytes coming)
+                    std::thread::yield_now();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read one complete WebSocket frame and return `(opcode, payload)`.
+    /// Control frames (Ping/Pong/Close) are handled inline; data frames are
+    /// returned to the caller.
+    fn read_frame(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        loop {
+            // ── Fixed 2-byte header ───────────────────────────────────────────
+            let mut hdr = [0u8; 2];
+            self.read_exact_inner(&mut hdr)?;
+
+            let _fin = (hdr[0] & 0x80) != 0;
+            let opcode = hdr[0] & 0x0F;
+            let masked = (hdr[1] & 0x80) != 0;
+            let len7 = (hdr[1] & 0x7F) as usize;
+
+            // ── Extended payload length ───────────────────────────────────────
+            let payload_len: usize = match len7 {
+                126 => {
+                    let mut ext = [0u8; 2];
+                    self.read_exact_inner(&mut ext)?;
+                    u16::from_be_bytes(ext) as usize
+                }
+                127 => {
+                    let mut ext = [0u8; 8];
+                    self.read_exact_inner(&mut ext)?;
+                    u64::from_be_bytes(ext) as usize
+                }
+                n => n,
+            };
+
+            // ── Masking key ───────────────────────────────────────────────────
+            let mask = if masked {
+                let mut m = [0u8; 4];
+                self.read_exact_inner(&mut m)?;
+                Some(m)
+            } else {
+                None
+            };
+
+            // ── Payload ───────────────────────────────────────────────────────
+            let mut payload = vec![0u8; payload_len];
+            if payload_len > 0 {
+                self.read_exact_inner(&mut payload)?;
+            }
+            if let Some(mask) = mask {
+                for (i, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mask[i % 4];
+                }
+            }
+
+            // ── Dispatch by opcode ────────────────────────────────────────────
+            match opcode {
+                OP_TEXT | OP_BIN | OP_CONT => {
+                    return Ok((opcode, payload));
+                }
+                OP_PING => {
+                    // Respond with Pong carrying the same payload
+                    self.write_frame(OP_PONG, &payload)?;
+                }
+                OP_PONG => {
+                    // Unsolicited pong — ignore
+                }
+                OP_CLOSE => {
+                    // Echo close frame and signal EOF
+                    if !self.closed {
+                        self.closed = true;
+                        let _ = self.write_frame(OP_CLOSE, &payload);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ws close"));
+                }
+                _ => {
+                    // Unknown opcode — treat as EOF
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown ws opcode 0x{:02x}", opcode),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Frame writer ──────────────────────────────────────────────────────────
+
+    /// Write a single unmasked WebSocket frame with the given opcode.
+    fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        let mut frame = Vec::with_capacity(10 + payload.len());
+
+        // FIN + opcode
+        frame.push(0x80 | opcode);
+
+        // Payload length (server→client frames are always unmasked)
+        let len = payload.len();
+        if len < 126 {
+            frame.push(len as u8);
+        } else if len < 65536 {
+            frame.push(126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+
+        frame.extend_from_slice(payload);
+        self.inner.write_all(&frame)
+    }
+}
+
+// ── std::io::Read / Write impls ───────────────────────────────────────────────
+
+impl Read for WsStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // If we have leftover bytes from a previous frame, drain them first.
+        if !self.read_buf.is_empty() {
+            let n = buf.len().min(self.read_buf.len());
+            buf[..n].copy_from_slice(&self.read_buf[..n]);
+            self.read_buf.drain(..n);
+            return Ok(n);
+        }
+
+        if self.closed {
+            return Ok(0);
+        }
+
+        // Read the next frame
+        let (_opcode, payload) = self.read_frame()?;
+
+        if payload.is_empty() {
+            return Ok(0);
+        }
+
+        let n = buf.len().min(payload.len());
+        buf[..n].copy_from_slice(&payload[..n]);
+        if payload.len() > n {
+            self.read_buf.extend_from_slice(&payload[n..]);
+        }
+        Ok(n)
+    }
+}
+
+impl Write for WsStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_frame(OP_BIN, buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}

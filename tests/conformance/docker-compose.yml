@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mosquitto_conformance
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  emqx:
+    image: emqx/emqx:5.4
+    container_name: emqx_conformance
+    ports:
+      - "1884:1883"        # MQTT port (mapped to 1884 on host)
+      - "18083:18083"      # Dashboard
+    environment:
+      - EMQX_LISTENER__TCP__EXTERNAL=1883
+      - EMQX_ALLOW_ANONYMOUS=true
+
+  hivemq:
+    image: hivemq/hivemq-ce:2024.3
+    container_name: hivemq_conformance
+    ports:
+      - "1885:1883"        # MQTT port (mapped to 1885 on host)

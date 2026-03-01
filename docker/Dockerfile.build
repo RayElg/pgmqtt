@@ -1,0 +1,57 @@
+#!/usr/bin/env docker build
+# Dockerfile.build — Compile and package the pgmqtt extension for a given PG version.
+#
+# Usage:
+#   docker build --build-arg PG_MAJOR=16 -f pg-docker/Dockerfile.build -t pgmqtt-builder-pg16 .
+#
+# The built artifacts are placed in /dist and can be extracted with:
+#   docker cp <container>:/dist ./dist-pg16
+
+FROM rust:bookworm AS builder
+
+ARG PG_MAJOR=16
+
+# Install PostgreSQL dev headers for the target version
+RUN apt-get update && apt-get install -y \
+    lsb-release \
+    wget \
+    gnupg \
+    && sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' \
+    && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+    && apt-get update \
+    && apt-get install -y \
+    clang \
+    gcc \
+    libclang-dev \
+    postgresql-server-dev-${PG_MAJOR} \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-pgrx (must match Cargo.toml version)
+RUN cargo install --locked cargo-pgrx --version 0.16.1
+
+# Initialize pgrx for the target PG version using the system installation
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+
+# Copy in the extension source
+WORKDIR /usr/src/extension
+COPY extension ./extension
+
+# Build the packaged extension
+WORKDIR /usr/src/extension/extension
+RUN cargo pgrx package --no-default-features --features pg${PG_MAJOR} \
+        --pg-config /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+
+# Collect artifacts into a flat /dist directory
+RUN mkdir -p /dist/lib /dist/extension \
+    && cp target/release/pgmqtt-pg${PG_MAJOR}/usr/lib/postgresql/${PG_MAJOR}/lib/pgmqtt.so \
+       /dist/lib/ \
+    && cp target/release/pgmqtt-pg${PG_MAJOR}/usr/share/postgresql/${PG_MAJOR}/extension/pgmqtt.control \
+       /dist/extension/ \
+    && cp target/release/pgmqtt-pg${PG_MAJOR}/usr/share/postgresql/${PG_MAJOR}/extension/pgmqtt--*.sql \
+       /dist/extension/
+
+# Final stage — just the artifacts
+FROM scratch
+COPY --from=builder /dist /dist

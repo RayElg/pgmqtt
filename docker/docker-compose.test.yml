@@ -1,0 +1,13 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.install-test
+      args:
+        PG_MAJOR: ${PG_MAJOR:-16}
+    ports:
+      - "5432:5432"
+      - "8080:8080"
+      - "1883:1883"
+    environment:
+      POSTGRES_PASSWORD: postgres
