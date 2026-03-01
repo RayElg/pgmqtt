@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pgmqtt - Machine Page</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <span class="accent">pg</span>mqtt - Machine Page
+            </div>
+            <div class="status-badge" id="conn-status">
+                <span class="dot red"></span>
+                <span class="text">DISCONNECTED</span>
+            </div>
+        </header>
+
+        <main>
+            <section class="dashboard">
+                <h1>Machine Vitals <span class="sub">Live CDC Stream</span></h1>
+
+                <div class="machine-grid" id="machine-grid">
+                    <!-- Machine cards will be injected here -->
+                    <div class="machine-card placeholder">
+                        <div class="loader"></div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="event-feed">
+                <h2>MQTT Event Stream</h2>
+                <div class="feed-container" id="event-feed">
+                    <div class="feed-entry system">Waiting for connection...</div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Powered by <strong>PostgreSQL</strong> + <strong>pgmqtt</strong> Extension</p>
+        </footer>
+    </div>
+    <script type="module" src="/main.js"></script>
+</body>
+
+</html>
