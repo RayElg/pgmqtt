@@ -1,0 +1,12 @@
+{
+  "name": "pgmqtt-demo-services",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "pg": "^8.11.3",
+    "ws": "^8.16.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
