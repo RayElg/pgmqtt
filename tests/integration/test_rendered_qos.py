@@ -4,15 +4,12 @@ import time
 import sys
 import os
 import subprocess
+import test_utils
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 
-def run_psql(cmd):
-    return subprocess.check_output([
-        "docker", "exec", "pgmqtt-postgres-1", 
-        "psql", "-U", "postgres", "-c", cmd
-    ]).decode()
+from test_utils import run_sql
 
 def encode_variable_byte_int(value):
     out = bytearray()
@@ -85,9 +82,9 @@ def parse_publish(body):
 def test_rendered_qos():
     # 1. Setup mappings
     print("Setting up mappings for QOS 0 and QOS 1 tests...")
-    run_psql("DROP TABLE IF EXISTS qos_test_table;")
-    run_psql("CREATE TABLE qos_test_table (id serial primary key, name text, val text);")
-    run_psql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 0);") # Mapping 0: QOS 0
+    run_sql("DROP TABLE IF EXISTS qos_test_table;")
+    run_sql("CREATE TABLE qos_test_table (id serial primary key, name text, val text);")
+    run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 0);") # Mapping 0: QOS 0
     
     # Connect subscriber
     print("Connecting subscriber with QOS 1 subscription...")
@@ -100,7 +97,7 @@ def test_rendered_qos():
 
     # Test Rendered QOS 0
     print("Testing Rendered QOS 0...")
-    run_psql("INSERT INTO qos_test_table (name, val) VALUES ('qos0', 'message0');")
+    run_sql("INSERT INTO qos_test_table (name, val) VALUES ('qos0', 'message0');")
     res = recv_packet(s, timeout=5.0)
     if res:
         header, body = res
@@ -118,10 +115,10 @@ def test_rendered_qos():
 
     # Re-configure mapping for QOS 1
     print("Updating mapping to QOS 1...")
-    run_psql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 1);")
+    run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 1);")
     
     print("Testing Rendered QOS 1...")
-    run_psql("INSERT INTO qos_test_table (name, val) VALUES ('qos1', 'message1');")
+    run_sql("INSERT INTO qos_test_table (name, val) VALUES ('qos1', 'message1');")
     res = recv_packet(s, timeout=5.0)
     if res:
         header, body = res

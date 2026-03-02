@@ -24,7 +24,7 @@ const mqtt = require('mqtt');
 const { execSync } = require('child_process');
 
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:9001';
-const PG_CONTAINER = process.env.PG_CONTAINER || 'pgmqtt-postgres-1';
+const PG_CONTAINER = process.env.PG_CONTAINER || 'postgres';
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '8000', 10);
 
 const TABLE = 'ws_test_table';
@@ -38,7 +38,7 @@ let exitCode = 0;
 function psql(sql) {
     if (!PG_CONTAINER) return;
     execSync(
-        `docker exec ${PG_CONTAINER} psql -U postgres -d postgres -c "${sql.replace(/"/g, '\\"')}"`,
+        `docker-compose exec -T ${PG_CONTAINER} psql -U postgres -d postgres -c "${sql.replace(/"/g, '\\"')}"`,
         { stdio: 'pipe' }
     );
 }
