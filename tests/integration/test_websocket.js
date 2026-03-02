@@ -38,7 +38,7 @@ let exitCode = 0;
 function psql(sql) {
     if (!PG_CONTAINER) return;
     execSync(
-        `docker-compose exec -T ${PG_CONTAINER} psql -U postgres -d postgres -c "${sql.replace(/"/g, '\\"')}"`,
+        `docker compose exec -T ${PG_CONTAINER} psql -U postgres -d postgres -c "${sql.replace(/"/g, '\\"')}"`,
         { stdio: 'pipe' }
     );
 }
