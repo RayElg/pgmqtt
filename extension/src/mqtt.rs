@@ -230,6 +230,14 @@ pub fn packet_len(buf: &[u8]) -> Result<usize> {
 // Parsed inbound packets
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub struct Will {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ConnectPacket {
@@ -237,6 +245,7 @@ pub struct ConnectPacket {
     pub clean_start: bool,
     pub keep_alive: u16,
     pub protocol_version: u8,
+    pub will: Option<Will>,
 }
 
 #[derive(Debug)]
@@ -270,7 +279,7 @@ pub enum InboundPacket {
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
     Pingreq,
-    Disconnect,
+    Disconnect(u8),
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +302,7 @@ pub fn parse_packet(buf: &[u8]) -> Result<(InboundPacket, usize)> {
         PacketType::Subscribe => InboundPacket::Subscribe(parse_subscribe(payload)?),
         PacketType::Unsubscribe => InboundPacket::Unsubscribe(parse_unsubscribe(payload)?),
         PacketType::Pingreq => InboundPacket::Pingreq,
-        PacketType::Disconnect => InboundPacket::Disconnect,
+        PacketType::Disconnect => InboundPacket::Disconnect(parse_disconnect(payload)?),
         other => return Err(MqttError::UnsupportedPacket(other as u8)),
     };
 
@@ -339,13 +348,22 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
     let (client_id, new_off) = decode_utf8(buf, off)?;
     off = new_off;
 
-    // Skip will properties + will topic + will payload if present
+    let mut will = None;
     if has_will {
+        // Will Properties
         off = skip_properties(buf, off)?;
-        let (_will_topic, new_off) = decode_utf8(buf, off)?;
+        // Will Topic
+        let (will_topic, new_off) = decode_utf8(buf, off)?;
         off = new_off;
-        let (_will_payload, new_off) = decode_binary(buf, off)?;
+        // Will Payload
+        let (will_payload, new_off) = decode_binary(buf, off)?;
         off = new_off;
+        will = Some(Will {
+            topic: will_topic,
+            payload: will_payload,
+            qos: _will_qos,
+            retain: _will_retain,
+        });
     }
 
     // Skip username/password if present
@@ -362,6 +380,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         clean_start,
         keep_alive,
         protocol_version,
+        will,
     })
 }
 
@@ -463,6 +482,13 @@ fn parse_puback(buf: &[u8]) -> Result<u16> {
     let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
     // MQTT 5.0 PUBACK might have a reason code and properties, but we skip them for current impl
     Ok(packet_id)
+}
+
+fn parse_disconnect(buf: &[u8]) -> Result<u8> {
+    if buf.is_empty() {
+        return Ok(reason::NORMAL_DISCONNECT);
+    }
+    Ok(buf[0])
 }
 
 // ---------------------------------------------------------------------------

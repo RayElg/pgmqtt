@@ -116,14 +116,25 @@ struct MqttClient {
     transport: Transport,
     client_id: String,
     buf: Vec<u8>,
+    will: Option<mqtt::Will>,
+    keep_alive: u16,
+    last_received_at: std::time::Instant,
 }
 
 impl MqttClient {
-    fn new(transport: Transport, client_id: String) -> Self {
+    fn new(
+        transport: Transport,
+        client_id: String,
+        will: Option<mqtt::Will>,
+        keep_alive: u16,
+    ) -> Self {
         Self {
             transport,
             client_id,
             buf: Vec::with_capacity(MAX_REQUEST_BYTES),
+            will,
+            keep_alive,
+            last_received_at: std::time::Instant::now(),
         }
     }
 }
@@ -627,7 +638,10 @@ fn finish_connect(
     let _ = transport.set_nonblocking(true);
 
     log!("pgmqtt mqtt: client '{}' ready for polling", client_id);
-    clients.insert(client_id.clone(), MqttClient::new(transport, client_id));
+    clients.insert(
+        client_id.clone(),
+        MqttClient::new(transport, client_id, packet.will, packet.keep_alive),
+    );
 }
 
 /// Poll all connected clients for incoming MQTT packets.
@@ -653,6 +667,7 @@ fn poll_mqtt_clients(clients: &mut HashMap<String, MqttClient>) {
                     continue;
                 }
                 client.buf.extend_from_slice(&tmp[..n]);
+                client.last_received_at = std::time::Instant::now();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No data available, continue
@@ -703,13 +718,129 @@ fn poll_mqtt_clients(clients: &mut HashMap<String, MqttClient>) {
                 }
             }
         }
+
+        // Check for keep-alive timeout (1.5 * keep_alive)
+        // Occurs *after* reading in pings, so we shouldn't
+        // really need to worry about CPU starvation causing false positives
+        if client.keep_alive > 0 {
+            let timeout = std::time::Duration::from_secs((client.keep_alive as u64 * 3) / 2);
+            // Uses instant -> strictly increasing, shouldn't be broken
+            // By time changing out from underneath us
+            if client.last_received_at.elapsed() > timeout {
+                log!(
+                    "pgmqtt mqtt: client '{}' keep-alive timeout exceeded. Disconnecting.",
+                    client_id
+                );
+                to_remove.push(client_id.clone());
+            }
+        }
     }
 
     // Clean up disconnected clients
     for id in to_remove {
-        // Persistent sessions. We only remove subscriptions if requested via Clean Start
-        // For now, we keep them until restart/re-connect with clean_start=true.
-        clients.remove(&id);
+        if let Some(mut client) = clients.remove(&id) {
+            if let Some(will) = client.will.take() {
+                log!(
+                    "pgmqtt mqtt: client '{}' disconnected unexpectedly, publishing Will",
+                    id
+                );
+                publish_message(
+                    will.topic,
+                    will.payload,
+                    will.qos,
+                    will.retain,
+                    &format!("{} (Will)", id),
+                );
+            }
+        }
+    }
+}
+
+fn publish_message(topic: String, payload: Vec<u8>, qos: u8, retain: bool, log_sender: &str) {
+    let payload_clone = payload.clone();
+    let topic_clone = topic.clone();
+    if qos > 0 || retain {
+        BackgroundWorker::transaction(|| {
+            let result = pgrx::spi::Spi::connect_mut(|client| {
+                let payload_arg = if payload_clone.is_empty() {
+                    None
+                } else {
+                    Some(payload_clone.as_slice())
+                };
+
+                let insert_msg = "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ($1, $2, $3, $4) RETURNING id";
+                let mut msg_id_opt: Option<i64> = None;
+
+                let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
+                    topic_clone.as_str().into(),
+                    payload_arg.into(),
+                    (qos as i32).into(),
+                    retain.into(),
+                ];
+
+                if let Ok(table) = client.update(insert_msg, None, &spi_args) {
+                    for row in table {
+                        if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+                            msg_id_opt = Some(id);
+                        }
+                        break;
+                    }
+                }
+
+                if retain {
+                    if payload_clone.is_empty() {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![topic_clone.as_str().into()];
+                        let _ = client.update(
+                            "DELETE FROM pgmqtt_retained WHERE topic = $1",
+                            None,
+                            &args,
+                        );
+                    } else if let Some(msg_id) = msg_id_opt {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![topic_clone.as_str().into(), msg_id.into()];
+                        let _ = client.update("INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id", None, &args);
+                    }
+                }
+                Ok::<_, pgrx::spi::Error>(msg_id_opt)
+            });
+
+            match result {
+                Ok(msg_id) => {
+                    log!(
+                        "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
+                        log_sender,
+                        topic,
+                        qos
+                    );
+                    topic_buffer::push(topic_buffer::MqttMessage {
+                        id: msg_id,
+                        topic: topic,
+                        payload: payload_clone,
+                        qos: qos,
+                    });
+                }
+                Err(e) => {
+                    log!(
+                        "pgmqtt: error persisting PUBLISH from '{}': {:?}",
+                        log_sender,
+                        e
+                    );
+                }
+            }
+        });
+    } else {
+        log!(
+            "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
+            log_sender,
+            topic
+        );
+        topic_buffer::push(topic_buffer::MqttMessage {
+            id: None,
+            topic: topic,
+            payload: payload_clone,
+            qos: 0,
+        });
     }
 }
 
@@ -785,103 +916,28 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
             let resp = mqtt::build_pingresp();
             transport.write_all(&resp).is_ok()
         }
-        mqtt::InboundPacket::Disconnect => {
-            log!("pgmqtt mqtt: '{}' sent DISCONNECT", client_id);
+        mqtt::InboundPacket::Disconnect(reason_code) => {
+            log!(
+                "pgmqtt mqtt: '{}' sent DISCONNECT (reason_code=0x{:02x})",
+                client_id,
+                reason_code
+            );
+            if reason_code == mqtt::reason::NORMAL_DISCONNECT {
+                client.will = None;
+            }
             false // signal removal
         }
         mqtt::InboundPacket::Publish(pub_pkt) => {
-            let qos = pub_pkt.qos;
-            let retain = pub_pkt.retain;
-            let topic = pub_pkt.topic.clone();
-            let payload_clone = pub_pkt.payload.clone();
-            let packet_id = pub_pkt.packet_id;
+            publish_message(
+                pub_pkt.topic,
+                pub_pkt.payload,
+                pub_pkt.qos,
+                pub_pkt.retain,
+                &client_id,
+            );
 
-            if qos > 0 || retain {
-                BackgroundWorker::transaction(|| {
-                    let result = pgrx::spi::Spi::connect_mut(|client| {
-                        let payload_arg = if payload_clone.is_empty() {
-                            None
-                        } else {
-                            Some(payload_clone.as_slice())
-                        };
-
-                        let insert_msg = "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ($1, $2, $3, $4) RETURNING id";
-                        let mut msg_id_opt: Option<i64> = None;
-
-                        let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
-                            topic.as_str().into(),
-                            payload_arg.into(),
-                            (qos as i32).into(),
-                            retain.into(),
-                        ];
-
-                        if let Ok(table) = client.update(insert_msg, None, &spi_args) {
-                            for row in table {
-                                if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
-                                    msg_id_opt = Some(id);
-                                }
-                                break;
-                            }
-                        }
-
-                        if retain {
-                            if payload_clone.is_empty() {
-                                let args: Vec<pgrx::datum::DatumWithOid> =
-                                    vec![topic.as_str().into()];
-                                let _ = client.update(
-                                    "DELETE FROM pgmqtt_retained WHERE topic = $1",
-                                    None,
-                                    &args,
-                                );
-                            } else if let Some(msg_id) = msg_id_opt {
-                                let args: Vec<pgrx::datum::DatumWithOid> =
-                                    vec![topic.as_str().into(), msg_id.into()];
-                                let _ = client.update("INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id", None, &args);
-                            }
-                        }
-                        Ok::<_, pgrx::spi::Error>(msg_id_opt)
-                    });
-
-                    match result {
-                        Ok(msg_id) => {
-                            log!(
-                                "pgmqtt mqtt: pushing message from '{}' to topic '{}' with qos={}",
-                                client_id,
-                                topic,
-                                qos
-                            );
-                            topic_buffer::push(topic_buffer::MqttMessage {
-                                id: msg_id,
-                                topic: topic,
-                                payload: payload_clone,
-                                qos: qos,
-                            });
-                        }
-                        Err(e) => {
-                            log!(
-                                "pgmqtt mqtt: error persisting PUBLISH from '{}': {:?}",
-                                client_id,
-                                e
-                            );
-                        }
-                    }
-                });
-            } else {
-                log!(
-                    "pgmqtt mqtt: pushing transient message from '{}' to topic '{}' with qos=0",
-                    client_id,
-                    topic
-                );
-                topic_buffer::push(topic_buffer::MqttMessage {
-                    id: None,
-                    topic: topic,
-                    payload: payload_clone,
-                    qos: 0,
-                });
-            }
-
-            if qos == 1 {
-                if let Some(pid) = packet_id {
+            if pub_pkt.qos == 1 {
+                if let Some(pid) = pub_pkt.packet_id {
                     let puback = mqtt::build_puback(pid);
                     let _ = transport.write_all(&puback);
                 }
