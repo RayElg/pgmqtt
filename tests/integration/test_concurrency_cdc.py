@@ -102,19 +102,15 @@ def recv_packet_blocking(sock):
 
 # ── SQL Helpers ──────────────────────────────────────────────────────────────
 
-def run_psql(sql):
-    subprocess.run(
-        ["docker", "exec", "pgmqtt-postgres-1", "psql", "-U", "postgres", "-d", "postgres", "-c", sql],
-        check=True, capture_output=True
-    )
+from test_utils import run_sql
 
 def setup_db():
     print("  [DB] Setting up table 'load_test'...")
-    run_psql("DROP TABLE IF EXISTS load_test;")
-    run_psql("CREATE TABLE load_test (id serial PRIMARY KEY, val int);")
-    run_psql("ALTER TABLE load_test REPLICA IDENTITY FULL;")
+    run_sql("DROP TABLE IF EXISTS load_test;")
+    run_sql("CREATE TABLE load_test (id serial PRIMARY KEY, val int);")
+    run_sql("ALTER TABLE load_test REPLICA IDENTITY FULL;")
     # Map: load/test/{{val}}
-    run_psql("SELECT pgmqtt_add_mapping('public', 'load_test', 'load/test/{{columns.val}}', '{\"val\": {{columns.val}}}');")
+    run_sql("SELECT pgmqtt_add_mapping('public', 'load_test', 'load/test/{{columns.val}}', '{\"val\": {{columns.val}}}');")
 
 def generate_load():
     print(f"  [DB] Generating {NUM_MESSAGES} messages in batches of {BATCH_SIZE}...")
@@ -125,7 +121,7 @@ def generate_load():
         end = sent + count
         # INSERT INTO load_test (val) SELECT generate_series(start, end)
         # Note: Using simple INSERT here.
-        run_psql(f"INSERT INTO load_test (val) SELECT generate_series({start}, {end});")
+        run_sql(f"INSERT INTO load_test (val) SELECT generate_series({start}, {end});")
         sent += count
         time.sleep(0.5) # Give DB/CDC worker a slight break
     print("  [DB] Load generation complete.")

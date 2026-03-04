@@ -22,28 +22,18 @@ from proto_utils import (
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-PG_CONTAINER = "pgmqtt-postgres-1"
+from test_utils import run_sql
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def psql(sql):
-    """Run SQL inside the pgmqtt container."""
-    result = subprocess.run(
-        ["docker", "exec", PG_CONTAINER, "psql", "-U", "postgres", "-d", "postgres", "-c", sql],
-        capture_output=True, text=True, timeout=10
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"psql failed: {result.stderr.strip()}")
-    return result.stdout
-
 def setup_table_and_mapping(table_name, topic_pattern):
-    psql(f"DROP TABLE IF EXISTS {table_name};")
-    psql(f"CREATE TABLE {table_name} (id serial PRIMARY KEY, data text);")
-    psql(f"ALTER TABLE {table_name} REPLICA IDENTITY FULL;")
-    psql(f"SELECT pgmqtt_add_mapping('public', '{table_name}', '{topic_pattern}', 'payload');")
+    run_sql(f"DROP TABLE IF EXISTS {table_name};")
+    run_sql(f"CREATE TABLE {table_name} (id serial PRIMARY KEY, data text);")
+    run_sql(f"ALTER TABLE {table_name} REPLICA IDENTITY FULL;")
+    run_sql(f"SELECT pgmqtt_add_mapping('public', '{table_name}', '{topic_pattern}', 'payload');")
 
 def cdc_publish(table_name, data):
-    psql(f"INSERT INTO {table_name} (data) VALUES ('{data}');")
+    run_sql(f"INSERT INTO {table_name} (data) VALUES ('{data}');")
     time.sleep(0.5) # Give CDC worker a moment
 
 # ── Tests ────────────────────────────────────────────────────────────────────
