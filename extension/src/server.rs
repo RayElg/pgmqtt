@@ -9,8 +9,11 @@ use pgrx::log;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
+
+static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the BGW latch wakes to poll for connections.
 const LATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -590,7 +593,8 @@ fn finish_connect(
     clients: &mut HashMap<String, MqttClient>,
 ) {
     let client_id = if packet.client_id.is_empty() {
-        format!("pgmqtt-auto-{}", clients.len())
+        let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("pgmqtt-auto-{}", id)
     } else {
         packet.client_id.clone()
     };
