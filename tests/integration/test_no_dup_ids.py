@@ -5,9 +5,6 @@ import time
 import os
 import concurrent.futures
 
-# Add integration tests to path to import proto_utils
-sys.path.append(os.path.join(os.path.dirname(__file__), 'integration'))
-
 from proto_utils import (
     create_connect_packet,
     recv_packet,
