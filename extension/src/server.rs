@@ -6,7 +6,7 @@ use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,6 +88,12 @@ struct MqttSession {
     next_packet_id: u16,
     /// Outgoing packet_id → (topic, payload, msg_id, sent_at)
     inflight: HashMap<u16, (String, Vec<u8>, Option<i64>, std::time::Instant)>,
+    /// Messages waiting to be promoted into inflight once a slot opens up.
+    queue: VecDeque<topic_buffer::MqttMessage>,
+    /// MQTT 5.0 Session Expiry Interval in seconds. 0 = end at disconnect.
+    expiry_interval: u32,
+    /// Set when the client disconnects (used by the session sweeper).
+    disconnected_at: Option<std::time::Instant>,
 }
 
 impl MqttSession {
@@ -95,6 +101,9 @@ impl MqttSession {
         Self {
             next_packet_id: 1,
             inflight: HashMap::new(),
+            queue: VecDeque::new(),
+            expiry_interval: 0,
+            disconnected_at: None,
         }
     }
 }
@@ -314,6 +323,9 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
 
         // Periodically resend unacked QoS 1 messages
         redeliver_unacked_messages(&mut clients);
+
+        // Sweep sessions whose Session Expiry Interval has elapsed
+        sweep_expired_sessions();
     }
 
     // Clean up
@@ -620,12 +632,24 @@ fn finish_connect(
         });
     }
 
-    let session_present = with_sessions(|s| s.contains_key(&client_id));
-    if !session_present {
-        with_sessions(|s| {
-            s.insert(client_id.clone(), MqttSession::new());
-        });
-    }
+    let session_present = with_sessions(|s| {
+        // Treat a session as "not present" if it had already expired
+        if let Some(sess) = s.get(&client_id) {
+            if sess.expiry_interval == 0 {
+                return false; // zero = session ended at disconnect
+            }
+            true
+        } else {
+            false
+        }
+    });
+    with_sessions(|s| {
+        let sess = s.entry(client_id.clone()).or_insert_with(MqttSession::new);
+        // Stamp the new expiry interval from the fresh CONNECT
+        sess.expiry_interval = packet.session_expiry_interval;
+        // Clear the disconnected timestamp since the client is reconnecting
+        sess.disconnected_at = None;
+    });
 
     // Send CONNACK with success
     let connack = mqtt::build_connack(session_present, mqtt::reason::SUCCESS);
@@ -636,12 +660,70 @@ fn finish_connect(
 
     // Set non-blocking for ongoing reads
     let _ = transport.set_nonblocking(true);
-
     log!("pgmqtt mqtt: client '{}' ready for polling", client_id);
     clients.insert(
         client_id.clone(),
-        MqttClient::new(transport, client_id, packet.will, packet.keep_alive),
+        MqttClient::new(transport, client_id.clone(), packet.will, packet.keep_alive),
     );
+
+    // ── Session resumption: redeliver inflight + drain queue ─────────────────
+    // MQTT 5.0 §4.4: The broker MUST retransmit all unacknowledged PUBLISH
+    // packets (with DUP=1) and deliver any queued messages after a reconnect
+    // with session_present=true.
+    if session_present {
+        // Collect what needs to be sent while holding the session lock.
+        let to_send: Vec<Vec<u8>> = with_sessions(|sessions| {
+            let mut pkts = Vec::new();
+            if let Some(session) = sessions.get_mut(&client_id) {
+                // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
+                for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
+                    pkts.push(mqtt::build_publish_qos1_dup(topic, payload, *pid));
+                    // Reset the timer so redeliver_unacked_messages doesn't fire immediately.
+                    *sent_at = std::time::Instant::now();
+                }
+                // 2. Drain the pending queue into inflight and add to send list.
+                while session.inflight.len() < MAX_INFLIGHT_MESSAGES {
+                    if let Some(queued) = session.queue.pop_front() {
+                        let pid = session.next_packet_id;
+                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
+                        if session.next_packet_id == 0 {
+                            session.next_packet_id = 1;
+                        }
+                        session.inflight.insert(
+                            pid,
+                            (
+                                queued.topic.clone(),
+                                queued.payload.clone(),
+                                queued.id,
+                                std::time::Instant::now(),
+                            ),
+                        );
+                        pkts.push(mqtt::build_publish_qos1(
+                            &queued.topic,
+                            &queued.payload,
+                            pid,
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+            }
+            pkts
+        });
+
+        if !to_send.is_empty() {
+            log!(
+                "pgmqtt mqtt: resuming session for '{}': redelivering {} packet(s)",
+                client_id,
+                to_send.len()
+            );
+            if let Some(client) = clients.get_mut(&client_id) {
+                for pkt in to_send {
+                    let _ = client.transport.write_all(&pkt);
+                }
+            }
+        }
+    }
 }
 
 /// Poll all connected clients for incoming MQTT packets.
@@ -753,6 +835,20 @@ fn poll_mqtt_clients(clients: &mut HashMap<String, MqttClient>) {
                 );
             }
         }
+        // Mark session as disconnected so the sweeper can reap it later.
+        // If expiry_interval == 0 the session should end immediately.
+        with_sessions(|s| {
+            let should_remove = s
+                .get(&id)
+                .map(|sess| sess.expiry_interval == 0)
+                .unwrap_or(false);
+            if should_remove {
+                s.remove(&id);
+                subscriptions::remove_client(&id);
+            } else if let Some(sess) = s.get_mut(&id) {
+                sess.disconnected_at = Some(std::time::Instant::now());
+            }
+        });
     }
 }
 
@@ -871,6 +967,39 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
                     packet_id
                 );
             }
+            // Slot freed — promote next queued message into inflight.
+            let next_pkt = with_sessions(|sessions| {
+                if let Some(session) = sessions.get_mut(&client_id) {
+                    if let Some(queued) = session.queue.pop_front() {
+                        let pid = session.next_packet_id;
+                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
+                        if session.next_packet_id == 0 {
+                            session.next_packet_id = 1;
+                        }
+                        session.inflight.insert(
+                            pid,
+                            (
+                                queued.topic.clone(),
+                                queued.payload.clone(),
+                                queued.id,
+                                std::time::Instant::now(),
+                            ),
+                        );
+                        Some(mqtt::build_publish_qos1(
+                            &queued.topic,
+                            &queued.payload,
+                            pid,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            if let Some(pkt) = next_pkt {
+                let _ = transport.write_all(&pkt);
+            }
             true
         }
         mqtt::InboundPacket::Subscribe(sub) => {
@@ -956,6 +1085,33 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
     }
 }
 
+/// Sweep all sessions whose Session Expiry Interval has elapsed.
+/// Must only be called for sessions whose client is not actively connected.
+fn sweep_expired_sessions() {
+    let now = std::time::Instant::now();
+    let mut expired_ids: Vec<String> = Vec::new();
+    with_sessions(|sessions| {
+        for (id, sess) in sessions.iter() {
+            if let Some(disconnected_at) = sess.disconnected_at {
+                let elapsed = now.duration_since(disconnected_at).as_secs();
+                if elapsed >= sess.expiry_interval as u64 {
+                    expired_ids.push(id.clone());
+                }
+            }
+        }
+        for id in &expired_ids {
+            sessions.remove(id);
+        }
+    });
+    for id in &expired_ids {
+        log!(
+            "pgmqtt mqtt: session for client '{}' expired, cleaning up",
+            id
+        );
+        subscriptions::remove_client(id);
+    }
+}
+
 /// Drain the topic_buffer and publish messages to matching subscribers.
 fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
     let messages = topic_buffer::drain_all();
@@ -982,7 +1138,20 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
                     let delivery_qos = std::cmp::min(msg.qos, *granted_qos);
                     if delivery_qos == 1 {
                         if session.inflight.len() >= MAX_INFLIGHT_MESSAGES {
-                            pgrx::log!("pgmqtt: client '{}' hit max inflight QoS 1 messages ({}), dropping new message.", sub_id, MAX_INFLIGHT_MESSAGES);
+                            // Queue instead of drop to preserve at-least-once semantics.
+                            session.queue.push_back(topic_buffer::MqttMessage {
+                                id: msg.id,
+                                topic: msg.topic.clone(),
+                                payload: msg.payload.clone(),
+                                qos: delivery_qos,
+                            });
+                            if session.queue.len() > 10_000 {
+                                pgrx::log!(
+                                    "pgmqtt: client '{}' queue exceeded 10 000 messages ({}). Consider increasing MAX_INFLIGHT_MESSAGES or investigating client health.",
+                                    sub_id,
+                                    session.queue.len()
+                                );
+                            }
                             None
                         } else {
                             let pid = session.next_packet_id;

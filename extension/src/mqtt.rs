@@ -183,6 +183,84 @@ fn skip_properties(buf: &[u8], offset: usize) -> Result<usize> {
     Ok(end)
 }
 
+/// Parse CONNECT properties, extracting the Session Expiry Interval (0x11).
+/// Returns `(session_expiry_interval, new_offset)`.
+fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
+    if offset >= buf.len() {
+        return Ok((0, offset));
+    }
+    let (prop_len, consumed) = decode_variable_byte_int(&buf[offset..])?;
+    let props_start = offset + consumed;
+    let props_end = props_start + prop_len;
+    if buf.len() < props_end {
+        return Err(MqttError::Incomplete);
+    }
+    let mut session_expiry_interval: u32 = 0;
+    let mut i = props_start;
+    while i < props_end {
+        let prop_id = buf[i];
+        i += 1;
+        match prop_id {
+            0x11 => {
+                // Session Expiry Interval – 4-byte big-endian u32
+                if i + 4 > props_end {
+                    return Err(MqttError::MalformedPacket(
+                        "Session Expiry Interval truncated".into(),
+                    ));
+                }
+                session_expiry_interval =
+                    u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+                i += 4;
+            }
+            0x21 => {
+                // Receive Maximum – 2 bytes, skip
+                i += 2;
+            }
+            0x27 => {
+                // Maximum Packet Size – 4 bytes, skip
+                i += 4;
+            }
+            0x22 => {
+                // Topic Alias Maximum – 2 bytes, skip
+                i += 2;
+            }
+            0x19 => {
+                // Request Response Information – 1 byte, skip
+                i += 1;
+            }
+            0x17 => {
+                // Request Problem Information – 1 byte, skip
+                i += 1;
+            }
+            0x26 => {
+                // User Property – UTF-8 key + value pair
+                let (_, new_off) = decode_utf8(buf, i)?;
+                let (_, new_off) = decode_utf8(buf, new_off)?;
+                i = new_off;
+            }
+            0x15 => {
+                // Authentication Method – UTF-8 string
+                let (_, new_off) = decode_utf8(buf, i)?;
+                i = new_off;
+            }
+            0x16 => {
+                // Authentication Data – binary
+                let (_, new_off) = decode_binary(buf, i)?;
+                i = new_off;
+            }
+            _ => {
+                // Unknown property – we cannot safely skip without knowing the type.
+                // Treat as malformed.
+                return Err(MqttError::MalformedPacket(format!(
+                    "unknown CONNECT property id 0x{:02x}",
+                    prop_id
+                )));
+            }
+        }
+    }
+    Ok((session_expiry_interval, props_end))
+}
+
 fn encode_empty_properties() -> Vec<u8> {
     vec![0x00] // property length = 0
 }
@@ -246,6 +324,9 @@ pub struct ConnectPacket {
     pub keep_alive: u16,
     pub protocol_version: u8,
     pub will: Option<Will>,
+    /// MQTT 5.0 Session Expiry Interval in seconds. 0 means end at disconnect.
+    /// 0xFFFFFFFF means never expire.
+    pub session_expiry_interval: u32,
 }
 
 #[derive(Debug)]
@@ -341,8 +422,9 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
 
     let keep_alive = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
 
-    // Skip CONNECT properties
-    let mut off = skip_properties(buf, off + 4)?;
+    // Parse CONNECT properties (extract Session Expiry Interval)
+    let (session_expiry_interval, new_off) = parse_connect_properties(buf, off + 4)?;
+    let mut off = new_off;
 
     // Client ID
     let (client_id, new_off) = decode_utf8(buf, off)?;
@@ -381,6 +463,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         keep_alive,
         protocol_version,
         will,
+        session_expiry_interval,
     })
 }
 
