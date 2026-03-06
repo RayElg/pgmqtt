@@ -32,3 +32,9 @@ Mappings between PostgreSQL tables and MQTT topics are managed via SQL functions
 ## 7. Performance and Memory Bounds
 - `pgmqtt` utilizes fixed-size in-memory ring buffers for CDC capture before persistence.
 - High-throughput QoS 1 publishing involves database I/O for the `pgmqtt_messages` table, which may impact performance compared to transient QoS 0 delivery.
+
+## 8. Replication and High Availability
+**Primary-Only Execution**: 
+- `pgmqtt` background workers (MQTT broker and CDC consumer) are configured to start only when the PostgreSQL instance is not in recovery mode (i.e., it is a primary node).
+- **Read Replicas**: On read replicas, the background workers remain paused/shipped. No ports (1883, 8080, etc.) will be opened.
+- **Failover/Promotion**: If a replica is promoted to primary (e.g., via `pg_ctl promote`), the background workers will automatically start, initialize the MQTT broker, and resume CDC processing.
