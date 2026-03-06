@@ -185,18 +185,20 @@ fn skip_properties(buf: &[u8], offset: usize) -> Result<usize> {
 
 /// Parse CONNECT properties, extracting the Session Expiry Interval (0x11).
 /// Returns `(session_expiry_interval, new_offset)`.
-fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
-    if offset >= buf.len() {
-        return Ok((0, offset));
+fn parse_connect_properties(buf: &[u8], mut off: usize) -> Result<(Option<u32>, usize)> {
+    if off >= buf.len() {
+        return Ok((None, off));
     }
-    let (prop_len, consumed) = decode_variable_byte_int(&buf[offset..])?;
-    let props_start = offset + consumed;
-    let props_end = props_start + prop_len;
+    let mut session_expiry_interval = None;
+    let (props_len, vbi_len) = decode_variable_byte_int(&buf[off..])?;
+    off += vbi_len;
+
+    let props_end = off + props_len;
     if buf.len() < props_end {
         return Err(MqttError::Incomplete);
     }
-    let mut session_expiry_interval: u32 = 0;
-    let mut i = props_start;
+
+    let mut i = off;
     while i < props_end {
         let prop_id = buf[i];
         i += 1;
@@ -208,8 +210,12 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
                         "Session Expiry Interval truncated".into(),
                     ));
                 }
-                session_expiry_interval =
-                    u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+                session_expiry_interval = Some(u32::from_be_bytes([
+                    buf[i],
+                    buf[i + 1],
+                    buf[i + 2],
+                    buf[i + 3],
+                ]));
                 i += 4;
             }
             0x21 => {
@@ -325,8 +331,8 @@ pub struct ConnectPacket {
     pub protocol_version: u8,
     pub will: Option<Will>,
     /// MQTT 5.0 Session Expiry Interval in seconds. 0 means end at disconnect.
-    /// 0xFFFFFFFF means never expire.
-    pub session_expiry_interval: u32,
+    /// 0xFFFFFFFF means never expire. None if not provided.
+    pub session_expiry_interval: Option<u32>,
 }
 
 #[derive(Debug)]

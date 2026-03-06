@@ -6,7 +6,7 @@ use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,7 +87,7 @@ impl Write for Transport {
 struct MqttSession {
     next_packet_id: u16,
     /// Outgoing packet_id → (topic, payload, msg_id, sent_at)
-    inflight: HashMap<u16, (String, Vec<u8>, Option<i64>, std::time::Instant)>,
+    inflight: BTreeMap<u16, (String, Vec<u8>, Option<i64>, std::time::Instant)>,
     /// Messages waiting to be promoted into inflight once a slot opens up.
     queue: VecDeque<topic_buffer::MqttMessage>,
     /// MQTT 5.0 Session Expiry Interval in seconds. 0 = end at disconnect.
@@ -100,7 +100,7 @@ impl MqttSession {
     fn new() -> Self {
         Self {
             next_packet_id: 1,
-            inflight: HashMap::new(),
+            inflight: BTreeMap::new(),
             queue: VecDeque::new(),
             expiry_interval: 0,
             disconnected_at: None,
@@ -305,6 +305,9 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
 
+    subscriptions::load_from_db();
+    load_sessions_from_db();
+
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt mqtt+cdc: SIGHUP received");
@@ -333,6 +336,114 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
         subscriptions::remove_client(&id);
     }
     log!("pgmqtt mqtt+cdc: shutting down");
+}
+
+fn load_sessions_from_db() {
+    let _ = BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            // Check if tables exist
+            let table_exists = client
+                .select("SELECT to_regclass('pgmqtt_sessions')::text", None, &[])
+                .and_then(|t| Ok(t.first().get_one::<String>()?.is_some()))
+                .unwrap_or(false);
+
+            if !table_exists {
+                return Ok::<_, pgrx::spi::Error>(());
+            }
+
+            // Treat any crashed connections as disconnecting now
+            client.update(
+                "UPDATE pgmqtt_sessions SET disconnected_at = NOW() WHERE disconnected_at IS NULL",
+                None,
+                &[],
+            )?;
+            // Delete mathematically expired sessions
+            client.update(
+                "DELETE FROM pgmqtt_sessions WHERE disconnected_at + (expiry_interval || ' seconds')::interval < NOW()",
+                None,
+                &[],
+            )?;
+
+            // Loop through remaining sessions
+            if let Ok(table) = client.select(
+                "SELECT client_id, expiry_interval FROM pgmqtt_sessions",
+                None,
+                &[],
+            ) {
+                with_sessions(|sessions| {
+                    for row in table {
+                        if let (Ok(Some(client_id)), Ok(Some(expiry))) = (
+                            row.get_by_name::<String, _>("client_id"),
+                            row.get_by_name::<i64, _>("expiry_interval"),
+                        ) {
+                            let mut sess = MqttSession::new();
+                            sess.expiry_interval = expiry as u32;
+                            // Since they were loaded from DB during startup, consider them disconnected right now
+                            sess.disconnected_at = Some(std::time::Instant::now());
+                            sessions.insert(client_id, sess);
+                        }
+                    }
+                });
+            }
+
+            // Now load the offline queue for these sessions
+            if let Ok(table) = client.select(
+                "SELECT q.client_id, q.message_id, q.packet_id, m.topic, m.payload, m.qos \
+                 FROM pgmqtt_session_queue q \
+                 JOIN pgmqtt_messages m ON q.message_id = m.id \
+                 ORDER BY q.message_id ASC",
+                None,
+                &[],
+            ) {
+                with_sessions(|sessions| {
+                    for row in table {
+                        if let (
+                            Ok(Some(client_id)),
+                            Ok(Some(msg_id)),
+                            Ok(packet_id_opt),
+                            Ok(Some(topic)),
+                            Ok(payload_opt),
+                            Ok(Some(qos)),
+                        ) = (
+                            row.get_by_name::<String, _>("client_id"),
+                            row.get_by_name::<i64, _>("message_id"),
+                            row.get_by_name::<i32, _>("packet_id"),
+                            row.get_by_name::<String, _>("topic"),
+                            row.get_by_name::<Vec<u8>, _>("payload"),
+                            row.get_by_name::<i32, _>("qos"),
+                        ) {
+                            if let Some(sess) = sessions.get_mut(&client_id) {
+                                let payload = payload_opt.unwrap_or_default();
+                                if let Some(pid) = packet_id_opt {
+                                    sess.inflight.insert(
+                                        pid as u16,
+                                        (topic, payload, Some(msg_id), std::time::Instant::now()),
+                                    );
+                                } else {
+                                    sess.queue.push_back(topic_buffer::MqttMessage {
+                                        id: Some(msg_id),
+                                        topic,
+                                        payload,
+                                        qos: qos as u8,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Recover next_packet_id
+                    for sess in sessions.values_mut() {
+                        let max_pid = sess.inflight.keys().max().copied().unwrap_or(0);
+                        sess.next_packet_id = max_pid.wrapping_add(1);
+                        if sess.next_packet_id == 0 {
+                            sess.next_packet_id = 1;
+                        }
+                    }
+                });
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        })
+    });
 }
 
 /// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
@@ -693,6 +804,17 @@ fn finish_connect(
 
     // If clean_start, remove any previous session
     if packet.clean_start {
+        let _ = BackgroundWorker::transaction(|| {
+            pgrx::spi::Spi::connect_mut(|client| {
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.as_str().into()];
+                client.update(
+                    "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
+                    None,
+                    &args,
+                )?;
+                Ok::<_, pgrx::spi::Error>(())
+            })
+        });
         subscriptions::remove_client(&client_id);
         with_sessions(|s| {
             s.remove(&client_id);
@@ -710,12 +832,33 @@ fn finish_connect(
             false
         }
     });
-    with_sessions(|s| {
+
+    let expiry = with_sessions(|s| {
         let sess = s.entry(client_id.clone()).or_insert_with(MqttSession::new);
-        // Stamp the new expiry interval from the fresh CONNECT
-        sess.expiry_interval = packet.session_expiry_interval;
+        if let Some(e) = packet.session_expiry_interval {
+            sess.expiry_interval = e;
+        } else if packet.clean_start {
+            sess.expiry_interval = 0;
+        }
         // Clear the disconnected timestamp since the client is reconnecting
         sess.disconnected_at = None;
+        sess.expiry_interval
+    });
+
+    let _ = BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> =
+                vec![client_id.as_str().into(), (expiry as i64).into()];
+            client.update(
+                "INSERT INTO pgmqtt_sessions (client_id, expiry_interval, disconnected_at) \
+                 VALUES ($1, $2, NULL) \
+                 ON CONFLICT (client_id) DO UPDATE \
+                 SET expiry_interval = EXCLUDED.expiry_interval, disconnected_at = NULL",
+                None,
+                &args,
+            )?;
+            Ok::<_, pgrx::spi::Error>(())
+        })
     });
 
     // Send CONNACK with success
@@ -739,8 +882,9 @@ fn finish_connect(
     // with session_present=true.
     if session_present {
         // Collect what needs to be sent while holding the session lock.
-        let to_send: Vec<Vec<u8>> = with_sessions(|sessions| {
+        let (to_send, db_updates) = with_sessions(|sessions| {
             let mut pkts = Vec::new();
+            let mut updates = Vec::new();
             if let Some(session) = sessions.get_mut(&client_id) {
                 // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
                 for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
@@ -765,6 +909,9 @@ fn finish_connect(
                                 std::time::Instant::now(),
                             ),
                         );
+                        if let Some(mid) = queued.id {
+                            updates.push((mid, pid as i32));
+                        }
                         pkts.push(mqtt::build_publish_qos1(
                             &queued.topic,
                             &queued.payload,
@@ -775,8 +922,25 @@ fn finish_connect(
                     }
                 }
             }
-            pkts
+            (pkts, updates)
         });
+
+        if !db_updates.is_empty() {
+            let _ = BackgroundWorker::transaction(|| {
+                pgrx::spi::Spi::connect_mut(|client| {
+                    for (mid, pid) in db_updates {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![pid.into(), client_id.as_str().into(), mid.into()];
+                        client.update(
+                            "UPDATE pgmqtt_session_queue SET packet_id = $1 WHERE client_id = $2 AND message_id = $3",
+                            None,
+                            &args,
+                        )?;
+                    }
+                    Ok::<_, pgrx::spi::Error>(())
+                })
+            });
+        }
 
         if !to_send.is_empty() {
             log!(
@@ -904,18 +1068,46 @@ fn poll_mqtt_clients(clients: &mut HashMap<String, MqttClient>) {
         }
         // Mark session as disconnected so the sweeper can reap it later.
         // If expiry_interval == 0 the session should end immediately.
-        with_sessions(|s| {
-            let should_remove = s
-                .get(&id)
+        let should_remove = with_sessions(|s| {
+            s.get(&id)
                 .map(|sess| sess.expiry_interval == 0)
-                .unwrap_or(false);
-            if should_remove {
-                s.remove(&id);
-                subscriptions::remove_client(&id);
-            } else if let Some(sess) = s.get_mut(&id) {
-                sess.disconnected_at = Some(std::time::Instant::now());
-            }
+                .unwrap_or(false)
         });
+
+        if should_remove {
+            let _ = BackgroundWorker::transaction(|| {
+                pgrx::spi::Spi::connect_mut(|client| {
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![id.as_str().into()];
+                    client.update(
+                        "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
+                        None,
+                        &args,
+                    )?;
+                    Ok::<_, pgrx::spi::Error>(())
+                })
+            });
+            with_sessions(|s| {
+                s.remove(&id);
+            });
+            subscriptions::remove_client(&id);
+        } else {
+            let _ = BackgroundWorker::transaction(|| {
+                pgrx::spi::Spi::connect_mut(|client| {
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![id.as_str().into()];
+                    client.update(
+                        "UPDATE pgmqtt_sessions SET disconnected_at = NOW() WHERE client_id = $1",
+                        None,
+                        &args,
+                    )?;
+                    Ok::<_, pgrx::spi::Error>(())
+                })
+            });
+            with_sessions(|s| {
+                if let Some(sess) = s.get_mut(&id) {
+                    sess.disconnected_at = Some(std::time::Instant::now());
+                }
+            });
+        }
     }
 }
 
@@ -941,28 +1133,31 @@ fn publish_message(topic: String, payload: Vec<u8>, qos: u8, retain: bool, log_s
                     retain.into(),
                 ];
 
-                if let Ok(table) = client.update(insert_msg, None, &spi_args) {
-                    for row in table {
-                        if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
-                            msg_id_opt = Some(id);
-                        }
-                        break;
+                let table = client.update(insert_msg, None, &spi_args)?;
+                for row in table {
+                    if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+                        msg_id_opt = Some(id);
                     }
+                    break;
                 }
 
                 if retain {
                     if payload_clone.is_empty() {
                         let args: Vec<pgrx::datum::DatumWithOid> =
                             vec![topic_clone.as_str().into()];
-                        let _ = client.update(
+                        client.update(
                             "DELETE FROM pgmqtt_retained WHERE topic = $1",
                             None,
                             &args,
-                        );
+                        )?;
                     } else if let Some(msg_id) = msg_id_opt {
                         let args: Vec<pgrx::datum::DatumWithOid> =
                             vec![topic_clone.as_str().into(), msg_id.into()];
-                        let _ = client.update("INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id", None, &args);
+                        client.update(
+                            "INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id", 
+                            None, 
+                            &args
+                        )?;
                     }
                 }
                 Ok::<_, pgrx::spi::Error>(msg_id_opt)
@@ -1020,7 +1215,19 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
                     None
                 }
             });
-            if let Some((_, _, msg_id, _)) = res {
+            if let Some((_, _, Some(msg_id), _)) = res {
+                let _ = BackgroundWorker::transaction(|| {
+                    pgrx::spi::Spi::connect_mut(|client| {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![client_id.as_str().into(), msg_id.into()];
+                        client.update(
+                            "DELETE FROM pgmqtt_session_queue WHERE client_id = $1 AND message_id = $2",
+                            None,
+                            &args,
+                        )?;
+                        Ok::<_, pgrx::spi::Error>(())
+                    })
+                });
                 log!(
                     "pgmqtt mqtt: '{}' acked packet_id={} (msg_id={:?})",
                     client_id,
@@ -1035,7 +1242,7 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
                 );
             }
             // Slot freed — promote next queued message into inflight.
-            let next_pkt = with_sessions(|sessions| {
+            let (next_pkt, db_update) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(&client_id) {
                     if let Some(queued) = session.queue.pop_front() {
                         let pid = session.next_packet_id;
@@ -1052,18 +1259,38 @@ fn handle_mqtt_packet(client: &mut MqttClient, packet: mqtt::InboundPacket) -> b
                                 std::time::Instant::now(),
                             ),
                         );
-                        Some(mqtt::build_publish_qos1(
-                            &queued.topic,
-                            &queued.payload,
-                            pid,
-                        ))
+                        let update = queued.id.map(|mid| (mid, pid as i32));
+                        (
+                            Some(mqtt::build_publish_qos1(
+                                &queued.topic,
+                                &queued.payload,
+                                pid,
+                            )),
+                            update,
+                        )
                     } else {
-                        None
+                        (None, None)
                     }
                 } else {
-                    None
+                    (None, None)
                 }
             });
+
+            if let Some((mid, pid)) = db_update {
+                let _ = BackgroundWorker::transaction(|| {
+                    pgrx::spi::Spi::connect_mut(|client| {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![pid.into(), client_id.as_str().into(), mid.into()];
+                        client.update(
+                            "UPDATE pgmqtt_session_queue SET packet_id = $1 WHERE client_id = $2 AND message_id = $3",
+                            None,
+                            &args,
+                        )?;
+                        Ok::<_, pgrx::spi::Error>(())
+                    })
+                });
+            }
+
             if let Some(pkt) = next_pkt {
                 let _ = transport.write_all(&pkt);
             }
@@ -1170,6 +1397,25 @@ fn sweep_expired_sessions() {
             sessions.remove(id);
         }
     });
+
+    if expired_ids.is_empty() {
+        return;
+    }
+
+    let _ = BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            for id in &expired_ids {
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![id.as_str().into()];
+                client.update(
+                    "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
+                    None,
+                    &args,
+                )?;
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        })
+    });
+
     for id in &expired_ids {
         log!(
             "pgmqtt mqtt: session for client '{}' expired, cleaning up",
@@ -1189,6 +1435,7 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
     log!("pgmqtt: publishing {} messages to clients", messages.len());
 
     let mut to_remove = Vec::new();
+    let mut db_queue_inserts: Vec<(String, i64, Option<i32>)> = Vec::new();
 
     for msg in &messages {
         let subscriber_ids = subscriptions::match_topic(&msg.topic);
@@ -1200,7 +1447,7 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
             );
         }
         for (sub_id, granted_qos) in &subscriber_ids {
-            let pkt_res = with_sessions(|sessions| {
+            let (pkt_res, db_insert) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(sub_id) {
                     let delivery_qos = std::cmp::min(msg.qos, *granted_qos);
                     if delivery_qos == 1 {
@@ -1219,7 +1466,8 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
                                     session.queue.len()
                                 );
                             }
-                            None
+                            let ins = msg.id.map(|mid| (sub_id.clone(), mid, None));
+                            (None, ins)
                         } else {
                             let pid = session.next_packet_id;
                             session.next_packet_id = session.next_packet_id.wrapping_add(1);
@@ -1235,15 +1483,26 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
                                     std::time::Instant::now(),
                                 ),
                             );
-                            Some(mqtt::build_publish_qos1(&msg.topic, &msg.payload, pid))
+                            let ins = msg.id.map(|mid| (sub_id.clone(), mid, Some(pid as i32)));
+                            (
+                                Some(mqtt::build_publish_qos1(&msg.topic, &msg.payload, pid)),
+                                ins,
+                            )
                         }
                     } else {
-                        Some(mqtt::build_publish_qos0(&msg.topic, &msg.payload))
+                        (
+                            Some(mqtt::build_publish_qos0(&msg.topic, &msg.payload)),
+                            None,
+                        )
                     }
                 } else {
-                    None
+                    (None, None)
                 }
             });
+
+            if let Some(ins) = db_insert {
+                db_queue_inserts.push(ins);
+            }
 
             if let Some(pkt) = pkt_res {
                 if let Some(client) = clients.get_mut(sub_id) {
@@ -1255,7 +1514,34 @@ fn publish_pending_messages(clients: &mut HashMap<String, MqttClient>) {
         }
     }
 
+    if !db_queue_inserts.is_empty() {
+        let _ = BackgroundWorker::transaction(|| {
+            pgrx::spi::Spi::connect_mut(|client| {
+                for (cid, mid, pid_opt) in db_queue_inserts {
+                    let mut args: Vec<pgrx::datum::DatumWithOid> =
+                        vec![cid.as_str().into(), mid.into()];
+                    if let Some(pid) = pid_opt {
+                        args.push(pid.into());
+                        client.update(
+                            "INSERT INTO pgmqtt_session_queue (client_id, message_id, packet_id) VALUES ($1, $2, $3)",
+                            None,
+                            &args,
+                        )?;
+                    } else {
+                        client.update(
+                            "INSERT INTO pgmqtt_session_queue (client_id, message_id, packet_id) VALUES ($1, $2, NULL)",
+                            None,
+                            &args,
+                        )?;
+                    }
+                }
+                Ok::<_, pgrx::spi::Error>(())
+            })
+        });
+    }
+
     for id in to_remove {
+        // ... handled in poll loop ...
         clients.remove(&id);
     }
 }
