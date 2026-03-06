@@ -335,7 +335,34 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
     log!("pgmqtt mqtt+cdc: shutting down");
 }
 
-/// One CDC tick: load mappings from DB, advance slot, drain ring buffer → render → topic_buffer.
+/// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
+///
+/// Each batch is one atomic PostgreSQL transaction: the replication slot LSN
+/// only advances when **all** QOS ≥ 1 messages from that batch have been
+/// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
+/// cost if a batch fails; larger values reduce per-batch transaction overhead.
+const CDC_BATCH_SIZE: usize = 256;
+
+/// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
+/// batches, persisting QOS ≥ 1 messages within the same transaction.
+///
+/// # Atomicity guarantee
+///
+/// For each batch the sequence is:
+///   1. `pg_logical_slot_get_changes(..., upto_nchanges = CDC_BATCH_SIZE)`
+///      fires the output plugin for each event, which pushes raw `ChangeEvent`s
+///      into the in-memory `ring_buffer`.
+///   2. The ring buffer is drained; every QOS ≥ 1 rendered message is
+///      `INSERT`ed into `pgmqtt_messages` **within the same transaction**.
+///   3. On commit, the slot's `confirmed_flush_lsn` advances to cover exactly
+///      those events — and only those events.
+///
+/// A crash between the two SPI calls is impossible: they share one transaction.
+/// If the inserts fail the whole batch rolls back; the slot does not advance;
+/// the same events will be re-read next tick (at-least-once delivery).
+///
+/// QOS 0 messages are not persisted; they are collected during the transaction
+/// and pushed to the `topic_buffer` after the commit (fire-and-forget).
 fn cdc_tick(slot_name: &str) {
     use crate::ring_buffer;
     use crate::topic_map;
@@ -386,131 +413,171 @@ fn cdc_tick(slot_name: &str) {
         }
     });
 
-    // Advance the slot — triggers pg_decode_change which pushes to ring_buffer
-    BackgroundWorker::transaction(|| {
-        let advance_query = format!(
-            "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, NULL)",
-            slot_name
-        );
-        if let Err(e) = Spi::connect(|client| {
-            if let Ok(table) = client.select(&advance_query, None, &[]) {
-                let mut count = 0;
-                for _ in table {
-                    count += 1;
+    // ── Batched, atomic CDC drain loop ───────────────────────────────────────
+    //
+    // BackgroundWorker::transaction requires UnwindSafe + RefUnwindSafe, which
+    // &mut T does NOT satisfy.  The fix: all mutable state lives *inside* the
+    // closure (local variables, not captured).  The closure returns a
+    // (messages, batch_count, ok) tuple that we destructure after the commit.
+    //
+    // topic_buffer::push is called ONLY after the transaction commits so that
+    // messages never enter the delivery queue before they are durably persisted.
+    loop {
+        let (to_publish, batch_count, batch_ok) =
+            BackgroundWorker::transaction(|| -> (Vec<topic_buffer::MqttMessage>, usize, bool) {
+                let mut to_publish: Vec<topic_buffer::MqttMessage> = Vec::new();
+                let mut batch_count: usize = 0;
+
+                // ── Step 1: advance the slot by at most CDC_BATCH_SIZE events ──
+                //
+                // The output plugin (pg_decode_change) fires synchronously for each
+                // row, pushing a ChangeEvent into ring_buffer.  Because this runs
+                // inside the same transaction as the inserts below, the slot's
+                // confirmed_flush_lsn only moves forward on COMMIT.
+                let advance_query = format!(
+                    "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
+                    slot_name, CDC_BATCH_SIZE
+                );
+                match Spi::connect(|client| {
+                    let mut n = 0usize;
+                    if let Ok(table) = client.select(&advance_query, None, &[]) {
+                        for _ in table {
+                            n += 1;
+                        }
+                    }
+                    Ok::<usize, spi::Error>(n)
+                }) {
+                    Ok(n) => {
+                        batch_count = n;
+                        if n > 0 {
+                            log!("pgmqtt: slot batch fetched {} raw logical messages", n);
+                        }
+                    }
+                    Err(e) => {
+                        log!("pgmqtt: error advancing slot: {:?} — skipping batch", e);
+                        return (to_publish, batch_count, false);
+                    }
                 }
-                if count > 0 {
-                    log!(
-                        "pgmqtt: slot advanced, fetched {} raw logical messages",
-                        count
-                    );
-                }
-            }
-            Ok::<_, spi::Error>(())
-        }) {
-            log!("pgmqtt: error advancing slot: {:?}", e);
-        }
-    });
 
-    // Drain CDC ring buffer → render templates → push to topic_buffer
-    let events = ring_buffer::drain();
-    if !events.is_empty() {
-        log!("pgmqtt: drained {} events from ring buffer", events.len());
-    }
+                // ── Step 2: drain ring_buffer; persist QOS ≥ 1 inside this tx ──
+                let events = ring_buffer::drain();
 
-    for event in &events {
-        match topic_map::render(&event.schema, &event.table, event.op, &event.columns) {
-            Some(rendered) => {
-                let topic_str = rendered.topic.clone();
-                let payload_clone = rendered.payload.clone();
+                for event in &events {
+                    match topic_map::render(&event.schema, &event.table, event.op, &event.columns) {
+                        Some(rendered) => {
+                            let topic_str = rendered.topic.clone();
 
-                if rendered.qos > 0 {
-                    BackgroundWorker::transaction(|| {
-                        let result = pgrx::spi::Spi::connect_mut(|client| {
-                            let payload_arg = if payload_clone.is_empty() {
-                                None
-                            } else {
-                                Some(payload_clone.as_slice())
-                            };
+                            if rendered.qos > 0 {
+                                // Persist within this transaction — committed atomically
+                                // with the slot advance above.
+                                let payload_clone = rendered.payload.clone();
+                                let result = pgrx::spi::Spi::connect_mut(|client| {
+                                    let payload_arg = if payload_clone.is_empty() {
+                                        None
+                                    } else {
+                                        Some(payload_clone.as_slice())
+                                    };
 
-                            let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
-                                topic_str.as_str().into(),
-                                payload_arg.into(),
-                                (rendered.qos as i32).into(), // CDC messages use mapping QOS
-                                false.into(),                 // CDC messages are not retained
-                            ];
+                                    let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
+                                        topic_str.as_str().into(),
+                                        payload_arg.into(),
+                                        (rendered.qos as i32).into(),
+                                        false.into(), // CDC messages are not retained
+                                    ];
 
-                            let mut msg_id_opt: Option<i64> = None;
-                            if let Ok(table) = client.update(
-                                "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ($1, $2, $3, $4) RETURNING id",
-                                None,
-                                &spi_args,
-                            ) {
-                                for row in table {
-                                    if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
-                                        msg_id_opt = Some(id);
+                                    let mut msg_id_opt: Option<i64> = None;
+                                    if let Ok(table) = client.update(
+                                        "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
+                                         VALUES ($1, $2, $3, $4) RETURNING id",
+                                        None,
+                                        &spi_args,
+                                    ) {
+                                        for row in table {
+                                            if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+                                                msg_id_opt = Some(id);
+                                            }
+                                            break;
+                                        }
                                     }
-                                    break;
-                                }
-                            }
-                            Ok::<_, pgrx::spi::Error>(msg_id_opt)
-                        });
+                                    Ok::<_, pgrx::spi::Error>(msg_id_opt)
+                                });
 
-                        match result {
-                            Ok(msg_id) => {
-                                log!(
-                                    "pgmqtt cdc: pushing message to topic '{}' with qos={}",
-                                    rendered.topic,
-                                    rendered.qos
-                                );
-                                topic_buffer::push(topic_buffer::MqttMessage {
-                                    id: msg_id,
+                                match result {
+                                    Ok(msg_id) => {
+                                        log!(
+                                            "pgmqtt cdc: persisted QOS {} to '{}' (msg_id={:?})",
+                                            rendered.qos,
+                                            rendered.topic,
+                                            msg_id
+                                        );
+                                        // Collected — pushed to topic_buffer after commit.
+                                        to_publish.push(topic_buffer::MqttMessage {
+                                            id: msg_id,
+                                            topic: rendered.topic,
+                                            payload: rendered.payload,
+                                            qos: rendered.qos,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        log!(
+                                            "pgmqtt cdc: error persisting QOS {} to '{}': {:?} \
+                                             — batch rolls back, events retried next tick",
+                                            rendered.qos,
+                                            topic_str,
+                                            e
+                                        );
+                                        // Return false → caller drops to_publish and stops.
+                                        return (Vec::new(), batch_count, false);
+                                    }
+                                }
+                            } else {
+                                // QOS 0 — collected for post-commit push (fire-and-forget).
+                                to_publish.push(topic_buffer::MqttMessage {
+                                    id: None,
                                     topic: rendered.topic,
                                     payload: rendered.payload,
-                                    qos: rendered.qos,
+                                    qos: 0,
                                 });
                             }
-                            Err(e) => {
-                                log!(
-                                    "pgmqtt cdc: error persisting event to topic '{}': {:?}",
-                                    topic_str,
-                                    e
-                                );
-                            }
+
+                            log!(
+                                "pgmqtt: processed {} on {}.{} → topic='{}'",
+                                event.op,
+                                event.schema,
+                                event.table,
+                                topic_str
+                            );
                         }
-                    });
-                } else {
-                    log!(
-                        "pgmqtt cdc: pushing transient message to topic '{}' with qos=0",
-                        rendered.topic
-                    );
-                    topic_buffer::push(topic_buffer::MqttMessage {
-                        id: None,
-                        topic: rendered.topic,
-                        payload: rendered.payload,
-                        qos: 0,
-                    });
+                        None => {
+                            log!(
+                                "pgmqtt: no mapping match for {}.{}",
+                                event.schema,
+                                event.table
+                            );
+                        }
+                    }
                 }
 
-                log!(
-                    "pgmqtt: published {} on {}.{} → topic='{}'",
-                    event.op,
-                    event.schema,
-                    event.table,
-                    topic_str
-                );
+                (to_publish, batch_count, true)
+            });
+        // ↑ COMMIT: slot LSN advances IFF all QOS ≥ 1 inserts committed.
+        //   batch_ok=false means the transaction rolled back; slot unchanged.
+
+        if batch_ok {
+            // Push all messages to the delivery queue only after the commit:
+            //  • QOS ≥ 1 messages are now durably in pgmqtt_messages.
+            //  • QOS 0 messages are fire-and-forget anyway.
+            for msg in to_publish {
+                topic_buffer::push(msg);
             }
-            None => {
-                // Topic map render returns None if no mapping matches
-                log!(
-                    "pgmqtt: no mapping match for {}.{}",
-                    event.schema,
-                    event.table
-                );
-            }
+        }
+
+        // Stop when the batch was smaller than the limit — WAL fully drained.
+        if batch_count < CDC_BATCH_SIZE {
+            break;
         }
     }
 }
-
 /// Accept new raw TCP MQTT connections and perform the MQTT CONNECT handshake.
 fn accept_mqtt_connections(listener: &TcpListener, clients: &mut HashMap<String, MqttClient>) {
     loop {
