@@ -24,7 +24,7 @@ from proto_utils import (
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-PG_HOST = "localhost"
+PG_HOST = "127.0.0.1"
 PG_PORT = 5432
 PG_USER = "postgres"
 PG_PASSWORD = "postgres"

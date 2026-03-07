@@ -2,11 +2,11 @@ import struct
 import os
 
 # Broker configuration from environment variables
-MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
+MQTT_HOST = os.environ.get('MQTT_HOST', '127.0.0.1')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
 
 # Postgres configuration from environment variables
-PG_HOST = os.environ.get('PG_HOST', 'localhost')
+PG_HOST = os.environ.get('PG_HOST', '127.0.0.1')
 PG_PORT = int(os.environ.get('PG_PORT', '5432'))
 PG_USER = os.environ.get('PG_USER', 'postgres')
 PG_PASSWORD = os.environ.get('PG_PASSWORD', 'postgres')

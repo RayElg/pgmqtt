@@ -18,7 +18,7 @@ import subprocess
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MQTT_HOST = "localhost"
+MQTT_HOST = "127.0.0.1"
 MQTT_PORT = 1883
 NUM_CLIENTS = 50
 NUM_MESSAGES = 1000

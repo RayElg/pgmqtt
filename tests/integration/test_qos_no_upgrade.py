@@ -89,7 +89,7 @@ def recv_packet(s, timeout=2.0):
         return None
 
 def test_qos_no_upgrade():
-    host = "localhost"
+    host = "127.0.0.1"
     port = 1883
     topic = "test/qos_no_upgrade"
     payload = b"this is qos 0"

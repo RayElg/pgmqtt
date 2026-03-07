@@ -26,7 +26,7 @@ import os
 
 from test_utils import run_sql, get_db_conn
 
-MQTT_HOST = os.environ.get("MQTT_HOST", "localhost")
+MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 SLOT_NAME = "pgmqtt_slot"
 TICK_WAIT = 2.0   # seconds — more than one broker tick interval (250 ms)
