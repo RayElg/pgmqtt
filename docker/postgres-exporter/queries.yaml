@@ -1,0 +1,13 @@
+pg_stat_statements_calls:
+  query: "SELECT sum(calls) as calls FROM pg_stat_statements"
+  metrics:
+    - calls:
+        usage: "COUNTER"
+        description: "Total number of calls"
+
+pg_replication_lag:
+  query: "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS bytes FROM pg_replication_slots WHERE slot_name = 'pgmqtt_slot'"
+  metrics:
+    - bytes:
+        usage: "GAUGE"
+        description: "Replication lag in bytes"

@@ -49,6 +49,8 @@ RUN cargo pgrx package && \
 # Runtime stage
 FROM postgres:16-bookworm
 
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 # Copy artifacts from builder
 COPY --from=builder /app/dist/usr/share/postgresql/16/extension /usr/share/postgresql/16/extension
 COPY --from=builder /app/dist/usr/lib/postgresql/16/lib /usr/lib/postgresql/16/lib
