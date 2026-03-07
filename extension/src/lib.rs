@@ -59,35 +59,6 @@ fn ensure_tables_exist() {
         )",
     )
     .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create retained table: {}", e));
-
-    Spi::run(
-        "CREATE TABLE IF NOT EXISTS pgmqtt_sessions (
-            client_id text PRIMARY KEY,
-            expiry_interval bigint NOT NULL,
-            disconnected_at timestamptz
-        )",
-    )
-    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create sessions table: {}", e));
-
-    Spi::run(
-        "CREATE TABLE IF NOT EXISTS pgmqtt_subscriptions (
-            client_id text REFERENCES pgmqtt_sessions(client_id) ON DELETE CASCADE,
-            topic_filter text NOT NULL,
-            qos int NOT NULL,
-            PRIMARY KEY (client_id, topic_filter)
-        )",
-    )
-    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create subscriptions table: {}", e));
-
-    Spi::run(
-        "CREATE TABLE IF NOT EXISTS pgmqtt_session_queue (
-            client_id text REFERENCES pgmqtt_sessions(client_id) ON DELETE CASCADE,
-            message_id bigint REFERENCES pgmqtt_messages(id) ON DELETE CASCADE,
-            packet_id int,
-            PRIMARY KEY (client_id, message_id)
-        )",
-    )
-    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create session queue table: {}", e));
 }
 
 /// Register a CDC → MQTT topic mapping (persisted to DB table).

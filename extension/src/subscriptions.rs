@@ -1,6 +1,9 @@
+//! In-memory subscription state: topic-filter → set of client IDs.
+//!
+//! Used by the MQTT server to know which connected clients should receive
+//! a PUBLISH for a given concrete topic.
+
 use crate::mqtt;
-use pgrx::bgworkers::BackgroundWorker;
-use pgrx::spi::Spi;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -45,79 +48,9 @@ where
 /// Maximum number of subscriptions allowed per client.
 const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 100;
 
-/// Load subscriptions from the database into memory.
-pub fn load_from_db() {
-    BackgroundWorker::transaction(|| {
-        let _ = Spi::connect(|client| {
-            // Check if table exists
-            let table_exists = client
-                .select(
-                    "SELECT to_regclass('pgmqtt_subscriptions')::text",
-                    None,
-                    &[],
-                )?
-                .first()
-                .get_one::<String>()?
-                .is_some();
-
-            if !table_exists {
-                return Ok::<_, pgrx::spi::Error>(());
-            }
-
-            if let Ok(table) = client.select(
-                "SELECT client_id, topic_filter, qos FROM pgmqtt_subscriptions",
-                None,
-                &[],
-            ) {
-                with_state(|state| {
-                    for row in table {
-                        if let (Ok(Some(client_id)), Ok(Some(filter)), Ok(Some(qos))) = (
-                            row.get_by_name::<String, _>("client_id"),
-                            row.get_by_name::<String, _>("topic_filter"),
-                            row.get_by_name::<i32, _>("qos"),
-                        ) {
-                            state
-                                .client_to_filters
-                                .entry(client_id.clone())
-                                .or_default()
-                                .insert(filter.clone());
-                            state
-                                .filter_to_clients
-                                .entry(filter)
-                                .or_default()
-                                .insert(client_id, qos as u8);
-                        }
-                    }
-                });
-            }
-            Ok::<_, pgrx::spi::Error>(())
-        });
-    });
-}
-
 /// Add a subscription for a client. Returns the granted QoS.
 pub fn subscribe(client_id: &str, topic_filter: &str, requested_qos: u8) -> u8 {
     let granted_qos = if requested_qos > 1 { 1 } else { requested_qos };
-
-    // Persist to database
-    let _ = BackgroundWorker::transaction(|| {
-        Spi::connect_mut(|client| {
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![
-                client_id.into(),
-                topic_filter.into(),
-                (granted_qos as i32).into(),
-            ];
-            client.update(
-                "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) \
-                 VALUES ($1, $2, $3) \
-                 ON CONFLICT (client_id, topic_filter) DO UPDATE \
-                 SET qos = EXCLUDED.qos",
-                None,
-                &args,
-            )?;
-            Ok::<_, pgrx::spi::Error>(())
-        })
-    });
 
     with_state(|state| {
         let filters = state
@@ -148,19 +81,6 @@ pub fn subscribe(client_id: &str, topic_filter: &str, requested_qos: u8) -> u8 {
 
 /// Remove a single subscription.
 pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
-    // Delete from database
-    let _ = BackgroundWorker::transaction(|| {
-        Spi::connect_mut(|client| {
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into(), topic_filter.into()];
-            client.update(
-                "DELETE FROM pgmqtt_subscriptions WHERE client_id = $1 AND topic_filter = $2",
-                None,
-                &args,
-            )?;
-            Ok::<_, pgrx::spi::Error>(())
-        })
-    });
-
     with_state(|state| {
         let mut removed = false;
         if let Some(clients) = state.filter_to_clients.get_mut(topic_filter) {
