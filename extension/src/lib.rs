@@ -37,6 +37,7 @@ fn ensure_tables_exist() {
     let _ =
         Spi::run("ALTER TABLE pgmqtt_topic_mappings ADD COLUMN IF NOT EXISTS qos int DEFAULT 0");
 
+    // TODO - if no session matching, drop message
     Spi::run(
         "CREATE TABLE IF NOT EXISTS pgmqtt_messages (
             id bigserial PRIMARY KEY,
