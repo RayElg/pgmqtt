@@ -193,6 +193,14 @@ fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         );
+                        // Cleanup orphaned messages
+                        let _ = client.update(
+                            "DELETE FROM pgmqtt_messages m \
+                             WHERE NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages sm WHERE sm.message_id = m.id) \
+                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained r WHERE r.message_id = m.id)",
+                            None,
+                            &[],
+                        );
                     }
                     SessionDbAction::InsertMessage {
                         client_id,
@@ -237,6 +245,15 @@ fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             "DELETE FROM pgmqtt_session_messages WHERE client_id = $1 AND message_id = $2",
                             None,
                             &args,
+                        );
+                        // Cleanup this specific message if now orphaned
+                        let args2: Vec<pgrx::datum::DatumWithOid> = vec![message_id.into()];
+                        let _ = client.update(
+                            "DELETE FROM pgmqtt_messages WHERE id = $1 \
+                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
+                            None,
+                            &args2,
                         );
                     }
                 }
@@ -746,6 +763,16 @@ fn cdc_tick(slot_name: &str) {
                     match topic_map::render(&event.schema, &event.table, event.op, &event.columns) {
                         Some(rendered) => {
                             let topic_str = rendered.topic.clone();
+
+                            // Case: no subscribers and not a retained message (CDC events are not retained)
+                            // We can skip rendering and persistence entirely.
+                            if subscriptions::match_topic(&topic_str).is_empty() {
+                                log!(
+                                    "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
+                                    topic_str
+                                );
+                                continue;
+                            }
 
                             if rendered.qos > 0 {
                                 // Persist within this transaction — committed atomically
@@ -1493,6 +1520,30 @@ fn handle_mqtt_packet(
             false // signal removal
         }
         mqtt::InboundPacket::Publish(pub_pkt) => {
+            // Optimization: skip all processing if no one is listening (and not retained)
+            // But for QoS 1, we still owe the client a PUBACK.
+            let subscriber_ids = subscriptions::match_topic(&pub_pkt.topic);
+            if !pub_pkt.retain && subscriber_ids.is_empty() {
+                if pub_pkt.qos == 1 {
+                    if let Some(pid) = pub_pkt.packet_id {
+                        log!(
+                            "pgmqtt mqtt: '{}' published to '{}' (QoS 1) with no subscribers. Sending PUBACK and skipping persistence.",
+                            client_id,
+                            pub_pkt.topic
+                        );
+                        let puback = mqtt::build_puback(pid);
+                        let _ = transport.write_all(&puback);
+                    }
+                } else {
+                    log!(
+                        "pgmqtt mqtt: '{}' published to '{}' (QoS 0) with no subscribers. Skipping.",
+                        client_id,
+                        pub_pkt.topic
+                    );
+                }
+                return true;
+            }
+
             pending_publishes.push(PendingPublish {
                 topic: pub_pkt.topic,
                 payload: pub_pkt.payload,

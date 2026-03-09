@@ -77,10 +77,9 @@ def pub_worker(client_id, topic, qos=0, duration=None, num_messages=None, interv
             if results is not None:
                 results.append(received)
     except (socket.error, ConnectionResetError, ConnectionAbortedError) as e:
-        # User requested to hide these noisy errors
+        print(f"  [!] {client_id} worker error: {e}")
         if results is not None:
-            results.append(received if qos == 0 else received) # Still report what we got
-        # Optional: print(f"  [!] {client_id} disconnected: {e}")
+            results.append(received)
 
 def sub_worker(client_id, topic, qos=0, stop_event=None, results=None):
     host, port = get_broker_config()
@@ -109,7 +108,8 @@ def sub_worker(client_id, topic, qos=0, stop_event=None, results=None):
                     continue
             if results is not None:
                 results.append(count)
-    except (socket.error, ConnectionResetError, ConnectionAbortedError):
+    except (socket.error, ConnectionResetError, ConnectionAbortedError) as e:
+        print(f"  [!] {client_id} sub worker error: {e}")
         if results is not None:
             results.append(count)
 
@@ -117,6 +117,13 @@ def test_scenario_a():
     """Scenario A: High-Throughput Ingestion (QoS 1) - Pipelined"""
     print(f"\n[PERF] Scenario A: High-Throughput Ingestion ({SCENARIO_DURATION}s QoS 1, Concurrency=100)")
     topic = "perf/scenarioA"
+    
+    # Start a subscriber to ensure messages are persisted/delivered
+    stop_event = threading.Event()
+    sub_thread = threading.Thread(target=sub_worker, args=("sub_a_dummy", topic, 1, stop_event))
+    sub_thread.start()
+    time.sleep(1)
+
     threads = []
     results = []
     
@@ -132,6 +139,10 @@ def test_scenario_a():
     
     duration = time.time() - start_time
     total_received = sum(results)
+    
+    stop_event.set()
+    sub_thread.join()
+
     print(f"  ✓ Acknowledged {total_received} QoS 1 messages via {SCENARIO_A_CLIENTS} threads in {duration:.2f}s ({total_received/duration:.1f} msg/s)")
 
 def test_scenario_b():

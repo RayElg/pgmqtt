@@ -29,6 +29,10 @@ def test_qos1_client_publish():
         s.sendall(create_connect_packet("pub_client"))
         recv_packet(s)
         
+        # Subscribe to ensure persistence path is considered (optional but good for consistency)
+        s.sendall(create_subscribe_packet(1, "test/qos1", qos=1))
+        recv_packet(s)
+        
         packet_id = 123
         s.sendall(create_publish_packet("test/qos1", b"hello", qos=1, packet_id=packet_id))
         resp = recv_packet(s)
