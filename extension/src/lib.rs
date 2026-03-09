@@ -243,7 +243,7 @@ pub unsafe extern "C" fn _PG_init() {
     let db_name_cstr = std::ffi::CString::new(db_name)
         .unwrap_or_else(|e| pgrx::error!("CString::new failed: {}", e));
     let db_name_ptr = db_name_cstr.as_ptr();
-    let db_name_datum = unsafe { std::mem::transmute::<*const i8, pg_sys::Datum>(db_name_ptr) };
+    let db_name_datum = unsafe { std::mem::transmute::<*const std::os::raw::c_char, pg_sys::Datum>(db_name_ptr) };
 
     // HTTP healthcheck server (port 8080)
     BackgroundWorkerBuilder::new("pgmqtt_http")
@@ -291,7 +291,7 @@ pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
         "postgres"
     } else {
         let cstr = unsafe {
-            std::ffi::CStr::from_ptr(std::mem::transmute::<pg_sys::Datum, *const i8>(arg))
+            std::ffi::CStr::from_ptr(std::mem::transmute::<pg_sys::Datum, *const std::os::raw::c_char>(arg))
         };
         cstr.to_str().unwrap_or("postgres")
     };

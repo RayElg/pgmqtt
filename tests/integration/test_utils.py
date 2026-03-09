@@ -36,5 +36,5 @@ def run_sql(sql):
 def run_command(cmd_list):
     """Run a command inside the postgres service container using docker-compose."""
     return subprocess.check_output(
-        ["docker-compose", "exec", "-T", "postgres"] + cmd_list
+        ["docker", "compose", "exec", "-T", "postgres"] + cmd_list
     ).decode()
