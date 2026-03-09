@@ -16,7 +16,7 @@ use std::time::Duration;
 static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the BGW latch wakes to poll for connections.
-const LATCH_INTERVAL: Duration = Duration::from_millis(150);
+const LATCH_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -25,7 +25,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REQUEST_BYTES: usize = 65536;
 
 /// Maximum number of unacked QoS 1 messages per client.
-const MAX_INFLIGHT_MESSAGES: usize = 500;
+const MAX_INFLIGHT_MESSAGES: usize = 800;
 
 // ── Transport abstraction ─────────────────────────────────────────────────────
 
