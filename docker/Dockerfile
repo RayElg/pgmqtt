@@ -30,18 +30,28 @@ RUN cargo install --locked cargo-pgrx --version 0.16.1
 RUN cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
 
 # Set up the work directory
-WORKDIR /usr/src/extension
-
-# Copy the extension source code
-# We copy everything so that cargo pgrx package has full context
-COPY extension ./extension
-# Also copy the top-level Cargo workspace files if any, but based on structure we just have extension/
-# If the user has a workspace at root, we might need to adjust.
-# The `ls` earlier showed `extension` is a subdir.
-# Docker build context will be the root `pgmqtt`.
-
-# Build the package
 WORKDIR /usr/src/extension/extension
+
+# 1. Copy only the manifest to cache dependencies
+COPY extension/Cargo.toml ./
+
+# 2. Create a dummy source file to satisfy cargo
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/pgrx_embed.rs
+
+# 3. Pre-build dependencies. 
+# We use --release and specify the features we need (pg16).
+# We use --no-default-features to avoid conflict with the default pg13 feature.
+# Note: cargo pgrx package will still be the final step, but this populates the cache.
+RUN cargo build --release --no-default-features --features pg16
+
+# 4. Remove the dummy source and copy the real source code
+RUN rm -rf src
+COPY extension/src ./src
+COPY extension/pgmqtt.control ./
+
+# 5. Build the real package
 RUN cargo pgrx package && \
     mkdir -p /app/dist && \
     cp -r target/release/pgmqtt-pg16/* /app/dist/
