@@ -9,7 +9,6 @@ import sys
 import os
 
 # Add the current directory to sys.path to import proto_utils
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from proto_utils import (
     create_connect_packet,

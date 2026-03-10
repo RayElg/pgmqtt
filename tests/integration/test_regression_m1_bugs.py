@@ -31,7 +31,6 @@ import sys
 import os
 import subprocess
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from proto_utils import (
     create_connect_packet,

@@ -36,6 +36,8 @@ const MAX_REQUEST_BYTES: usize = 65536;
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
 
+/// Threshold for warning when a client's message queue exceeds this size.
+const QUEUE_WARNING_THRESHOLD: usize = 10_000;
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
@@ -1288,14 +1290,13 @@ fn handle_mqtt_packet(
                                 std::time::Instant::now(),
                             ),
                         );
-                        let action = queued.id.map(|id| (id, pid)).unwrap_or((0, 0)); // fallback if QoS 0, but queue should only have QoS > 0
                         (
                             Some(mqtt::build_publish_qos1(
                                 &queued.topic,
                                 &queued.payload,
                                 pid,
                             )),
-                            if action.0 != 0 { Some(action) } else { None },
+                            queued.id.map(|id| (id, pid)),
                         )
                     } else {
                         (None, None)
@@ -1355,7 +1356,7 @@ fn handle_mqtt_packet(
                     });
                     mqtt::reason::SUCCESS
                 } else {
-                    0x11 // No Subscription Existed
+                    mqtt::reason::NO_SUBSCRIPTION_EXISTED
                 });
                 log!(
                     "pgmqtt mqtt: '{}' unsubscribed from '{}'",
@@ -1452,7 +1453,10 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
     with_sessions(|sessions| {
         for (id, sess) in sessions.iter() {
             if let Some(disconnected_at) = sess.disconnected_at {
-                let elapsed = now.duration_since(disconnected_at).as_secs();
+                let elapsed = now
+                    .checked_duration_since(disconnected_at)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 if elapsed >= sess.expiry_interval as u64 {
                     expired_ids.push(id.clone());
                 }
@@ -1523,10 +1527,11 @@ fn publish_pending_messages(
                                 payload: msg.payload.clone(),
                                 qos: delivery_qos,
                             });
-                            if session.queue.len() > 10_000 {
+                            if session.queue.len() > QUEUE_WARNING_THRESHOLD {
                                 pgrx::log!(
-                                    "pgmqtt: client '{}' queue exceeded 10 000 messages ({}). Consider increasing MAX_INFLIGHT_MESSAGES or investigating client health.",
+                                    "pgmqtt: client '{}' queue exceeded {} messages ({}). Consider increasing MAX_INFLIGHT_MESSAGES or investigating client health.",
                                     sub_id,
+                                    QUEUE_WARNING_THRESHOLD,
                                     session.queue.len()
                                 );
                             }

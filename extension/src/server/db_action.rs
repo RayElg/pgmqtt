@@ -83,7 +83,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             (next_packet_id as i32).into(),
                             (expiry_interval as i32).into(),
                         ];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "INSERT INTO pgmqtt_sessions (client_id, next_packet_id, expiry_interval, disconnected_at) \
                              VALUES ($1, $2, $3, NULL) \
                              ON CONFLICT (client_id) DO UPDATE \
@@ -92,29 +92,37 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                                  disconnected_at = NULL",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to upsert session '{}': {}", client_id, e);
+                        }
                     }
                     SessionDbAction::MarkDisconnected { client_id } => {
                         let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE client_id = $1",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to mark session '{}' disconnected: {}", client_id, e);
+                        }
                     }
                     SessionDbAction::DeleteSession { client_id } => {
                         let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
+                        }
                         // Cleanup orphaned messages (CASCADE deletes session_messages, then ref_count = 0)
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_messages WHERE ref_count <= 0 AND retain = false",
                             None,
                             &[],
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to cleanup orphaned messages: {}", e);
+                        }
                     }
                     SessionDbAction::InsertMessage {
                         client_id,
@@ -124,20 +132,24 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         let pid_arg = packet_id.map(|p| p as i32);
                         let args: Vec<DatumWithOid> =
                             vec![client_id.as_str().into(), message_id.into(), pid_arg.into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "INSERT INTO pgmqtt_session_messages (client_id, message_id, packet_id, sent_at) \
                              VALUES ($1, $2, $3, CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
                              ON CONFLICT (client_id, message_id) DO NOTHING",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to insert message for session '{}': {}", client_id, e);
+                        }
                         // Increment ref_count (one per session_message inserted)
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "UPDATE pgmqtt_messages SET ref_count = ref_count + 1 WHERE id = $1",
                             None,
                             &args2,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to increment ref_count for message {}: {}", message_id, e);
+                        }
                     }
                     SessionDbAction::InsertMessageBatch {
                         message_id,
@@ -169,15 +181,19 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             values_str
                         );
 
-                        let _ = client.update(&query, None, &args);
+                        if let Err(e) = client.update(&query, None, &args) {
+                            pgrx::log!("pgmqtt: failed to batch insert messages for message {}: {}", message_id, e);
+                        }
 
                         // Increment ref_count by the number of rows we attempted to insert
                         let args2: Vec<DatumWithOid> = vec![message_id.into(), (entries.len() as i32).into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "UPDATE pgmqtt_messages SET ref_count = ref_count + $2 WHERE id = $1",
                             None,
                             &args2,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to update ref_count for message {}: {}", message_id, e);
+                        }
                     }
                     SessionDbAction::UpdateMessageInflight {
                         client_id,
@@ -189,12 +205,14 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             client_id.as_str().into(),
                             message_id.into(),
                         ];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "UPDATE pgmqtt_session_messages SET packet_id = $1, sent_at = now() \
                              WHERE client_id = $2 AND message_id = $3",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to update message {} as inflight for session '{}': {}", message_id, client_id, e);
+                        }
                     }
                     SessionDbAction::DeleteMessage {
                         client_id,
@@ -202,25 +220,31 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                     } => {
                         let args: Vec<DatumWithOid> =
                             vec![client_id.as_str().into(), message_id.into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_session_messages WHERE client_id = $1 AND message_id = $2",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
+                        }
                         // Decrement ref_count and delete message if orphaned (not retained and no refs)
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_messages \
                              WHERE id = $1 AND ref_count <= 1 AND retain = false",
                             None,
                             &args2,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to delete orphaned message {}: {}", message_id, e);
+                        }
                         // Decrement ref_count for retained messages or those with other refs
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "UPDATE pgmqtt_messages SET ref_count = GREATEST(0, ref_count - 1) WHERE id = $1",
                             None,
                             &args2,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to decrement ref_count for message {}: {}", message_id, e);
+                        }
                     }
                     SessionDbAction::InsertSubscription {
                         client_id,
@@ -232,14 +256,16 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             topic_filter.as_str().into(),
                             (qos as i32).into(),
                         ];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) \
                              VALUES ($1, $2, $3) \
                              ON CONFLICT (client_id, topic_filter) DO UPDATE \
                              SET qos = EXCLUDED.qos",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to insert subscription for '{}' to '{}': {}", client_id, topic_filter, e);
+                        }
                     }
                     SessionDbAction::DeleteSubscription {
                         client_id,
@@ -247,11 +273,13 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                     } => {
                         let args: Vec<DatumWithOid> =
                             vec![client_id.as_str().into(), topic_filter.as_str().into()];
-                        let _ = client.update(
+                        if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_subscriptions WHERE client_id = $1 AND topic_filter = $2",
                             None,
                             &args,
-                        );
+                        ) {
+                            pgrx::log!("pgmqtt: failed to delete subscription for '{}' from '{}': {}", client_id, topic_filter, e);
+                        }
                     }
                 }
             }

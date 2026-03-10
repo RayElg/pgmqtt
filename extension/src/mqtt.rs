@@ -121,6 +121,7 @@ pub mod reason {
     pub const NOT_AUTHORIZED: u8 = 0x87;
     pub const TOPIC_FILTER_INVALID: u8 = 0x8F;
     pub const PACKET_ID_IN_USE: u8 = 0x91;
+    pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
 }
 
 // ---------------------------------------------------------------------------
