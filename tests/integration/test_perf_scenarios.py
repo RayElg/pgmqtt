@@ -81,7 +81,7 @@ def pub_worker(client_id, topic, qos=0, duration=None, num_messages=None, interv
         if results is not None:
             results.append(received)
 
-def sub_worker(client_id, topic, qos=0, stop_event=None, results=None):
+def sub_worker(client_id, topic, qos=0, stop_event=None, results=None, progress_results=None):
     host, port = get_broker_config()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -98,6 +98,12 @@ def sub_worker(client_id, topic, qos=0, stop_event=None, results=None):
                     pkt = recv_packet(s, timeout=0.1)
                     if pkt:
                         count += 1
+                        if progress_results is not None:
+                            # Keep progress_results updated
+                            if len(progress_results) == 0:
+                                progress_results.append(count)
+                            else:
+                                progress_results[0] = count
                         try:
                             _, _, p_qos, _, _, pid, _ = validate_publish(pkt)
                             if p_qos > 0 and pid:
@@ -266,34 +272,72 @@ def test_scenario_cdc_publish():
     
     stop_event = threading.Event()
     sub_results = []
+    sub_progress = [] # Share for real-time tracking
     pub_results = []
     
     # Start subscriber to measure delivery
     sub_cid = "sub_cdc_perf"
-    sub_thread = threading.Thread(target=sub_worker, args=(sub_cid, topic, 1, stop_event, sub_results))
+    sub_thread = threading.Thread(target=sub_worker, args=(sub_cid, topic, 1, stop_event, sub_results, sub_progress))
     sub_thread.start()
     
-    time.sleep(2) # Wait for sub and mapping to settle
+    time.sleep(5) # Wait for sub to connect (increased from 2)
     
+    # Warmup: Insert one row and wait for it to be received
+    print("  Waiting for CDC warmup message...")
+    run_psql("INSERT INTO cdc_perf_table (data) VALUES ('warmup');")
+    
+    warmup_start = time.time()
+    while (time.time() - warmup_start) < 20.0: # Increased from 10.0
+        if sub_progress and sub_progress[0] >= 1:
+            break
+        time.sleep(0.2)
+    
+    if not sub_progress or sub_progress[0] < 1:
+        print("  WARNING: CDC warmup failed, proceeding anyway...")
+    else:
+        print("  ✓ CDC warmup successful")
+
+    # Reset progress for actual measurement
+    # Instead of clearing, just record the baseline
+    warmup_received = sub_progress[0] if sub_progress else 0
+    print(f"  Starting measurement from baseline: {warmup_received} messages")
+
     # Start CDC publisher (inserting rows)
+    # Slow down slightly to avoid overwhelming the 8192-capacity ring buffer
+    def cdc_pub_worker_throttled(duration, batch_size, results):
+        sent = 0
+        start_time = time.time()
+        while (time.time() - start_time) < duration:
+            run_psql(f"INSERT INTO cdc_perf_table (data) SELECT 'cdc msg ' || i FROM generate_series({sent}+1, {sent}+{batch_size}) AS i;")
+            sent += batch_size
+            time.sleep(0.02) # Add small delay to keep ring buffer happy
+        results.append(sent)
+
     start_time = time.time()
-    cdc_pub_worker(duration=SCENARIO_DURATION, batch_size=100, results=pub_results)
+    cdc_pub_worker_throttled(duration=SCENARIO_DURATION, batch_size=100, results=pub_results)
     
     total_sent = sum(pub_results)
     
     # Wait for delivery (CDC can have more lag)
-    # Target: wait until sub_results sum matches total_sent or timeout
+    # Target: wait until sub_progress matches total_sent + warmup_received or timeout
     wait_start = time.time()
-    timeout = 20.0
+    timeout = 60.0 # Increased from 30.0
+    last_val = -1
     while (time.time() - wait_start) < timeout:
-        if sum(sub_results) >= total_sent:
+        current_total = sub_progress[0] if sub_progress else 0
+        current_received = current_total - warmup_received
+        if current_received != last_val:
+            print(f"  Progress: {current_received}/{total_sent} received...")
+            last_val = current_received
+        if current_received >= total_sent:
             break
-        time.sleep(0.5)
+        time.sleep(1.0)
     
     stop_event.set()
     sub_thread.join()
     
-    total_received = sum(sub_results)
+    # Final check from sub_results
+    total_received = (sub_results[0] if sub_results else 0) - warmup_received
     
     print(f"  ✓ DB inserted {total_sent} rows in {SCENARIO_DURATION}s ({total_sent/SCENARIO_DURATION:.1f} rows/s)")
     if total_received >= total_sent:

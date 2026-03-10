@@ -420,9 +420,11 @@ unsafe extern "C-unwind" fn pg_decode_change(
     pgrx::log!("pgmqtt: CDC event: {} on {}.{}", op, schema_name, rel_name);
 
     // Ignore inner extension tables to avoid infinite pub sub loops
-    if rel_name == "pgmqtt_topic_mappings" {
+    if rel_name.starts_with("pgmqtt_") {
         return;
     }
+
+    pgrx::log!("pgmqtt: CDC event: {} on {}.{}", op, schema_name, rel_name);
 
     ring_buffer::push(ring_buffer::ChangeEvent {
         op,
@@ -430,12 +432,6 @@ unsafe extern "C-unwind" fn pg_decode_change(
         table: rel_name.into_owned(),
         columns,
     });
-
-    // Debug - now peek at the ring buffer contents instead of clearing them
-    pgrx::log!(
-        "pgmqtt: ring buffer contents (peek): {:?}",
-        ring_buffer::peek_all()
-    );
 
     // The output plugin MUST produce output for pg_logical_slot_get_changes to advance.
     unsafe {

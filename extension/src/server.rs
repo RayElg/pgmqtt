@@ -870,6 +870,10 @@ fn cdc_tick(slot_name: &str) {
         // ↑ COMMIT: slot LSN advances IFF all QOS ≥ 1 inserts committed.
         //   batch_ok=false means the transaction rolled back; slot unchanged.
 
+        if !batch_ok {
+            log!("pgmqtt cdc: batch transaction failed or rolled back — events will be retried");
+        }
+
         if batch_ok {
             // Push all messages to the delivery queue only after the commit:
             //  • QOS ≥ 1 messages are now durably in pgmqtt_messages.
