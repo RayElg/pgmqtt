@@ -53,6 +53,7 @@ fn ensure_tables_exist() {
             payload bytea,
             qos int DEFAULT 0,
             retain boolean DEFAULT false,
+            ref_count integer NOT NULL DEFAULT 0,
             created_at timestamptz DEFAULT NOW()
         )",
         "create messages table",
@@ -60,6 +61,8 @@ fn ensure_tables_exist() {
 
     // Migration: add qos to messages if missing
     let _ = Spi::run("ALTER TABLE pgmqtt_messages ADD COLUMN IF NOT EXISTS qos int DEFAULT 0");
+    // Migration: add ref_count for message cleanup optimization
+    let _ = Spi::run("ALTER TABLE pgmqtt_messages ADD COLUMN IF NOT EXISTS ref_count integer DEFAULT 0");
 
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_retained (
@@ -103,6 +106,12 @@ fn ensure_tables_exist() {
         )",
         "create subscriptions table",
     );
+
+    // Create indexes for efficient queries
+    let _ = Spi::run("CREATE INDEX IF NOT EXISTS idx_session_messages_message_id ON pgmqtt_session_messages(message_id)");
+    let _ = Spi::run("CREATE INDEX IF NOT EXISTS idx_session_messages_client_id ON pgmqtt_session_messages(client_id)");
+    let _ = Spi::run("CREATE INDEX IF NOT EXISTS idx_subscriptions_client_id ON pgmqtt_subscriptions(client_id)");
+    let _ = Spi::run("CREATE INDEX IF NOT EXISTS idx_retained_message_id ON pgmqtt_retained(message_id)");
 }
 
 /// Register a CDC → MQTT topic mapping (persisted to DB table).

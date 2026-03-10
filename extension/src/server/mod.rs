@@ -1498,14 +1498,18 @@ fn publish_pending_messages(
                 subscriptions::active_filters()
             );
         }
+
+        // Batch database actions by message_id to minimize writes
+        let mut batch_entries: Vec<(String, Option<u16>)> = Vec::new();
+
         for (sub_id, granted_qos) in &subscriber_ids {
             let receive_maximum = clients.get(sub_id).map(|c| c.receive_maximum).unwrap_or(65535);
             let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, receive_maximum as usize);
 
             enum DbAction {
                 None,
-                Queue(i64),
-                Inflight(i64, u16),
+                Queue,
+                Inflight(u16),
             }
             let (pkt_res, db_action) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(sub_id) {
@@ -1526,7 +1530,7 @@ fn publish_pending_messages(
                                     session.queue.len()
                                 );
                             }
-                            (None, msg.id.map(DbAction::Queue).unwrap_or(DbAction::None))
+                            (None, DbAction::Queue)
                         } else {
                             let pid = session.next_packet_id;
                             session.next_packet_id = session.next_packet_id.wrapping_add(1);
@@ -1544,9 +1548,7 @@ fn publish_pending_messages(
                             );
                             (
                                 Some(mqtt::build_publish_qos1(&msg.topic, &msg.payload, pid)),
-                                msg.id
-                                    .map(|id| DbAction::Inflight(id, pid))
-                                    .unwrap_or(DbAction::None),
+                                DbAction::Inflight(pid),
                             )
                         }
                     } else {
@@ -1561,19 +1563,15 @@ fn publish_pending_messages(
             });
 
             match db_action {
-                DbAction::Queue(msg_id) => {
-                    session_db_actions.push(SessionDbAction::InsertMessage {
-                        client_id: sub_id.clone(),
-                        message_id: msg_id,
-                        packet_id: None,
-                    });
+                DbAction::Queue => {
+                    if let Some(msg_id) = msg.id {
+                        batch_entries.push((sub_id.clone(), None));
+                    }
                 }
-                DbAction::Inflight(msg_id, pid) => {
-                    session_db_actions.push(SessionDbAction::InsertMessage {
-                        client_id: sub_id.clone(),
-                        message_id: msg_id,
-                        packet_id: Some(pid),
-                    });
+                DbAction::Inflight(pid) => {
+                    if let Some(msg_id) = msg.id {
+                        batch_entries.push((sub_id.clone(), Some(pid)));
+                    }
                 }
                 DbAction::None => {}
             }
@@ -1584,6 +1582,16 @@ fn publish_pending_messages(
                         to_remove.push(sub_id.clone());
                     }
                 }
+            }
+        }
+
+        // Execute batch insert if there are entries for this message
+        if !batch_entries.is_empty() {
+            if let Some(msg_id) = msg.id {
+                session_db_actions.push(SessionDbAction::InsertMessageBatch {
+                    message_id: msg_id,
+                    entries: batch_entries,
+                });
             }
         }
     }

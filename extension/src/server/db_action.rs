@@ -30,6 +30,11 @@ pub enum SessionDbAction {
         message_id: i64,
         packet_id: Option<u16>,
     },
+    /// Batch insert multiple session_messages rows for the same message_id (one per client).
+    InsertMessageBatch {
+        message_id: i64,
+        entries: Vec<(String, Option<u16>)>, // (client_id, packet_id)
+    },
     /// Update a message's packet_id (promote from queue to inflight).
     UpdateMessageInflight {
         client_id: String,
@@ -104,11 +109,9 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         );
-                        // Cleanup orphaned messages
+                        // Cleanup orphaned messages (CASCADE deletes session_messages, then ref_count = 0)
                         let _ = client.update(
-                            "DELETE FROM pgmqtt_messages m \
-                             WHERE NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages sm WHERE sm.message_id = m.id) \
-                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained r WHERE r.message_id = m.id)",
+                            "DELETE FROM pgmqtt_messages WHERE ref_count <= 0 AND retain = false",
                             None,
                             &[],
                         );
@@ -127,6 +130,53 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                              ON CONFLICT (client_id, message_id) DO NOTHING",
                             None,
                             &args,
+                        );
+                        // Increment ref_count (one per session_message inserted)
+                        let args2: Vec<DatumWithOid> = vec![message_id.into()];
+                        let _ = client.update(
+                            "UPDATE pgmqtt_messages SET ref_count = ref_count + 1 WHERE id = $1",
+                            None,
+                            &args2,
+                        );
+                    }
+                    SessionDbAction::InsertMessageBatch {
+                        message_id,
+                        entries,
+                    } => {
+                        // Build multi-row VALUES clause: ($1, $2, ...), ($3, $4, ...), etc.
+                        let mut values_clauses = Vec::new();
+                        let mut args: Vec<DatumWithOid> = vec![message_id.into()];
+                        let mut param_idx = 2;
+
+                        for (client_id, packet_id) in &entries {
+                            let pid_arg = packet_id.map(|p| p as i32);
+                            values_clauses.push(format!(
+                                "($1, ${}, ${}, CASE WHEN ${} IS NULL THEN NULL ELSE now() END)",
+                                param_idx,
+                                param_idx + 1,
+                                param_idx + 1
+                            ));
+                            args.push(client_id.as_str().into());
+                            args.push(pid_arg.into());
+                            param_idx += 2;
+                        }
+
+                        let values_str = values_clauses.join(",");
+                        let query = format!(
+                            "INSERT INTO pgmqtt_session_messages (message_id, client_id, packet_id, sent_at) \
+                             VALUES {} \
+                             ON CONFLICT (client_id, message_id) DO NOTHING",
+                            values_str
+                        );
+
+                        let _ = client.update(&query, None, &args);
+
+                        // Increment ref_count by the number of rows we attempted to insert
+                        let args2: Vec<DatumWithOid> = vec![message_id.into(), (entries.len() as i32).into()];
+                        let _ = client.update(
+                            "UPDATE pgmqtt_messages SET ref_count = ref_count + $2 WHERE id = $1",
+                            None,
+                            &args2,
                         );
                     }
                     SessionDbAction::UpdateMessageInflight {
@@ -157,12 +207,17 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         );
-                        // Cleanup this specific message if now orphaned
+                        // Decrement ref_count and delete message if orphaned (not retained and no refs)
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
                         let _ = client.update(
-                            "DELETE FROM pgmqtt_messages WHERE id = $1 \
-                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
-                             AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
+                            "DELETE FROM pgmqtt_messages \
+                             WHERE id = $1 AND ref_count <= 1 AND retain = false",
+                            None,
+                            &args2,
+                        );
+                        // Decrement ref_count for retained messages or those with other refs
+                        let _ = client.update(
+                            "UPDATE pgmqtt_messages SET ref_count = GREATEST(0, ref_count - 1) WHERE id = $1",
                             None,
                             &args2,
                         );
