@@ -5,6 +5,33 @@
 //!   Building : CONNACK, SUBACK, UNSUBACK, PUBLISH (QoS 0), PINGRESP, DISCONNECT
 
 // ---------------------------------------------------------------------------
+// MQTT 5.0 property IDs (used in CONNECT, DISCONNECT variable headers)
+// ---------------------------------------------------------------------------
+
+pub mod property {
+    /// Session Expiry Interval (4-byte integer) — CONNECT/DISCONNECT
+    pub const SESSION_EXPIRY_INTERVAL: u8 = 0x11;
+    /// Receive Maximum (2-byte integer) — CONNECT
+    pub const RECEIVE_MAXIMUM: u8 = 0x21;
+    /// Maximum Packet Size (4-byte integer) — CONNECT
+    pub const MAX_PACKET_SIZE: u8 = 0x27;
+    /// Topic Alias Maximum (2-byte integer) — CONNECT
+    pub const TOPIC_ALIAS_MAX: u8 = 0x22;
+    /// Request Response Information (1-byte) — CONNECT
+    pub const REQUEST_RESPONSE_INFO: u8 = 0x19;
+    /// Request Problem Information (1-byte) — CONNECT
+    pub const REQUEST_PROBLEM_INFO: u8 = 0x17;
+    /// User Property (UTF-8 string pair) — CONNECT/DISCONNECT/others
+    pub const USER_PROPERTY: u8 = 0x26;
+    /// Authentication Method (UTF-8 string) — CONNECT
+    pub const AUTH_METHOD: u8 = 0x15;
+    /// Reason String (UTF-8 string) — DISCONNECT/others
+    pub const REASON_STRING: u8 = 0x1F;
+    /// Payload Format Indicator (1-byte) — PUBLISH
+    pub const PAYLOAD_FORMAT: u8 = 0x01;
+}
+
+// ---------------------------------------------------------------------------
 // Packet types
 // ---------------------------------------------------------------------------
 
@@ -53,9 +80,34 @@ impl PacketType {
 }
 
 // ---------------------------------------------------------------------------
-// Reason codes (MQTT 5.0 subset)
+// Reason codes (MQTT 5.0 subset, represented as u8 for wire format)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReasonCode {
+    /// Success (CONNACK, SUBACK, UNSUBACK, PUBACK, PUBREC, PUBREL, PUBCOMP, AUTH, DISCONNECT)
+    /// Also used as Granted QoS 0 in SUBACK
+    Success = 0x00,
+    /// Granted QoS 1 (SUBACK)
+    GrantedQos1 = 0x01,
+    /// Granted QoS 2 (SUBACK)
+    GrantedQos2 = 0x02,
+    /// Unspecified error
+    UnspecifiedError = 0x80,
+    /// Malformed packet
+    MalformedPacket = 0x81,
+    /// Protocol error
+    ProtocolError = 0x82,
+    /// Not authorized
+    NotAuthorized = 0x87,
+    /// Topic filter invalid
+    TopicFilterInvalid = 0x8F,
+    /// Packet ID in use
+    PacketIdInUse = 0x91,
+}
+
+/// Constants for backwards compatibility — use ReasonCode enum instead
 #[allow(dead_code)]
 pub mod reason {
     pub const SUCCESS: u8 = 0x00;
@@ -203,8 +255,8 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usiz
         let prop_id = buf[i];
         i += 1;
         match prop_id {
-            0x11 => {
-                // Session Expiry Interval – 4-byte big-endian u32
+            property::SESSION_EXPIRY_INTERVAL => {
+                // 4-byte big-endian u32
                 if i + 4 > props_end {
                     return Err(MqttError::MalformedPacket(
                         "Session Expiry Interval truncated".into(),
@@ -214,8 +266,8 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usiz
                     u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
                 i += 4;
             }
-            0x21 => {
-                // Receive Maximum – 2-byte big-endian u16
+            property::RECEIVE_MAXIMUM => {
+                // 2-byte big-endian u16
                 if i + 2 > props_end {
                     return Err(MqttError::MalformedPacket(
                         "Receive Maximum truncated".into(),
@@ -229,30 +281,30 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usiz
                 }
                 i += 2;
             }
-            0x27 => {
-                // Maximum Packet Size – 4 bytes, skip
+            property::MAX_PACKET_SIZE => {
+                // 4 bytes, skip
                 i += 4;
             }
-            0x22 => {
-                // Topic Alias Maximum – 2 bytes, skip
+            property::TOPIC_ALIAS_MAX => {
+                // 2 bytes, skip
                 i += 2;
             }
-            0x19 => {
-                // Request Response Information – 1 byte, skip
+            property::REQUEST_RESPONSE_INFO => {
+                // 1 byte, skip
                 i += 1;
             }
-            0x17 => {
-                // Request Problem Information – 1 byte, skip
+            property::REQUEST_PROBLEM_INFO => {
+                // 1 byte, skip
                 i += 1;
             }
-            0x26 => {
-                // User Property – UTF-8 key + value pair
+            property::USER_PROPERTY => {
+                // UTF-8 key + value pair
                 let (_, new_off) = decode_utf8(buf, i)?;
                 let (_, new_off) = decode_utf8(buf, new_off)?;
                 i = new_off;
             }
-            0x15 => {
-                // Authentication Method – UTF-8 string
+            property::AUTH_METHOD => {
+                // UTF-8 string
                 let (_, new_off) = decode_utf8(buf, i)?;
                 i = new_off;
             }
@@ -615,7 +667,7 @@ fn parse_disconnect(buf: &[u8]) -> Result<(u8, Option<u32>)> {
         let prop_id = buf[i];
         i += 1;
         match prop_id {
-            0x11 => {
+            property::SESSION_EXPIRY_INTERVAL => {
                 if i + 4 > props_end {
                     break;
                 }
@@ -623,14 +675,14 @@ fn parse_disconnect(buf: &[u8]) -> Result<(u8, Option<u32>)> {
                     Some(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
                 i += 4;
             }
-            0x1F => {
-                // Reason String – UTF-8, skip
+            property::REASON_STRING => {
+                // UTF-8, skip
                 if i + 2 > props_end { break; }
                 let len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
                 i += 2 + len;
             }
-            0x26 => {
-                // User Property – two UTF-8 strings, skip
+            property::USER_PROPERTY => {
+                // Two UTF-8 strings, skip
                 let (_, new_off) = decode_utf8(buf, i)?;
                 let (_, new_off) = decode_utf8(buf, new_off)?;
                 i = new_off;

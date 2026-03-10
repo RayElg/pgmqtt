@@ -15,7 +15,7 @@ use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
