@@ -183,11 +183,11 @@ fn skip_properties(buf: &[u8], offset: usize) -> Result<usize> {
     Ok(end)
 }
 
-/// Parse CONNECT properties, extracting the Session Expiry Interval (0x11).
-/// Returns `(session_expiry_interval, new_offset)`.
-fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
+/// Parse CONNECT properties, extracting the Session Expiry Interval (0x11) and Receive Maximum (0x21).
+/// Returns `(session_expiry_interval, receive_maximum, new_offset)`.
+fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usize)> {
     if offset >= buf.len() {
-        return Ok((0, offset));
+        return Ok((0, 65535, offset));
     }
     let (prop_len, consumed) = decode_variable_byte_int(&buf[offset..])?;
     let props_start = offset + consumed;
@@ -196,6 +196,8 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
         return Err(MqttError::Incomplete);
     }
     let mut session_expiry_interval: u32 = 0;
+    let mut receive_maximum: u16 = 65535; // Default per MQTT spec
+
     let mut i = props_start;
     while i < props_end {
         let prop_id = buf[i];
@@ -213,7 +215,18 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
                 i += 4;
             }
             0x21 => {
-                // Receive Maximum – 2 bytes, skip
+                // Receive Maximum – 2-byte big-endian u16
+                if i + 2 > props_end {
+                    return Err(MqttError::MalformedPacket(
+                        "Receive Maximum truncated".into(),
+                    ));
+                }
+                receive_maximum = u16::from_be_bytes([buf[i], buf[i + 1]]);
+                if receive_maximum == 0 {
+                    return Err(MqttError::ProtocolError(
+                        "Receive Maximum must not be 0".into(),
+                    ));
+                }
                 i += 2;
             }
             0x27 => {
@@ -258,7 +271,7 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
             }
         }
     }
-    Ok((session_expiry_interval, props_end))
+    Ok((session_expiry_interval, receive_maximum, props_end))
 }
 
 fn encode_empty_properties() -> Vec<u8> {
@@ -327,6 +340,8 @@ pub struct ConnectPacket {
     /// MQTT 5.0 Session Expiry Interval in seconds. 0 means end at disconnect.
     /// 0xFFFFFFFF means never expire.
     pub session_expiry_interval: u32,
+    /// Client's Receive Maximum limit for QoS 1 and 2 inflight messages.
+    pub receive_maximum: u16,
 }
 
 #[derive(Debug)]
@@ -360,7 +375,8 @@ pub enum InboundPacket {
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
     Pingreq,
-    Disconnect(u8),
+    /// (reason_code, optional Session Expiry Interval override)
+    Disconnect(u8, Option<u32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +399,10 @@ pub fn parse_packet(buf: &[u8]) -> Result<(InboundPacket, usize)> {
         PacketType::Subscribe => InboundPacket::Subscribe(parse_subscribe(payload)?),
         PacketType::Unsubscribe => InboundPacket::Unsubscribe(parse_unsubscribe(payload)?),
         PacketType::Pingreq => InboundPacket::Pingreq,
-        PacketType::Disconnect => InboundPacket::Disconnect(parse_disconnect(payload)?),
+        PacketType::Disconnect => {
+            let (rc, expiry) = parse_disconnect(payload)?;
+            InboundPacket::Disconnect(rc, expiry)
+        }
         other => return Err(MqttError::UnsupportedPacket(other as u8)),
     };
 
@@ -422,8 +441,9 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
 
     let keep_alive = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
 
-    // Parse CONNECT properties (extract Session Expiry Interval)
-    let (session_expiry_interval, new_off) = parse_connect_properties(buf, off + 4)?;
+    // Parse CONNECT properties (extract Session Expiry Interval and Receive Maximum)
+    let (session_expiry_interval, receive_maximum, new_off) =
+        parse_connect_properties(buf, off + 4)?;
     let mut off = new_off;
 
     // Client ID
@@ -464,6 +484,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         protocol_version,
         will,
         session_expiry_interval,
+        receive_maximum,
     })
 }
 
@@ -567,11 +588,57 @@ fn parse_puback(buf: &[u8]) -> Result<u16> {
     Ok(packet_id)
 }
 
-fn parse_disconnect(buf: &[u8]) -> Result<u8> {
+/// Parse DISCONNECT packet.
+/// Returns `(reason_code, optional Session Expiry Interval override)`.
+/// Per MQTT 5.0 §3.14.2.2.2, the client may include a Session Expiry Interval
+/// property to override the value set at CONNECT (e.g. 0 to end the session).
+fn parse_disconnect(buf: &[u8]) -> Result<(u8, Option<u32>)> {
     if buf.is_empty() {
-        return Ok(reason::NORMAL_DISCONNECT);
+        return Ok((reason::NORMAL_DISCONNECT, None));
     }
-    Ok(buf[0])
+    let reason_code = buf[0];
+    if buf.len() < 2 {
+        return Ok((reason_code, None));
+    }
+
+    // Parse properties — only extract Session Expiry Interval (0x11)
+    let (prop_len, consumed) = decode_variable_byte_int(&buf[1..])?;
+    let props_start = 1 + consumed;
+    let props_end = props_start + prop_len;
+    if buf.len() < props_end {
+        return Ok((reason_code, None));
+    }
+
+    let mut session_expiry: Option<u32> = None;
+    let mut i = props_start;
+    while i < props_end {
+        let prop_id = buf[i];
+        i += 1;
+        match prop_id {
+            0x11 => {
+                if i + 4 > props_end {
+                    break;
+                }
+                session_expiry =
+                    Some(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+                i += 4;
+            }
+            0x1F => {
+                // Reason String – UTF-8, skip
+                if i + 2 > props_end { break; }
+                let len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
+                i += 2 + len;
+            }
+            0x26 => {
+                // User Property – two UTF-8 strings, skip
+                let (_, new_off) = decode_utf8(buf, i)?;
+                let (_, new_off) = decode_utf8(buf, new_off)?;
+                i = new_off;
+            }
+            _ => break,
+        }
+    }
+    Ok((reason_code, session_expiry))
 }
 
 // ---------------------------------------------------------------------------

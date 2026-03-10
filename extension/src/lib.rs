@@ -85,6 +85,16 @@ fn ensure_tables_exist() {
         )",
     )
     .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create session messages table: {}", e));
+
+    Spi::run(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_subscriptions (
+            client_id text NOT NULL REFERENCES pgmqtt_sessions(client_id) ON DELETE CASCADE,
+            topic_filter text NOT NULL,
+            qos integer NOT NULL DEFAULT 0,
+            PRIMARY KEY (client_id, topic_filter)
+        )",
+    )
+    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to create subscriptions table: {}", e));
 }
 
 /// Register a CDC → MQTT topic mapping (persisted to DB table).

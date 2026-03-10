@@ -8,7 +8,7 @@
 
 use minijinja::{context, Environment};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,7 +107,8 @@ pub fn render(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let env = Environment::new();
+    static ENV: OnceLock<Environment<'static>> = OnceLock::new();
+    let env = ENV.get_or_init(Environment::new);
 
     let topic = match env.render_str(
         &mapping.topic_template,
