@@ -8,7 +8,7 @@ def test_read_replica_pauses_mqtt():
     # Spin up the primary-replica cluster
     print("Starting multinode cluster...")
     subprocess.check_call([
-        "docker", "compose"", "-f", "tests/integration/multinode/"docker", "compose".multinode.yml", "up", "-d", "--build"
+        "docker", "compose", "-f", "tests/integration/multinode/docker-compose.multinode.yml", "up", "-d", "--build"
     ])
     
     try:
@@ -18,7 +18,7 @@ def test_read_replica_pauses_mqtt():
         for i in range(30):
             try:
                 subprocess.check_output([
-                    "docker", "compose"", "-f", "tests/integration/multinode/"docker", "compose".multinode.yml", 
+                    "docker", "compose", "-f", "tests/integration/multinode/docker-compose.multinode.yml",
                     "exec", "-u", "postgres", "-T", "pg_replica", "psql", "-c", "SELECT 1"
                 ], stderr=subprocess.STDOUT)
                 replica_ready = True
@@ -42,7 +42,7 @@ def test_read_replica_pauses_mqtt():
         # Test promoting the replica
         print("Promoting replica to primary...")
         subprocess.check_call([
-            "docker", "compose"", "-f", "tests/integration/multinode/"docker", "compose".multinode.yml", "exec", "-u", "postgres", "-T", "pg_replica", "pg_ctl", "promote"
+            "docker", "compose", "-f", "tests/integration/multinode/docker-compose.multinode.yml", "exec", "-u", "postgres", "-T", "pg_replica", "pg_ctl", "promote"
         ])
         
         # Now wait for the broker to proceed with startup
@@ -68,14 +68,14 @@ def test_read_replica_pauses_mqtt():
     except AssertionError as e:
         print(f"\nAssertion failed: {e}\nPrinting pg_replica logs:\n")
         logs = subprocess.check_output([
-            "docker", "compose"", "-f", "tests/integration/multinode/"docker", "compose".multinode.yml", "logs", "pg_replica"
+            "docker", "compose", "-f", "tests/integration/multinode/docker-compose.multinode.yml", "logs", "pg_replica"
         ]).decode('utf-8')
         print(logs)
         raise
     finally:
         print("Tearing down multinode cluster...")
         subprocess.check_call([
-            "docker", "compose"", "-f", "tests/integration/multinode/"docker", "compose".multinode.yml", "down", "-v"
+            "docker", "compose", "-f", "tests/integration/multinode/docker-compose.multinode.yml", "down", "-v"
         ])
 
 if __name__ == "__main__":
