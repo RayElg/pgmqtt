@@ -108,6 +108,7 @@ def setup_cdc_table(table, topic_pattern, payload_pattern="{{ columns.msg }}", q
         f"SELECT pgmqtt_add_mapping('public', '{table}', "
         f"'{topic_pattern}', '{payload_pattern}', {qos});"
     )
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 
 def drain_publishes(s, count, ack=False, timeout_per=3.0):

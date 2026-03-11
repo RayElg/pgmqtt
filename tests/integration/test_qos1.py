@@ -55,6 +55,7 @@ def test_qos1_broker_publish():
     run_psql("CREATE TABLE qos1_test (id serial primary key, name text, value text);")
     run_psql("ALTER TABLE qos1_test REPLICA IDENTITY FULL;")
     run_psql("SELECT pgmqtt_add_mapping('public', 'qos1_test', 'test/{{ columns.name }}', '{{ columns.value }}', 1);")
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((MQTT_HOST, MQTT_PORT))

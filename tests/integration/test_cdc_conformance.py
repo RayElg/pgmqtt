@@ -34,6 +34,7 @@ def setup_table_and_mapping(table_name, topic_pattern):
     run_sql(f"CREATE TABLE {table_name} (id serial PRIMARY KEY, data text);")
     run_sql(f"ALTER TABLE {table_name} REPLICA IDENTITY FULL;")
     run_sql(f"SELECT pgmqtt_add_mapping('public', '{table_name}', '{topic_pattern}', 'payload');")
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 def cdc_publish(table_name, data):
     run_sql(f"INSERT INTO {table_name} (data) VALUES ('{data}');")

@@ -415,29 +415,27 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
         accept_mqtt_connections(&mqtt_listener, &mut clients, &mut session_db_actions);
         accept_ws_connections(&ws_listener, &mut clients, &mut session_db_actions);
 
-        let mut pending_publishes = Vec::new();
+        let mut publishes = Vec::new();
         poll_mqtt_clients(
             &mut clients,
-            &mut pending_publishes,
+            &mut publishes,
             &mut session_db_actions,
         );
-        publish_messages_batch(pending_publishes, &mut clients);
 
         // ── CDC: load mappings, advance slot, drain ring buffer ──
         cdc_tick(slot_name);
 
         // Send pending messages to clients
-        let mut extra_publishes = Vec::new();
         publish_pending_messages(
             &mut clients,
-            &mut extra_publishes,
+            &mut publishes,
             &mut session_db_actions,
         );
 
         // Periodically resend unacked QoS 1 messages
-        redeliver_unacked_messages(&mut clients, &mut extra_publishes, &mut session_db_actions);
+        redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
 
-        publish_messages_batch(extra_publishes, &mut clients);
+        publish_messages_batch(publishes, &mut clients);
 
         // Sweep sessions whose Session Expiry Interval has elapsed
         sweep_expired_sessions(&mut session_db_actions);

@@ -54,7 +54,9 @@ RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample &
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "host    all             all             127.0.0.1/32            trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
+    echo "host    all             all             ::1/128                 trust" >> /usr/share/postgresql/pg_hba.conf.sample
 
 # Auto-create the extension on first startup
 RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \

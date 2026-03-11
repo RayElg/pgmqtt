@@ -116,7 +116,11 @@ def test_rendered_qos():
     # Re-configure mapping for QOS 1
     print("Updating mapping to QOS 1...")
     run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 1);")
-    
+
+    # Wait for the server's 5-second mapping reload cache to expire
+    print("Waiting 6s for mapping cache to expire...")
+    time.sleep(6)
+
     print("Testing Rendered QOS 1...")
     run_sql("INSERT INTO qos_test_table (name, val) VALUES ('qos1', 'message1');")
     res = recv_packet(s, timeout=5.0)

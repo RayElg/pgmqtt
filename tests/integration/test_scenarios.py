@@ -147,7 +147,8 @@ def test_comprehensive_demo():
     # 2. Add Mappings
     run_psql("SELECT pgmqtt_add_mapping('public', 'demo_users', 'presence/{{columns.username}}', '{\"status\": \"{{columns.status}}\"}');")
     run_psql("SELECT pgmqtt_add_mapping('public', 'demo_iot', 'telemetry/{{columns.device_id}}', '{\"val\": {{columns.reading}}, \"u\": \"{{columns.unit}}\"}');")
-    
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
+
     # 3. Connect and subscribe to everything
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))

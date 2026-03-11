@@ -64,6 +64,7 @@ def setup_table(table="session_expiry_test"):
         f"SELECT pgmqtt_add_mapping('public', '{table}', "
         f"'test/session/expiry', '{{{{ columns.msg }}}}', 1);"
     )
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 
 # ---------------------------------------------------------------------------
