@@ -106,8 +106,9 @@ def test_flow_control_queues_not_drops():
 
     # 2. Insert TOTAL rows — each triggers a QoS 1 CDC PUBLISH
     print(f"  ! Inserting {TOTAL} rows into CDC table...")
-    for i in range(TOTAL):
-        run_psql(f"INSERT INTO {table} (val) VALUES ('msg-{i}');")
+    # Batch insert instead of one-by-one to speed up the test
+    insert_sql = ", ".join([f"('msg-{i}')" for i in range(TOTAL)])
+    run_psql(f"INSERT INTO {table} (val) VALUES {insert_sql};")
 
     # 3. Collect the first MAX_INFLIGHT PUBLISHes (do NOT ack them)
     print(f"  ! Collecting initial {MAX_INFLIGHT} publishes (no ACK)...")
@@ -191,8 +192,9 @@ def test_fast_ack_receives_all():
 
     # 2. Insert rows
     print(f"  ! Inserting {TOTAL} rows...")
-    for i in range(TOTAL):
-        run_psql(f"INSERT INTO {table} (val) VALUES ('fast-msg-{i}');")
+    # Batch insert instead of one-by-one to speed up the test
+    insert_sql = ", ".join([f"('fast-msg-{i}')" for i in range(TOTAL)])
+    run_psql(f"INSERT INTO {table} (val) VALUES {insert_sql};")
 
     # 3. Receive and ACK everything
     received = 0

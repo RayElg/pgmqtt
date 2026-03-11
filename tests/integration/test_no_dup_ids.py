@@ -110,18 +110,25 @@ def test_many_concurrent_clients(num_clients=200):
     assert len(sockets) == num_clients, f"Only {len(sockets)}/{num_clients} connected"
 
     print("Verifying all clients are still alive (no ID collisions caused disconnects)...")
-    alive_count = 0
-    for i, s in enumerate(sockets):
+
+    def verify_client(i, s):
         try:
             s.sendall(bytes([0xC0, 0x00]))
-            pingresp = recv_packet(s, timeout=5)
+            pingresp = recv_packet(s, timeout=2)
             if pingresp == bytes([0xD0, 0x00]):
-                alive_count += 1
+                return True
             else:
-                print(f"  ✗ Client {i} socket did not respond properly to PING")
+                return False
         except Exception as e:
-            print(f"  ✗ Error communicating with Client {i}: {e}")
-            
+            return False
+
+    alive_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(verify_client, i, s): i for i, s in enumerate(sockets)}
+        for future in concurrent.futures.as_completed(futures, timeout=15):
+            if future.result():
+                alive_count += 1
+
     print(f"  ✓ {alive_count} clients alive")
     assert alive_count == num_clients, f"Only {alive_count}/{num_clients} alive"
 
