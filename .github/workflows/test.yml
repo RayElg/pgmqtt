@@ -37,10 +37,9 @@ jobs:
         run: |
           docker compose up -d --build
 
-      - name: Wait for services to be ready
+      - name: Wait for PostgreSQL to be ready
         run: |
-          docker compose ps
-          sleep 10
+          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U postgres; do sleep 2; done'
 
       - name: Run Python integration tests
         run: |
