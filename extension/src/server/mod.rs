@@ -872,6 +872,8 @@ fn finish_connect(
         let sess = s.entry(client_id.clone()).or_insert_with(MqttSession::new);
         // Stamp the new expiry interval from the fresh CONNECT
         sess.expiry_interval = packet.session_expiry_interval;
+        // Stamp the receive_maximum from the CONNECT (needed to enforce per-session limits)
+        sess.receive_maximum = packet.receive_maximum;
         // Clear the disconnected timestamp since the client is reconnecting
         sess.disconnected_at = None;
         (sess.next_packet_id, sess.expiry_interval)
@@ -913,7 +915,7 @@ fn finish_connect(
                     *sent_at = std::time::Instant::now();
                 }
                 // 2. Drain the pending queue into inflight and add to send list.
-                let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, packet.receive_maximum as usize);
+                let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
                 while session.inflight.len() < inflight_limit {
                     if let Some(queued) = session.queue.pop_front() {
                         let pid = session.next_packet_id;
@@ -1202,15 +1204,15 @@ fn publish_messages_batch(pending: Vec<PendingPublish>, clients: &mut HashMap<St
             for msg in to_publish {
                 topic_buffer::push(msg);
             }
-        }
 
-        // After successful commit, send PUBACKs
-        for p in persistent {
-            if p.qos == 1 {
-                if let Some(pid) = p.packet_id {
-                    if let Some(client) = clients.get_mut(&p.log_sender) {
-                        let puback = mqtt::build_puback(pid);
-                        let _ = client.transport.write_all(&puback);
+            // Send PUBACKs only after successful commit — MQTT at-least-once semantics.
+            for p in persistent {
+                if p.qos == 1 {
+                    if let Some(pid) = p.packet_id {
+                        if let Some(client) = clients.get_mut(&p.log_sender) {
+                            let puback = mqtt::build_puback(pid);
+                            let _ = client.transport.write_all(&puback);
+                        }
                     }
                 }
             }
@@ -1270,32 +1272,38 @@ fn handle_mqtt_packet(
                     packet_id
                 );
             }
-            // Slot freed — promote next queued message into inflight.
+            // Slot freed — promote next queued message into inflight (if within receive_maximum).
             let (next_pkt, db_action) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(&client_id) {
-                    if let Some(queued) = session.queue.pop_front() {
-                        let pid = session.next_packet_id;
-                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
-                        if session.next_packet_id == 0 {
-                            session.next_packet_id = 1;
-                        }
-                        session.inflight.insert(
-                            pid,
-                            (
-                                queued.topic.clone(),
-                                queued.payload.clone(),
-                                queued.id,
-                                std::time::Instant::now(),
-                            ),
-                        );
-                        (
-                            Some(mqtt::build_publish_qos1(
-                                &queued.topic,
-                                &queued.payload,
+                    let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
+                    // Only promote if there's space and a queued message
+                    if session.inflight.len() < inflight_limit && !session.queue.is_empty() {
+                        if let Some(queued) = session.queue.pop_front() {
+                            let pid = session.next_packet_id;
+                            session.next_packet_id = session.next_packet_id.wrapping_add(1);
+                            if session.next_packet_id == 0 {
+                                session.next_packet_id = 1;
+                            }
+                            session.inflight.insert(
                                 pid,
-                            )),
-                            queued.id.map(|id| (id, pid)),
-                        )
+                                (
+                                    queued.topic.clone(),
+                                    queued.payload.clone(),
+                                    queued.id,
+                                    std::time::Instant::now(),
+                                ),
+                            );
+                            (
+                                Some(mqtt::build_publish_qos1(
+                                    &queued.topic,
+                                    &queued.payload,
+                                    pid,
+                                )),
+                                queued.id.map(|id| (id, pid)),
+                            )
+                        } else {
+                            (None, None)
+                        }
                     } else {
                         (None, None)
                     }

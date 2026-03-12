@@ -241,19 +241,37 @@ def test_client_publish_survives_restart():
     s_pub.close()
     print(f"  ✓ Publisher received PUBACK")
 
-    # 3. Verify the message row exists in the DB (proves the transaction committed)
+    # 3. Verify the message row exists in pgmqtt_messages — committed in the SAME transaction
+    #    as the PUBACK, so this should be visible immediately.
     time.sleep(0.5)
     rows = run_psql(
-        "SELECT COUNT(*) FROM pgmqtt_messages m "
-        "JOIN pgmqtt_session_messages sm ON sm.message_id = m.id "
-        f"WHERE sm.client_id = '{sub_id}';"
+        f"SELECT COUNT(*) FROM pgmqtt_messages WHERE topic = '{topic}';"
     )
     count = rows[0][0] if rows else 0
     assert count >= 1, (
-        f"Message not found in pgmqtt_messages for {sub_id}. "
-        "Bug #2: topic_buffer::push may have happened before the DB commit."
+        f"Message not found in pgmqtt_messages for topic '{topic}'. "
+        "Bug #2: publish_messages_batch did not persist the message before sending PUBACK."
     )
     print(f"  ✓ Message found in pgmqtt_messages (count={count})")
+
+    # Also wait for pgmqtt_session_messages (committed the tick AFTER publish_messages_batch).
+    deadline = time.time() + 5.0
+    sm_count = 0
+    while time.time() < deadline:
+        rows = run_psql(
+            "SELECT COUNT(*) FROM pgmqtt_session_messages sm "
+            "JOIN pgmqtt_messages m ON sm.message_id = m.id "
+            f"WHERE sm.client_id = '{sub_id}';"
+        )
+        sm_count = rows[0][0] if rows else 0
+        if sm_count >= 1:
+            break
+        time.sleep(0.2)
+    assert sm_count >= 1, (
+        f"Message not routed to {sub_id} in pgmqtt_session_messages (after 5s). "
+        "InsertMessageBatch may not have run — check if subscriber session was in SESSIONS."
+    )
+    print(f"  ✓ Message routed to session (sm_count={sm_count})")
 
     # 4. Restart the broker — in-memory topic_buffer is wiped
     restart_broker()
@@ -370,9 +388,10 @@ def test_receive_maximum_enforced():
             continue
         ptype = (pkt[0] & 0xF0) >> 4
         if ptype == MQTTControlPacket.PUBLISH:
-            _, _, qos_r, _, _, pid, _ = validate_publish(pkt)
+            _, _, qos_r, dup, _, pid, _ = validate_publish(pkt)
             assert qos_r == 1
-            burst_pids.append(pid)
+            if not dup:  # Only count new deliveries, not DUP retransmits
+                burst_pids.append(pid)
 
     assert len(burst_pids) <= RECV_MAX, (
         f"Broker sent {len(burst_pids)} QoS 1 PUBLISHes before any PUBACK, "

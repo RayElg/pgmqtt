@@ -53,7 +53,6 @@ fn ensure_tables_exist() {
             payload bytea,
             qos int DEFAULT 0,
             retain boolean DEFAULT false,
-            ref_count integer NOT NULL DEFAULT 0,
             created_at timestamptz DEFAULT NOW()
         )",
         "create messages table",
@@ -61,8 +60,8 @@ fn ensure_tables_exist() {
 
     // Migration: add qos to messages if missing
     let _ = Spi::run("ALTER TABLE pgmqtt_messages ADD COLUMN IF NOT EXISTS qos int DEFAULT 0");
-    // Migration: add ref_count for message cleanup optimization
-    let _ = Spi::run("ALTER TABLE pgmqtt_messages ADD COLUMN IF NOT EXISTS ref_count integer DEFAULT 0");
+    // Migration: drop ref_count (replaced by NOT EXISTS check on pgmqtt_session_messages)
+    let _ = Spi::run("ALTER TABLE pgmqtt_messages DROP COLUMN IF EXISTS ref_count");
 
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_retained (

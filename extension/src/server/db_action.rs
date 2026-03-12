@@ -115,14 +115,10 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         ) {
                             pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
                         }
-                        // Cleanup orphaned messages (CASCADE deletes session_messages, then ref_count = 0)
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_messages WHERE ref_count <= 0 AND retain = false",
-                            None,
-                            &[],
-                        ) {
-                            pgrx::log!("pgmqtt: failed to cleanup orphaned messages: {}", e);
-                        }
+                        // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
+                        // rows. Messages that now have no remaining session_messages are cleaned up
+                        // by the DeleteMessage action when each subscriber ACKs. A global sweep
+                        // here would race with InsertMessageBatch in the same transaction.
                     }
                     SessionDbAction::InsertMessage {
                         client_id,
@@ -140,15 +136,6 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             &args,
                         ) {
                             pgrx::log!("pgmqtt: failed to insert message for session '{}': {}", client_id, e);
-                        }
-                        // Increment ref_count (one per session_message inserted)
-                        let args2: Vec<DatumWithOid> = vec![message_id.into()];
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_messages SET ref_count = ref_count + 1 WHERE id = $1",
-                            None,
-                            &args2,
-                        ) {
-                            pgrx::log!("pgmqtt: failed to increment ref_count for message {}: {}", message_id, e);
                         }
                     }
                     SessionDbAction::InsertMessageBatch {
@@ -184,16 +171,6 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         if let Err(e) = client.update(&query, None, &args) {
                             pgrx::log!("pgmqtt: failed to batch insert messages for message {}: {}", message_id, e);
                         }
-
-                        // Increment ref_count by the number of rows we attempted to insert
-                        let args2: Vec<DatumWithOid> = vec![message_id.into(), (entries.len() as i32).into()];
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_messages SET ref_count = ref_count + $2 WHERE id = $1",
-                            None,
-                            &args2,
-                        ) {
-                            pgrx::log!("pgmqtt: failed to update ref_count for message {}: {}", message_id, e);
-                        }
                     }
                     SessionDbAction::UpdateMessageInflight {
                         client_id,
@@ -225,25 +202,20 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
-                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
+                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", client_id, e);
                         }
-                        // Decrement ref_count and delete message if orphaned (not retained and no refs)
+                        // Delete the message itself if no other session is waiting for it.
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
                         if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_messages \
-                             WHERE id = $1 AND ref_count <= 1 AND retain = false",
+                             WHERE id = $1 AND retain = false \
+                               AND NOT EXISTS ( \
+                                   SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1 \
+                               )",
                             None,
                             &args2,
                         ) {
                             pgrx::log!("pgmqtt: failed to delete orphaned message {}: {}", message_id, e);
-                        }
-                        // Decrement ref_count for retained messages or those with other refs
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_messages SET ref_count = GREATEST(0, ref_count - 1) WHERE id = $1",
-                            None,
-                            &args2,
-                        ) {
-                            pgrx::log!("pgmqtt: failed to decrement ref_count for message {}: {}", message_id, e);
                         }
                     }
                     SessionDbAction::InsertSubscription {

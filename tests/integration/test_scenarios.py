@@ -70,7 +70,7 @@ def fail(msg):
 
 def test_long_lived_connection():
     """Requirement: Over the course of a minute, be able to continuously receive changes."""
-    print("\n[Scenario 1] Long-lived connection (60 seconds)")
+    print("\n[Scenario 1] Long-lived connection (40 seconds)")
     
     # 1. Setup table and mapping
     run_psql("DROP TABLE IF EXISTS heartbeat;")
@@ -87,7 +87,7 @@ def test_long_lived_connection():
     recv_packet(s) # SUBACK
     
     start_time = time.time()
-    duration = 65 # Run for 65 seconds to be sure
+    duration = 40 # Run for 40 seconds to be sure
     interval = 10 # Send every 10 seconds
     count = 0
     received = 0

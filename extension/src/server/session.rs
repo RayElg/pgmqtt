@@ -21,6 +21,9 @@ pub struct MqttSession {
     pub expiry_interval: u32,
     /// Set when the client disconnects (used by the session sweeper).
     pub disconnected_at: Option<std::time::Instant>,
+    /// MQTT 5.0 Receive Maximum: max unacknowledged QoS 1/2 messages allowed.
+    /// Default: 65535 per spec. Set on CONNECT.
+    pub receive_maximum: u16,
 }
 
 impl MqttSession {
@@ -32,6 +35,7 @@ impl MqttSession {
             queue: VecDeque::new(),
             expiry_interval: 0,
             disconnected_at: None,
+            receive_maximum: 65535,
         }
     }
 }

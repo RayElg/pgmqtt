@@ -36,7 +36,7 @@ from proto_utils import (
 # ---------------------------------------------------------------------------
 # Constants – must match server.rs MAX_INFLIGHT_MESSAGES
 # ---------------------------------------------------------------------------
-MAX_INFLIGHT = 500
+MAX_INFLIGHT = 800
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,6 +52,7 @@ def setup_table(table="flow_control_test"):
         f"SELECT pgmqtt_add_mapping('public', '{table}', "
         f"'test/flow/{{{{ columns.id }}}}', '{{{{ columns.val }}}}', 1);"
     )
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 
 def drain_all_publish(s, count, timeout_per=3.0):

@@ -62,12 +62,13 @@ def setup_table(table="session_restart_test"):
         f"SELECT pgmqtt_add_mapping('public', '{table}', "
         f"'test/session/restart', '{{{{ columns.msg }}}}', 1);"
     )
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 
 def restart_broker():
     """Restarts the postgres container using docker-compose."""
     print("  ! Restarting broker (postgres)...")
-    subprocess.run(["docker-compose", "restart", "postgres"], check=True)
+    subprocess.run(["docker", "compose", "restart", "postgres"], check=True)
     
     # Wait for the broker to fully come back up
     max_retries = 30
