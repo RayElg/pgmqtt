@@ -202,7 +202,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
-                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", client_id, e);
+                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
                         }
                         // Delete the message itself if no other session is waiting for it.
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
