@@ -23,16 +23,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-timeout paho-mqtt psycopg2-binary
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Node.js dependencies
-        run: |
-          cd tests/integration
-          npm install
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -54,14 +44,23 @@ jobs:
             sleep 2
           done'
 
-      - name: Run Python integration tests
+      - name: Run integration tests
         timeout-minutes: 30
         run: |
-          python -m pytest tests/integration/ --timeout=60 -v
+          python -m pytest tests/integration/ -m "not slow" --timeout=60 -v
 
-      - name: Run WebSocket integration tests
+      - name: Run performance tests
+        timeout-minutes: 15
         run: |
-          python tests/integration/test_websocket_runner.py
+          python -m pytest tests/integration/ -m slow --timeout=120 -v -s 2>&1 | tee perf_output.txt
+
+      - name: Performance results summary
+        if: always()
+        run: |
+          echo "## Performance Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep "PERF |" perf_output.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No perf results found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Dump logs on failure
         if: failure()
