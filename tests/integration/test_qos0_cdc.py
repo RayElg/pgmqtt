@@ -38,6 +38,7 @@ def setup_test_table(table_name, topic_pattern):
         f"'{topic_pattern}', "
         f"'{{{{ columns | tojson }}}}');"
     )
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 def cdc_publish(table_name, data_value):
     """INSERT a row to trigger CDC → MQTT delivery."""

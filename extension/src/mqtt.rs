@@ -5,6 +5,33 @@
 //!   Building : CONNACK, SUBACK, UNSUBACK, PUBLISH (QoS 0), PINGRESP, DISCONNECT
 
 // ---------------------------------------------------------------------------
+// MQTT 5.0 property IDs (used in CONNECT, DISCONNECT variable headers)
+// ---------------------------------------------------------------------------
+
+pub mod property {
+    /// Session Expiry Interval (4-byte integer) — CONNECT/DISCONNECT
+    pub const SESSION_EXPIRY_INTERVAL: u8 = 0x11;
+    /// Receive Maximum (2-byte integer) — CONNECT
+    pub const RECEIVE_MAXIMUM: u8 = 0x21;
+    /// Maximum Packet Size (4-byte integer) — CONNECT
+    pub const MAX_PACKET_SIZE: u8 = 0x27;
+    /// Topic Alias Maximum (2-byte integer) — CONNECT
+    pub const TOPIC_ALIAS_MAX: u8 = 0x22;
+    /// Request Response Information (1-byte) — CONNECT
+    pub const REQUEST_RESPONSE_INFO: u8 = 0x19;
+    /// Request Problem Information (1-byte) — CONNECT
+    pub const REQUEST_PROBLEM_INFO: u8 = 0x17;
+    /// User Property (UTF-8 string pair) — CONNECT/DISCONNECT/others
+    pub const USER_PROPERTY: u8 = 0x26;
+    /// Authentication Method (UTF-8 string) — CONNECT
+    pub const AUTH_METHOD: u8 = 0x15;
+    /// Reason String (UTF-8 string) — DISCONNECT/others
+    pub const REASON_STRING: u8 = 0x1F;
+    /// Payload Format Indicator (1-byte) — PUBLISH
+    pub const PAYLOAD_FORMAT: u8 = 0x01;
+}
+
+// ---------------------------------------------------------------------------
 // Packet types
 // ---------------------------------------------------------------------------
 
@@ -53,9 +80,34 @@ impl PacketType {
 }
 
 // ---------------------------------------------------------------------------
-// Reason codes (MQTT 5.0 subset)
+// Reason codes (MQTT 5.0 subset, represented as u8 for wire format)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReasonCode {
+    /// Success (CONNACK, SUBACK, UNSUBACK, PUBACK, PUBREC, PUBREL, PUBCOMP, AUTH, DISCONNECT)
+    /// Also used as Granted QoS 0 in SUBACK
+    Success = 0x00,
+    /// Granted QoS 1 (SUBACK)
+    GrantedQos1 = 0x01,
+    /// Granted QoS 2 (SUBACK)
+    GrantedQos2 = 0x02,
+    /// Unspecified error
+    UnspecifiedError = 0x80,
+    /// Malformed packet
+    MalformedPacket = 0x81,
+    /// Protocol error
+    ProtocolError = 0x82,
+    /// Not authorized
+    NotAuthorized = 0x87,
+    /// Topic filter invalid
+    TopicFilterInvalid = 0x8F,
+    /// Packet ID in use
+    PacketIdInUse = 0x91,
+}
+
+/// Constants for backwards compatibility — use ReasonCode enum instead
 #[allow(dead_code)]
 pub mod reason {
     pub const SUCCESS: u8 = 0x00;
@@ -69,6 +121,7 @@ pub mod reason {
     pub const NOT_AUTHORIZED: u8 = 0x87;
     pub const TOPIC_FILTER_INVALID: u8 = 0x8F;
     pub const PACKET_ID_IN_USE: u8 = 0x91;
+    pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +236,97 @@ fn skip_properties(buf: &[u8], offset: usize) -> Result<usize> {
     Ok(end)
 }
 
+/// Parse CONNECT properties, extracting the Session Expiry Interval (0x11) and Receive Maximum (0x21).
+/// Returns `(session_expiry_interval, receive_maximum, new_offset)`.
+fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usize)> {
+    if offset >= buf.len() {
+        return Ok((0, 65535, offset));
+    }
+    let (prop_len, consumed) = decode_variable_byte_int(&buf[offset..])?;
+    let props_start = offset + consumed;
+    let props_end = props_start + prop_len;
+    if buf.len() < props_end {
+        return Err(MqttError::Incomplete);
+    }
+    let mut session_expiry_interval: u32 = 0;
+    let mut receive_maximum: u16 = 65535; // Default per MQTT spec
+
+    let mut i = props_start;
+    while i < props_end {
+        let prop_id = buf[i];
+        i += 1;
+        match prop_id {
+            property::SESSION_EXPIRY_INTERVAL => {
+                // 4-byte big-endian u32
+                if i + 4 > props_end {
+                    return Err(MqttError::MalformedPacket(
+                        "Session Expiry Interval truncated".into(),
+                    ));
+                }
+                session_expiry_interval =
+                    u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+                i += 4;
+            }
+            property::RECEIVE_MAXIMUM => {
+                // 2-byte big-endian u16
+                if i + 2 > props_end {
+                    return Err(MqttError::MalformedPacket(
+                        "Receive Maximum truncated".into(),
+                    ));
+                }
+                receive_maximum = u16::from_be_bytes([buf[i], buf[i + 1]]);
+                if receive_maximum == 0 {
+                    return Err(MqttError::ProtocolError(
+                        "Receive Maximum must not be 0".into(),
+                    ));
+                }
+                i += 2;
+            }
+            property::MAX_PACKET_SIZE => {
+                // 4 bytes, skip
+                i += 4;
+            }
+            property::TOPIC_ALIAS_MAX => {
+                // 2 bytes, skip
+                i += 2;
+            }
+            property::REQUEST_RESPONSE_INFO => {
+                // 1 byte, skip
+                i += 1;
+            }
+            property::REQUEST_PROBLEM_INFO => {
+                // 1 byte, skip
+                i += 1;
+            }
+            property::USER_PROPERTY => {
+                // UTF-8 key + value pair
+                let (_, new_off) = decode_utf8(buf, i)?;
+                let (_, new_off) = decode_utf8(buf, new_off)?;
+                i = new_off;
+            }
+            property::AUTH_METHOD => {
+                // UTF-8 string
+                let (_, new_off) = decode_utf8(buf, i)?;
+                i = new_off;
+            }
+            0x16 => {
+                // Authentication Data – binary
+                let (_, new_off) = decode_binary(buf, i)?;
+                i = new_off;
+            }
+            _ => {
+                // Unknown property – we cannot safely skip without knowing the type.
+                // Treat as malformed.
+                return Err(MqttError::MalformedPacket(format!(
+                    "unknown CONNECT property id 0x{:02x}",
+                    prop_id
+                )));
+            }
+        }
+    }
+    Ok((session_expiry_interval, receive_maximum, props_end))
+}
+
 fn encode_empty_properties() -> Vec<u8> {
     vec![0x00] // property length = 0
 }
@@ -230,6 +374,14 @@ pub fn packet_len(buf: &[u8]) -> Result<usize> {
 // Parsed inbound packets
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub struct Will {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ConnectPacket {
@@ -237,6 +389,12 @@ pub struct ConnectPacket {
     pub clean_start: bool,
     pub keep_alive: u16,
     pub protocol_version: u8,
+    pub will: Option<Will>,
+    /// MQTT 5.0 Session Expiry Interval in seconds. 0 means end at disconnect.
+    /// 0xFFFFFFFF means never expire.
+    pub session_expiry_interval: u32,
+    /// Client's Receive Maximum limit for QoS 1 and 2 inflight messages.
+    pub receive_maximum: u16,
 }
 
 #[derive(Debug)]
@@ -270,7 +428,8 @@ pub enum InboundPacket {
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
     Pingreq,
-    Disconnect,
+    /// (reason_code, optional Session Expiry Interval override)
+    Disconnect(u8, Option<u32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +452,10 @@ pub fn parse_packet(buf: &[u8]) -> Result<(InboundPacket, usize)> {
         PacketType::Subscribe => InboundPacket::Subscribe(parse_subscribe(payload)?),
         PacketType::Unsubscribe => InboundPacket::Unsubscribe(parse_unsubscribe(payload)?),
         PacketType::Pingreq => InboundPacket::Pingreq,
-        PacketType::Disconnect => InboundPacket::Disconnect,
+        PacketType::Disconnect => {
+            let (rc, expiry) = parse_disconnect(payload)?;
+            InboundPacket::Disconnect(rc, expiry)
+        }
         other => return Err(MqttError::UnsupportedPacket(other as u8)),
     };
 
@@ -332,20 +494,31 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
 
     let keep_alive = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
 
-    // Skip CONNECT properties
-    let mut off = skip_properties(buf, off + 4)?;
+    // Parse CONNECT properties (extract Session Expiry Interval and Receive Maximum)
+    let (session_expiry_interval, receive_maximum, new_off) =
+        parse_connect_properties(buf, off + 4)?;
+    let mut off = new_off;
 
     // Client ID
     let (client_id, new_off) = decode_utf8(buf, off)?;
     off = new_off;
 
-    // Skip will properties + will topic + will payload if present
+    let mut will = None;
     if has_will {
+        // Will Properties
         off = skip_properties(buf, off)?;
-        let (_will_topic, new_off) = decode_utf8(buf, off)?;
+        // Will Topic
+        let (will_topic, new_off) = decode_utf8(buf, off)?;
         off = new_off;
-        let (_will_payload, new_off) = decode_binary(buf, off)?;
+        // Will Payload
+        let (will_payload, new_off) = decode_binary(buf, off)?;
         off = new_off;
+        will = Some(Will {
+            topic: will_topic,
+            payload: will_payload,
+            qos: _will_qos,
+            retain: _will_retain,
+        });
     }
 
     // Skip username/password if present
@@ -362,6 +535,9 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         clean_start,
         keep_alive,
         protocol_version,
+        will,
+        session_expiry_interval,
+        receive_maximum,
     })
 }
 
@@ -463,6 +639,59 @@ fn parse_puback(buf: &[u8]) -> Result<u16> {
     let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
     // MQTT 5.0 PUBACK might have a reason code and properties, but we skip them for current impl
     Ok(packet_id)
+}
+
+/// Parse DISCONNECT packet.
+/// Returns `(reason_code, optional Session Expiry Interval override)`.
+/// Per MQTT 5.0 §3.14.2.2.2, the client may include a Session Expiry Interval
+/// property to override the value set at CONNECT (e.g. 0 to end the session).
+fn parse_disconnect(buf: &[u8]) -> Result<(u8, Option<u32>)> {
+    if buf.is_empty() {
+        return Ok((reason::NORMAL_DISCONNECT, None));
+    }
+    let reason_code = buf[0];
+    if buf.len() < 2 {
+        return Ok((reason_code, None));
+    }
+
+    // Parse properties — only extract Session Expiry Interval (0x11)
+    let (prop_len, consumed) = decode_variable_byte_int(&buf[1..])?;
+    let props_start = 1 + consumed;
+    let props_end = props_start + prop_len;
+    if buf.len() < props_end {
+        return Ok((reason_code, None));
+    }
+
+    let mut session_expiry: Option<u32> = None;
+    let mut i = props_start;
+    while i < props_end {
+        let prop_id = buf[i];
+        i += 1;
+        match prop_id {
+            property::SESSION_EXPIRY_INTERVAL => {
+                if i + 4 > props_end {
+                    break;
+                }
+                session_expiry =
+                    Some(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+                i += 4;
+            }
+            property::REASON_STRING => {
+                // UTF-8, skip
+                if i + 2 > props_end { break; }
+                let len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
+                i += 2 + len;
+            }
+            property::USER_PROPERTY => {
+                // Two UTF-8 strings, skip
+                let (_, new_off) = decode_utf8(buf, i)?;
+                let (_, new_off) = decode_utf8(buf, new_off)?;
+                i = new_off;
+            }
+            _ => break,
+        }
+    }
+    Ok((reason_code, session_expiry))
 }
 
 // ---------------------------------------------------------------------------

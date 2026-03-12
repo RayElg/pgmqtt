@@ -2,7 +2,7 @@ import struct
 import os
 
 # Broker configuration from environment variables
-MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
+MQTT_HOST = os.environ.get('MQTT_HOST', '127.0.0.1')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
 
 def get_broker_config():

@@ -18,7 +18,7 @@ import subprocess
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-MQTT_HOST = "localhost"
+MQTT_HOST = "127.0.0.1"
 MQTT_PORT = 1883
 NUM_CLIENTS = 50
 NUM_MESSAGES = 1000
@@ -111,6 +111,7 @@ def setup_db():
     run_sql("ALTER TABLE load_test REPLICA IDENTITY FULL;")
     # Map: load/test/{{val}}
     run_sql("SELECT pgmqtt_add_mapping('public', 'load_test', 'load/test/{{columns.val}}', '{\"val\": {{columns.val}}}');")
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
 
 def generate_load():
     print(f"  [DB] Generating {NUM_MESSAGES} messages in batches of {BATCH_SIZE}...")

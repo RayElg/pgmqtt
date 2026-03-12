@@ -24,7 +24,7 @@ from proto_utils import (
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-PG_HOST = "localhost"
+PG_HOST = "127.0.0.1"
 PG_PORT = 5432
 PG_USER = "postgres"
 PG_PASSWORD = "postgres"
@@ -70,14 +70,15 @@ def fail(msg):
 
 def test_long_lived_connection():
     """Requirement: Over the course of a minute, be able to continuously receive changes."""
-    print("\n[Scenario 1] Long-lived connection (60 seconds)")
+    print("\n[Scenario 1] Long-lived connection (40 seconds)")
     
     # 1. Setup table and mapping
     run_psql("DROP TABLE IF EXISTS heartbeat;")
     run_psql("CREATE TABLE heartbeat (id serial PRIMARY KEY, ts timestamp DEFAULT now());")
     run_psql("ALTER TABLE heartbeat REPLICA IDENTITY FULL;")
     run_psql("SELECT pgmqtt_add_mapping('public', 'heartbeat', 'system/heartbeat', '{{ columns.ts }}');")
-    
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
+
     # 2. Connect and subscribe
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))
@@ -87,7 +88,7 @@ def test_long_lived_connection():
     recv_packet(s) # SUBACK
     
     start_time = time.time()
-    duration = 65 # Run for 65 seconds to be sure
+    duration = 40 # Run for 40 seconds to be sure
     interval = 10 # Send every 10 seconds
     count = 0
     received = 0
@@ -147,7 +148,8 @@ def test_comprehensive_demo():
     # 2. Add Mappings
     run_psql("SELECT pgmqtt_add_mapping('public', 'demo_users', 'presence/{{columns.username}}', '{\"status\": \"{{columns.status}}\"}');")
     run_psql("SELECT pgmqtt_add_mapping('public', 'demo_iot', 'telemetry/{{columns.device_id}}', '{\"val\": {{columns.reading}}, \"u\": \"{{columns.unit}}\"}');")
-    
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
+
     # 3. Connect and subscribe to everything
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))

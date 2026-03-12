@@ -57,11 +57,6 @@ impl TopicBufferState {
                 }
             }
             buf.push_back(msg.clone());
-            pgrx::log!(
-                "pgmqtt: queued QoS 0 message for topic='{}' (buf_qos0_len={})",
-                msg.topic,
-                buf.len()
-            );
         } else {
             let buf = self
                 .buffers_qos1
@@ -72,12 +67,6 @@ impl TopicBufferState {
             if buf.len() % 1000 == 0 {
                 pgrx::log!(
                     "WARNING: pgmqtt topic buffer (QoS 1+) for topic='{}' is growing large (buf_qos1_len={}).",
-                    msg.topic,
-                    buf.len()
-                );
-            } else {
-                pgrx::log!(
-                    "pgmqtt: queued QoS 1+ message for topic='{}' (buf_qos1_len={})",
                     msg.topic,
                     buf.len()
                 );

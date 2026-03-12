@@ -29,6 +29,10 @@ def test_qos1_client_publish():
         s.sendall(create_connect_packet("pub_client"))
         recv_packet(s)
         
+        # Subscribe to ensure persistence path is considered (optional but good for consistency)
+        s.sendall(create_subscribe_packet(1, "test/qos1", qos=1))
+        recv_packet(s)
+        
         packet_id = 123
         s.sendall(create_publish_packet("test/qos1", b"hello", qos=1, packet_id=packet_id))
         resp = recv_packet(s)
@@ -51,6 +55,7 @@ def test_qos1_broker_publish():
     run_psql("CREATE TABLE qos1_test (id serial primary key, name text, value text);")
     run_psql("ALTER TABLE qos1_test REPLICA IDENTITY FULL;")
     run_psql("SELECT pgmqtt_add_mapping('public', 'qos1_test', 'test/{{ columns.name }}', '{{ columns.value }}', 1);")
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((MQTT_HOST, MQTT_PORT))

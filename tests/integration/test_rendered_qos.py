@@ -6,7 +6,7 @@ import os
 import subprocess
 import test_utils
 
-MQTT_HOST = "localhost"
+MQTT_HOST = "127.0.0.1"
 MQTT_PORT = 1883
 
 from test_utils import run_sql
@@ -85,7 +85,10 @@ def test_rendered_qos():
     run_sql("DROP TABLE IF EXISTS qos_test_table;")
     run_sql("CREATE TABLE qos_test_table (id serial primary key, name text, val text);")
     run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 0);") # Mapping 0: QOS 0
-    
+    # Wait for server's 5s mapping cache to expire before inserting
+    print("Waiting 6s for initial mapping cache to expire...")
+    time.sleep(6)
+
     # Connect subscriber
     print("Connecting subscriber with QOS 1 subscription...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -116,7 +119,11 @@ def test_rendered_qos():
     # Re-configure mapping for QOS 1
     print("Updating mapping to QOS 1...")
     run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 1);")
-    
+
+    # Wait for the server's 5-second mapping reload cache to expire
+    print("Waiting 6s for mapping cache to expire...")
+    time.sleep(6)
+
     print("Testing Rendered QOS 1...")
     run_sql("INSERT INTO qos_test_table (name, val) VALUES ('qos1', 'message1');")
     res = recv_packet(s, timeout=5.0)
