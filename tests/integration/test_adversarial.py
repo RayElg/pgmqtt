@@ -268,3 +268,28 @@ def test_subscribe_before_connect():
     data = recv_packet(s, timeout=2.0)
     assert data is None, "Connection should be closed for packet before CONNECT"
     s.close()
+
+
+def test_publish_before_connect():
+    """PUBLISH before CONNECT should close connection."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+
+    s.sendall(create_publish_packet("test/topic", b"data", qos=0))
+    data = recv_packet(s, timeout=2.0)
+    assert data is None, "Connection should be closed for packet before CONNECT"
+    s.close()
+
+
+@pytest.mark.xfail(reason="Maximum packet size validation not enforced")
+def test_payload_exceeds_maximum_packet_size():
+    """Payload exceeding Maximum Packet Size should be rejected."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet("adv_max_size"))
+    recv_packet(s)
+
+    huge_payload = b"X" * (1024 * 1024 * 10)  # 10 MB
+    s.sendall(create_publish_packet("test/huge", huge_payload, qos=0))
+    assert _expect_disconnect_or_close(s, expected_reason=ReasonCode.PACKET_TOO_LARGE)
+    s.close()
