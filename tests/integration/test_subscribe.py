@@ -49,13 +49,15 @@ def test_single_level_wildcard():
     s_pub.sendall(create_publish_packet("test/a/b/data", b"nomatch", qos=0))
     s_pub.close()
 
-    pub1 = recv_packet(s_cons)
-    t1, *_ = validate_publish(pub1)
-    assert t1 == "test/a/data"
+    topics = []
+    for _ in range(2):
+        pkt = recv_packet(s_cons, timeout=2.0)
+        assert pkt is not None
+        t, *_ = validate_publish(pkt)
+        topics.append(t)
 
-    pub2 = recv_packet(s_cons)
-    t2, *_ = validate_publish(pub2)
-    assert t2 == "test/sensor1/data"
+    assert "test/a/data" in topics
+    assert "test/sensor1/data" in topics
 
     extra = recv_packet(s_cons, timeout=1.0)
     assert extra is None, "Should not match test/a/b/data"

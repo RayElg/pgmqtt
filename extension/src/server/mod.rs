@@ -809,7 +809,6 @@ fn handle_new_connection(
             }
             Ok(_) => {
                 log!("pgmqtt mqtt: expected CONNECT, got something else");
-                let _ = transport.write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR));
                 return;
             }
             Err(mqtt::MqttError::Incomplete) => {
