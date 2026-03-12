@@ -110,9 +110,14 @@ def _count_messages(topic_prefix):
     return rows[0][0] if rows else 0
 
 
+# ── Module-level subscriber socket (kept alive for all tests) ──────────────────
+_module_sub = None
+
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup_module(module=None):
+    global _module_sub
     run_sql("DROP TABLE IF EXISTS wct_qos1_table;")
     run_sql("DROP TABLE IF EXISTS wct_qos0_table;")
     run_sql(
@@ -134,8 +139,23 @@ def setup_module(module=None):
         "SELECT pgmqtt_add_mapping('public', 'wct_qos0_table', "
         "'wct/qos0/{{ columns.name }}', '{{ columns.val }}', 0);"
     )
-    # Wait one tick so mappings are loaded
-    time.sleep(TICK_WAIT)
+    # Wait for server's 5s mapping cache to expire
+    time.sleep(6)
+
+    # Keep a persistent subscriber so QoS 1 CDC messages get routed and
+    # persisted to pgmqtt_messages (broker only stores messages with subscribers).
+    _module_sub = _connect("wct_module_sub", clean_start=True)
+    _subscribe(_module_sub, 1, "wct/#", qos=1)
+
+
+def teardown_module(module=None):
+    global _module_sub
+    if _module_sub is not None:
+        try:
+            _module_sub.close()
+        except Exception:
+            pass
+        _module_sub = None
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────

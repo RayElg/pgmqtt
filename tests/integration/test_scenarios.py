@@ -77,7 +77,8 @@ def test_long_lived_connection():
     run_psql("CREATE TABLE heartbeat (id serial PRIMARY KEY, ts timestamp DEFAULT now());")
     run_psql("ALTER TABLE heartbeat REPLICA IDENTITY FULL;")
     run_psql("SELECT pgmqtt_add_mapping('public', 'heartbeat', 'system/heartbeat', '{{ columns.ts }}');")
-    
+    time.sleep(6)  # Wait for server's 5s mapping cache to expire
+
     # 2. Connect and subscribe
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))

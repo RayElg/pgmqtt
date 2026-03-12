@@ -85,7 +85,10 @@ def test_rendered_qos():
     run_sql("DROP TABLE IF EXISTS qos_test_table;")
     run_sql("CREATE TABLE qos_test_table (id serial primary key, name text, val text);")
     run_sql("SELECT pgmqtt_add_mapping('public', 'qos_test_table', 'test/{{ columns.name }}', '{{ columns.val }}', 0);") # Mapping 0: QOS 0
-    
+    # Wait for server's 5s mapping cache to expire before inserting
+    print("Waiting 6s for initial mapping cache to expire...")
+    time.sleep(6)
+
     # Connect subscriber
     print("Connecting subscriber with QOS 1 subscription...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
