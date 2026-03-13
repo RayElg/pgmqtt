@@ -30,18 +30,14 @@ RUN cargo install --locked cargo-pgrx --version 0.16.1
 RUN cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
 
 # Set up the work directory
-WORKDIR /usr/src/extension
-
-# Copy the extension source code
-# We copy everything so that cargo pgrx package has full context
-COPY extension ./extension
-# Also copy the top-level Cargo workspace files if any, but based on structure we just have extension/
-# If the user has a workspace at root, we might need to adjust.
-# The `ls` earlier showed `extension` is a subdir.
-# Docker build context will be the root `pgmqtt`.
-
-# Build the package
 WORKDIR /usr/src/extension/extension
+
+# Copy the complete extension source
+COPY extension/Cargo.toml ./
+COPY extension/src ./src
+COPY extension/pgmqtt.control ./
+
+# Build the extension package
 RUN cargo pgrx package && \
     mkdir -p /app/dist && \
     cp -r target/release/pgmqtt-pg16/* /app/dist/
@@ -58,7 +54,9 @@ RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample &
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "host    all             all             127.0.0.1/32            trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
+    echo "host    all             all             ::1/128                 trust" >> /usr/share/postgresql/pg_hba.conf.sample
 
 # Auto-create the extension on first startup
 RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \

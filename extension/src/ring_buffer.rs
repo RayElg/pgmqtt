@@ -49,10 +49,6 @@ impl RingBuffer {
         self.buf.drain(..).collect()
     }
 
-    fn peek_all(&self) -> Vec<ChangeEvent> {
-        self.buf.iter().cloned().collect()
-    }
-
     #[allow(dead_code)]
     fn dropped_count(&self) -> u64 {
         self.dropped
@@ -80,13 +76,6 @@ pub fn drain() -> Vec<ChangeEvent> {
     let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
     ensure_init(&mut lock);
     lock.as_mut().unwrap().drain()
-}
-
-/// Peek at all buffered events without removing them.
-pub fn peek_all() -> Vec<ChangeEvent> {
-    let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
-    ensure_init(&mut lock);
-    lock.as_ref().unwrap().peek_all()
 }
 
 /// Return the number of events that were dropped due to overflow.
