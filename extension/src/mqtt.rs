@@ -83,32 +83,7 @@ impl PacketType {
 // Reason codes (MQTT 5.0 subset, represented as u8 for wire format)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ReasonCode {
-    /// Success (CONNACK, SUBACK, UNSUBACK, PUBACK, PUBREC, PUBREL, PUBCOMP, AUTH, DISCONNECT)
-    /// Also used as Granted QoS 0 in SUBACK
-    Success = 0x00,
-    /// Granted QoS 1 (SUBACK)
-    GrantedQos1 = 0x01,
-    /// Granted QoS 2 (SUBACK)
-    GrantedQos2 = 0x02,
-    /// Unspecified error
-    UnspecifiedError = 0x80,
-    /// Malformed packet
-    MalformedPacket = 0x81,
-    /// Protocol error
-    ProtocolError = 0x82,
-    /// Not authorized
-    NotAuthorized = 0x87,
-    /// Topic filter invalid
-    TopicFilterInvalid = 0x8F,
-    /// Packet ID in use
-    PacketIdInUse = 0x91,
-}
-
-/// Constants for backwards compatibility — use ReasonCode enum instead
-#[allow(dead_code)]
+/// MQTT 5.0 reason code constants.
 pub mod reason {
     pub const SUCCESS: u8 = 0x00;
     pub const NORMAL_DISCONNECT: u8 = 0x00;
@@ -122,6 +97,9 @@ pub mod reason {
     pub const TOPIC_FILTER_INVALID: u8 = 0x8F;
     pub const PACKET_ID_IN_USE: u8 = 0x91;
     pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
+    pub const SERVER_SHUTTING_DOWN: u8 = 0x8B;
+    pub const TOPIC_NAME_INVALID: u8 = 0x90;
+    pub const QUOTA_EXCEEDED: u8 = 0x97;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +373,8 @@ pub struct ConnectPacket {
     pub session_expiry_interval: u32,
     /// Client's Receive Maximum limit for QoS 1 and 2 inflight messages.
     pub receive_maximum: u16,
+    /// Optional password field (used for JWT bearer tokens).
+    pub password: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -521,14 +501,17 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         });
     }
 
-    // Skip username/password if present
+    // Skip username / read password if present
     if has_username {
         let (_, new_off) = decode_utf8(buf, off)?;
         off = new_off;
     }
-    if has_password {
-        let (_, _new_off) = decode_binary(buf, off)?;
-    }
+    let password = if has_password {
+        let (data, _new_off) = decode_binary(buf, off)?;
+        Some(data)
+    } else {
+        None
+    };
 
     Ok(ConnectPacket {
         client_id,
@@ -538,6 +521,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         will,
         session_expiry_interval,
         receive_maximum,
+        password,
     })
 }
 
@@ -739,6 +723,14 @@ pub fn build_publish_qos0(topic: &str, payload: &[u8]) -> Vec<u8> {
     vh.extend_from_slice(&encode_empty_properties());
     vh.extend_from_slice(payload);
     build_packet(PacketType::Publish, 0x00, &vh) // flags: DUP=0 QoS=00 RETAIN=0
+}
+
+pub fn build_publish_qos0_retain(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&encode_utf8(topic));
+    vh.extend_from_slice(&encode_empty_properties());
+    vh.extend_from_slice(payload);
+    build_packet(PacketType::Publish, 0x01, &vh) // flags: DUP=0 QoS=00 RETAIN=1
 }
 
 pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {

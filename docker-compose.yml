@@ -8,6 +8,8 @@ services:
       - "8080:8080"
       - "1883:1883"
       - "9001:9001"
+      - "8883:8883"
+      - "9002:9002"
     environment:
       POSTGRES_PASSWORD: postgres
     # Mount a volume for persistence if we wanted, but not for now.

@@ -1,12 +1,8 @@
 """
 MQTT 5.0 Retained Message Tests.
-
-Retained message delivery on subscribe is not yet implemented — those tests are xfail.
-Live publish retain flag forwarding should work.
 """
 
 import socket
-import pytest
 
 from proto_utils import (
     create_connect_packet,
@@ -23,7 +19,6 @@ from proto_utils import (
 )
 
 
-@pytest.mark.xfail(reason="Retained message delivery on subscribe not yet implemented")
 def test_receive_retained_on_subscribe():
     """Subscriber receives retained message on subscribe with RETAIN=1."""
     topic = "test/retain/receive"
@@ -64,25 +59,26 @@ def test_receive_retained_on_subscribe():
     s.close()
 
 
-@pytest.mark.xfail(reason="Retained message delivery on subscribe not yet implemented")
 def test_clear_retained_with_empty_payload():
     """Empty payload with RETAIN=1 clears retained message."""
     topic = "test/retain/clear"
 
-    # Set retained
+    # Set retained — QoS 1 so we can wait for PUBACK before proceeding
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))
     s.sendall(create_connect_packet("retain_setter"))
     recv_packet(s)
-    s.sendall(create_publish_packet(topic, b"to be cleared", qos=0, retain=True))
+    s.sendall(create_publish_packet(topic, b"to be cleared", qos=1, packet_id=1, retain=True))
+    recv_packet(s)  # PUBACK — retained message is now committed
     s.close()
 
-    # Clear with empty payload
+    # Clear with empty payload — QoS 1 so we can wait for PUBACK before subscribing
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((MQTT_HOST, MQTT_PORT))
     s.sendall(create_connect_packet("retain_clearer"))
     recv_packet(s)
-    s.sendall(create_publish_packet(topic, b"", qos=0, retain=True))
+    s.sendall(create_publish_packet(topic, b"", qos=1, packet_id=2, retain=True))
+    recv_packet(s)  # PUBACK — delete from pgmqtt_retained is now committed
     s.close()
 
     # Subscriber should NOT receive retained

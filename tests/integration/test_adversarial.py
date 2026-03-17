@@ -90,7 +90,6 @@ def test_invalid_utf8_topic():
 
 # --- Topic violations ---
 
-@pytest.mark.xfail(reason="Null character validation not enforced")
 def test_topic_with_null_character():
     """Topic containing null character should be rejected."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -102,7 +101,6 @@ def test_topic_with_null_character():
     s.close()
 
 
-@pytest.mark.xfail(reason="Wildcard in publish topic not rejected")
 def test_invalid_wildcard_in_publish():
     """Publishing to topic with wildcards should be rejected."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

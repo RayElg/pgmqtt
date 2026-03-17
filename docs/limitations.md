@@ -8,16 +8,18 @@
 - **Downgrading**: Subscriptions with QoS 2 requests are currently downgraded to QoS 1.
 
 ## 2. Retained Messages
-Retained messages are **partially supported**:
-- **Live Publishes**: If a client publishes a message with the `Retain` flag set, the broker forwards it to currently connected matching subscribers. However, delivery to new subscribers upon subscription is currently not supported.
+Retained messages are **supported**:
+- **Live Publishes**: If a client publishes a message with the `Retain` flag set, the broker stores it and forwards it to matching subscribers.
+- **Retained delivery on subscribe**: New subscribers receive matching retained messages immediately upon subscribing, with the RETAIN flag set to 1.
+- **Clearing retained**: Publishing an empty payload with the Retain flag deletes the retained message. New subscribers will not receive anything for that topic.
 - **CDC Events**: Changes captured from PostgreSQL tables via CDC are not currently tagged as "retained".
 
 
 
 ## 3. Security and Authentication
-- **No TLS/SSL**: MQTT connections are not encrypted natively by the extension.
-- **No Authentication**: The broker does not yet validate MQTT credentials. Any client can connect.
-- **Encryption**: For production use, it is recommended to proxy the MQTT/WS ports through a TLS-terminating load balancer or sidecar.
+- **Native TLS/SSL (enterprise)**: MQTTS (port 8883) and WSS (port 9002) listeners are available in enterprise builds via `pgmqtt.mqtts_enabled` / `pgmqtt.wss_enabled`. Community builds should terminate TLS at a reverse proxy (nginx, HAProxy, AWS NLB) and forward plain MQTT or WebSocket traffic to pgmqtt.
+- **No username/password authentication**: The broker does not validate MQTT credentials beyond JWT tokens.
+- **JWT authentication**: Supported via `pgmqtt.jwt_public_key` / `pgmqtt.jwt_required` (enterprise feature).
 
 ## 4. Supported Operations
 `INSERT`, `UPDATE`, and `DELETE` operations are captured. `DELETE` requiring `REPLICA IDENTITY FULL` still applies. DDL changes and `TRUNCATE` are not captured.
@@ -69,8 +71,8 @@ Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
 | Feature | Status | Test |
 |---------|--------|------|
 | Retain flag forwarding on live publish | :white_check_mark: | [test_retain.py](tests/integration/test_retain.py) |
-| Retained message delivery on subscribe | :x: | [test_retain.py](tests/integration/test_retain.py) |
-| Clear retained with empty payload | :x: | [test_retain.py](tests/integration/test_retain.py) |
+| Retained message delivery on subscribe | :white_check_mark: | [test_retain.py](tests/integration/test_retain.py) |
+| Clear retained with empty payload | :white_check_mark: | [test_retain.py](tests/integration/test_retain.py) |
 
 ## Will (LWT)
 
@@ -111,8 +113,8 @@ Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
 | Subscribe before CONNECT rejection | :white_check_mark: | [test_adversarial.py](tests/integration/test_adversarial.py) |
 | Unexpected PUBACK handling | :white_check_mark: | [test_adversarial.py](tests/integration/test_adversarial.py) |
 | Invalid UTF-8 rejection | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |
-| Null character in topic | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |
-| Wildcard in PUBLISH topic | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |
+| Null character in topic | :white_check_mark: | [test_adversarial.py](tests/integration/test_adversarial.py) |
+| Wildcard in PUBLISH topic | :white_check_mark: | [test_adversarial.py](tests/integration/test_adversarial.py) |
 | Invalid wildcard placement | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |
 | QoS 0 with packet ID | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |
 | QoS 1 without packet ID | :x: | [test_adversarial.py](tests/integration/test_adversarial.py) |

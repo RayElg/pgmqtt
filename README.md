@@ -29,22 +29,38 @@ Ensure that `wal_level = logical` is set inside your `postgresql.conf` for the l
 - `tests/`: Test suites.
   - `tests/conformance/`: MQTT conformance tests against reference brokers.
   - `tests/integration/`: Integration tests for CDC, MQTT, and WebSocket flows.
+  - `tests/enterprise/`: Enterprise feature tests (license gating, JWT authentication).
+  - `tests/helpers/`: Shared test helpers for enterprise tests (MQTT, JWT, TLS utilities).
 
 ## Development
 
-To start the development environment:
+### Setup
+
+Install Python test dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the development environment:
 
 ```bash
 docker compose up -d --build
 ```
 
-To run integration tests:
+### Running tests
 
 ```bash
-# Run python tests
+# Core integration tests
 python -m pytest tests/integration/
 
-# Run WebSocket test (requires Node.js)
+# Enterprise feature tests (license gating, JWT auth)
+python -m pytest tests/enterprise/ -m enterprise
+
+# All tests
+python -m pytest tests/integration/ tests/enterprise/
+
+# WebSocket conformance test (requires Node.js)
 python tests/integration/test_websocket_runner.py
 ```
 
