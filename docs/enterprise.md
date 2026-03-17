@@ -49,6 +49,8 @@ pgmqtt uses a signed license token to gate enterprise features. Without a valid 
 
 If a license key is set but invalid (bad format, bad signature, tampered), the status is reported as `invalid` with a reason — the extension does **not** silently fall back to Community.
 
+Since this is in an early stage, contact me if you want a license key to try out: raynor (at) rynr (dot) dev
+
 ### License Token Format
 
 ```
