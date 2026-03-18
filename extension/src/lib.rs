@@ -20,8 +20,8 @@ mod websocket;
 //   GRANT EXECUTE ON FUNCTION pgmqtt_add_mapping(...) TO some_role;
 extension_sql!(
     r#"
-    REVOKE EXECUTE ON FUNCTION pgmqtt_add_mapping(text, text, text, text, int) FROM PUBLIC;
-    REVOKE EXECUTE ON FUNCTION pgmqtt_remove_mapping(text, text) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_add_mapping(text, text, text, text, int, text) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_remove_mapping(text, text, text) FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pgmqtt_list_mappings() FROM PUBLIC;
     "#,
     name = "revoke_mapping_from_public",
@@ -145,6 +145,9 @@ fn ensure_tables_exist() {
 
 /// Register a CDC → MQTT topic mapping (persisted to DB table).
 ///
+/// Multiple mappings per (schema, table) are supported via distinct `mapping_name` values,
+/// enabling parallel publish to multiple topics (e.g. for gradual reader schema migration).
+///
 /// Example:
 /// ```sql
 /// SELECT pgmqtt_add_mapping(
@@ -152,6 +155,15 @@ fn ensure_tables_exist() {
 ///     'events',
 ///     'events/{{ op | lower }}',
 ///     '{{ columns | tojson }}'
+/// );
+/// -- Add a second mapping for the same table:
+/// SELECT pgmqtt_add_mapping(
+///     'public',
+///     'events',
+///     'events/v2/{{ op | lower }}',
+///     '{"id": "{{ columns.id }}"}',
+///     0,
+///     'v2'
 /// );
 /// ```
 #[pg_extern]
@@ -161,12 +173,15 @@ fn pgmqtt_add_mapping(
     topic_template: &str,
     payload_template: &str,
     qos: default!(i32, 0),
+    mapping_name: default!(Option<&str>, "NULL"),
 ) -> &'static str {
-    // Upsert the mapping
+    let mapping_name = mapping_name.unwrap_or("default");
+
     let query = "\
-        INSERT INTO pgmqtt_topic_mappings (schema_name, table_name, topic_template, payload_template, qos) \
-        VALUES ($1, $2, $3, $4, $5) \
-        ON CONFLICT (schema_name, table_name) DO UPDATE \
+        INSERT INTO pgmqtt_topic_mappings \
+            (schema_name, table_name, mapping_name, topic_template, payload_template, qos) \
+        VALUES ($1, $2, $3, $4, $5, $6) \
+        ON CONFLICT (schema_name, table_name, mapping_name) DO UPDATE \
         SET topic_template = EXCLUDED.topic_template, \
             payload_template = EXCLUDED.payload_template, \
             qos = EXCLUDED.qos";
@@ -174,6 +189,7 @@ fn pgmqtt_add_mapping(
     let args: Vec<pgrx::datum::DatumWithOid> = vec![
         schema_name.into(),
         table_name.into(),
+        mapping_name.into(),
         topic_template.into(),
         payload_template.into(),
         qos.into(),
@@ -183,29 +199,41 @@ fn pgmqtt_add_mapping(
         .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to upsert mapping: {}", e));
 
     pgrx::log!(
-        "pgmqtt: added mapping {}.{} → topic='{}' payload='{}'",
+        "pgmqtt: added mapping {}.{} (name='{}') → topic='{}' payload='{}'",
         schema_name,
         table_name,
+        mapping_name,
         topic_template,
         payload_template
     );
     "ok"
 }
 
-/// Remove a CDC → MQTT topic mapping.
+/// Remove a CDC → MQTT topic mapping by name.
+///
+/// Removes the mapping with the given `mapping_name` (default `'default'`).
+/// To remove all mappings for a table, call this once per mapping name.
 #[pg_extern]
-fn pgmqtt_remove_mapping(schema_name: &str, table_name: &str) -> bool {
-    let query = "DELETE FROM pgmqtt_topic_mappings WHERE schema_name = $1 AND table_name = $2";
-    let args: Vec<pgrx::datum::DatumWithOid> = vec![schema_name.into(), table_name.into()];
+fn pgmqtt_remove_mapping(
+    schema_name: &str,
+    table_name: &str,
+    mapping_name: default!(Option<&str>, "NULL"),
+) -> bool {
+    let mapping_name = mapping_name.unwrap_or("default");
 
-    // If the table doesn't exist, Spi::connect_mut will error — treat as "not found"
+    let query = "DELETE FROM pgmqtt_topic_mappings \
+                 WHERE schema_name = $1 AND table_name = $2 AND mapping_name = $3";
+    let args: Vec<pgrx::datum::DatumWithOid> =
+        vec![schema_name.into(), table_name.into(), mapping_name.into()];
+
     let deleted =
         pgrx::spi::Spi::connect_mut(|client| client.update(query, None, &args).map(|_| ())).is_ok();
 
     pgrx::log!(
-        "pgmqtt: remove mapping {}.{} → {}",
+        "pgmqtt: remove mapping {}.{} (name='{}') → {}",
         schema_name,
         table_name,
+        mapping_name,
         if deleted { "removed" } else { "not found" }
     );
     deleted
@@ -218,6 +246,7 @@ fn pgmqtt_list_mappings() -> TableIterator<
     (
         name!(schema_name, String),
         name!(table_name, String),
+        name!(mapping_name, String),
         name!(topic_template, String),
         name!(payload_template, String),
         name!(qos, i32),
@@ -236,18 +265,19 @@ fn pgmqtt_list_mappings() -> TableIterator<
         }
 
         let mut rows = Vec::new();
-        // Try to select from the table
         if let Ok(table) = client.select(
-            "SELECT schema_name, table_name, topic_template, payload_template, qos FROM pgmqtt_topic_mappings",
+            "SELECT schema_name, table_name, mapping_name, topic_template, payload_template, qos \
+             FROM pgmqtt_topic_mappings",
             None, &[],
         ) {
             for row in table {
                 let s: String = row.get_by_name("schema_name").ok().flatten().unwrap_or_default();
                 let t: String = row.get_by_name("table_name").ok().flatten().unwrap_or_default();
+                let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_else(|| "default".to_string());
                 let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
                 let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
                 let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                rows.push((s, t, tt, pt, q));
+                rows.push((s, t, mn, tt, pt, q));
             }
         }
         Ok::<_, spi::Error>(rows)
@@ -665,22 +695,38 @@ unsafe extern "C-unwind" fn pg_decode_change(
         }
     };
 
-    // Extract column data from the tuple
-    let columns = extract_columns(relation, change);
+    // Intercept changes to the mapping table and push them into the ring buffer as
+    // MappingUpdate events so the consumer can apply deltas in WAL order, keeping the
+    // in-memory cache consistent with the WAL position.
+    if rel_name == "pgmqtt_topic_mappings" {
+        let columns = extract_columns(relation, change);
+        ring_buffer::push(ring_buffer::RingEvent::MappingUpdate { op, columns });
+        let msg = std::ffi::CString::new("mapping_update")
+            .unwrap_or_else(|e| pgrx::error!("CString::new failed: {}", e));
+        unsafe {
+            pg_sys::OutputPluginPrepareWrite(ctx, true);
+            pg_sys::appendStringInfoString((*ctx).out, msg.as_ptr());
+            pg_sys::OutputPluginWrite(ctx, true);
+        }
+        return;
+    }
 
-    // Ignore inner extension tables to avoid infinite pub sub loops
+    // Ignore other internal extension tables to avoid infinite pub/sub loops.
     if rel_name.starts_with("pgmqtt_") {
         return;
     }
 
+    // Extract column data from the tuple (only for user tables).
+    let columns = extract_columns(relation, change);
+
     pgrx::log!("pgmqtt: CDC event: {} on {}.{}", op, schema_name, rel_name);
 
-    ring_buffer::push(ring_buffer::ChangeEvent {
+    ring_buffer::push(ring_buffer::RingEvent::Data(ring_buffer::ChangeEvent {
         op,
         schema: schema_name,
         table: rel_name,
         columns,
-    });
+    }));
 
     // The output plugin MUST produce output for pg_logical_slot_get_changes to advance.
     let msg = std::ffi::CString::new(format!("{}", op))

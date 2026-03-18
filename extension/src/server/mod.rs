@@ -666,61 +666,76 @@ fn cdc_tick(slot_name: &str) {
     use crate::topic_map;
     use pgrx::spi::{self, Spi};
 
-    // Load topic mappings from DB → in-process cache (at most every 5 s)
-    static LAST_MAPPING_LOAD: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const MAPPING_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+    // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
+    //
+    // pgmqtt_slot_mappings is the WAL-synchronized checkpoint: it is updated
+    // atomically inside the same BackgroundWorker::transaction that advances
+    // the slot LSN.  Loading from it on restart gives us the mapping state
+    // exactly at confirmed_flush_lsn — never a "future" version.
+    //
+    // On a fresh slot (confirmed_flush_lsn IS NULL — nothing consumed yet) we
+    // bootstrap by copying pgmqtt_topic_mappings → pgmqtt_slot_mappings once,
+    // since pre-slot mapping rows will never appear as WAL events.
+    if topic_map::get().is_none() {
+        BackgroundWorker::transaction(|| {
+            // Detect whether the slot has ever consumed data.
+            let is_fresh = Spi::connect(|client| {
+                let lsn: Option<String> = client
+                    .select(
+                        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+                         WHERE slot_name = $1",
+                        None,
+                        &[slot_name.into()],
+                    )?
+                    .first()
+                    .get_one::<String>()?;
+                Ok::<bool, spi::Error>(lsn.is_none())
+            })
+            .unwrap_or(false);
 
-    let should_reload = {
-        let last = LAST_MAPPING_LOAD.lock().expect("mapping reload mutex");
-        last.map_or(true, |t| t.elapsed() >= MAPPING_RELOAD_INTERVAL)
-    };
+            if is_fresh {
+                // Bootstrap: copy current user-facing table into the slot checkpoint.
+                let _ = Spi::run(
+                    "INSERT INTO pgmqtt_slot_mappings \
+                         SELECT schema_name, table_name, mapping_name, \
+                                topic_template, payload_template, qos \
+                         FROM pgmqtt_topic_mappings \
+                         ON CONFLICT DO NOTHING",
+                );
+                log!("pgmqtt: fresh slot — bootstrapped slot mappings from pgmqtt_topic_mappings");
+            }
 
-    if should_reload {
-    BackgroundWorker::transaction(|| {
-        if let Ok(mappings) = Spi::connect(|client| {
-            // Check if table exists before querying
-            let table_exists = client
-                .select(
-                    "SELECT to_regclass('pgmqtt_topic_mappings')::text",
+            // Load from the checkpoint into the in-process cache.
+            if let Ok(mappings) = Spi::connect(|client| {
+                let mut rows = Vec::new();
+                if let Ok(table) = client.select(
+                    "SELECT schema_name, table_name, mapping_name, \
+                            topic_template, payload_template, qos \
+                     FROM pgmqtt_slot_mappings",
                     None,
                     &[],
-                )?
-                .first()
-                .get_one::<String>()?
-                .is_some();
-
-            if !table_exists {
-                return Ok::<_, spi::Error>(Vec::new());
-            }
-
-            let mut rows = Vec::new();
-            if let Ok(table) = client.select(
-                "SELECT schema_name, table_name, topic_template, payload_template, qos FROM pgmqtt_topic_mappings",
-                None, &[],
-            ) {
-                for row in table {
-                    // Safely handle missing columns or type mismatches (prevents panic)
-                    let s: String = row.get_by_name("schema_name").ok().flatten().unwrap_or_default();
-                    let t: String = row.get_by_name("table_name").ok().flatten().unwrap_or_default();
-                    let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
-                    let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
-                    let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                    rows.push(topic_map::TopicMapping {
-                        schema: s, table: t, topic_template: tt, payload_template: pt, qos: q as u8,
-                    });
+                ) {
+                    for row in table {
+                        let s: String = row.get_by_name("schema_name").ok().flatten().unwrap_or_default();
+                        let t: String = row.get_by_name("table_name").ok().flatten().unwrap_or_default();
+                        let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_else(|| "default".to_string());
+                        let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
+                        let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
+                        let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
+                        rows.push(topic_map::TopicMapping {
+                            name: mn, schema: s, table: t,
+                            topic_template: tt, payload_template: pt, qos: q as u8,
+                        });
+                    }
                 }
+                Ok::<_, spi::Error>(rows)
+            }) {
+                let count = mappings.len();
+                topic_map::set_mappings(mappings);
+                log!("pgmqtt: loaded {} topic mappings from slot checkpoint", count);
             }
-            Ok::<_, spi::Error>(rows)
-        }) {
-            let count = mappings.len();
-            topic_map::set_mappings(mappings);
-            if count > 0 {
-                log!("pgmqtt: loaded {} topic mappings from DB", count);
-            }
-        }
-    });
-    *LAST_MAPPING_LOAD.lock().expect("mapping reload mutex") = Some(std::time::Instant::now());
-    } // should_reload
+        });
+    }
 
     // ── Batched, atomic CDC drain loop ───────────────────────────────────────
     //
@@ -768,111 +783,183 @@ fn cdc_tick(slot_name: &str) {
                     }
                 }
 
-                // ── Step 2: drain ring_buffer; persist QOS ≥ 1 inside this tx ──
+                // ── Step 2: drain ring_buffer; process events in WAL order ──────
+                //
+                // MappingUpdate events apply mapping deltas both to the in-process
+                // cache and to pgmqtt_slot_mappings within this transaction, so the
+                // checkpoint stays atomically consistent with confirmed_flush_lsn.
                 let events = ring_buffer::drain();
 
                 for event in &events {
-                    match topic_map::render(&event.schema, &event.table, event.op, &event.columns) {
-                        Some(rendered) => {
-                            let topic_str = rendered.topic.clone();
+                    match event {
+                        ring_buffer::RingEvent::MappingUpdate { op, columns } => {
+                            // Helper to pull a column value by name.
+                            let col = |name: &str| -> String {
+                                columns
+                                    .iter()
+                                    .find(|(k, _)| k == name)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default()
+                            };
+                            let schema = col("schema_name");
+                            let table = col("table_name");
+                            let name = col("mapping_name");
 
-                            // Case: no subscribers and not a retained message (CDC events are not retained)
-                            // We can skip rendering and persistence entirely.
-                            if subscriptions::match_topic(&topic_str).is_empty() {
+                            if *op == "DELETE" {
+                                topic_map::wal_remove(&schema, &table, &name);
+                                let _ = pgrx::spi::Spi::connect_mut(|client| {
+                                    client.update(
+                                        "DELETE FROM pgmqtt_slot_mappings \
+                                         WHERE schema_name = $1 AND table_name = $2 AND mapping_name = $3",
+                                        None,
+                                        &[schema.as_str().into(), table.as_str().into(), name.as_str().into()],
+                                    ).map(|_| ())
+                                });
+                                log!("pgmqtt: WAL mapping DELETE {}.{} ({})", schema, table, name);
+                            } else {
+                                // INSERT or UPDATE
+                                let topic_template = col("topic_template");
+                                let payload_template = col("payload_template");
+                                let qos: u8 = col("qos").parse().unwrap_or(0);
+                                let mapping = topic_map::TopicMapping {
+                                    name: name.clone(),
+                                    schema: schema.clone(),
+                                    table: table.clone(),
+                                    topic_template: topic_template.clone(),
+                                    payload_template: payload_template.clone(),
+                                    qos,
+                                };
+                                topic_map::wal_upsert(mapping);
+                                let _ = pgrx::spi::Spi::connect_mut(|client| {
+                                    client.update(
+                                        "INSERT INTO pgmqtt_slot_mappings \
+                                             (schema_name, table_name, mapping_name, \
+                                              topic_template, payload_template, qos) \
+                                         VALUES ($1, $2, $3, $4, $5, $6) \
+                                         ON CONFLICT (schema_name, table_name, mapping_name) DO UPDATE \
+                                         SET topic_template = EXCLUDED.topic_template, \
+                                             payload_template = EXCLUDED.payload_template, \
+                                             qos = EXCLUDED.qos",
+                                        None,
+                                        &[
+                                            schema.as_str().into(),
+                                            table.as_str().into(),
+                                            name.as_str().into(),
+                                            topic_template.as_str().into(),
+                                            payload_template.as_str().into(),
+                                            (qos as i32).into(),
+                                        ],
+                                    ).map(|_| ())
+                                });
+                                log!("pgmqtt: WAL mapping {} {}.{} ({})", op, schema, table, name);
+                            }
+                        }
+
+                        ring_buffer::RingEvent::Data(change) => {
+                            let rendered_messages = topic_map::render(
+                                &change.schema, &change.table, change.op, &change.columns,
+                            );
+
+                            if rendered_messages.is_empty() {
                                 log!(
-                                    "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
-                                    topic_str
+                                    "pgmqtt: no mapping match for {}.{}",
+                                    change.schema,
+                                    change.table
                                 );
                                 continue;
                             }
 
-                            if rendered.qos > 0 {
-                                // Persist within this transaction — committed atomically
-                                // with the slot advance above.
-                                let payload_clone = rendered.payload.clone();
-                                let result = pgrx::spi::Spi::connect_mut(|client| {
-                                    let payload_arg = if payload_clone.is_empty() {
-                                        None
-                                    } else {
-                                        Some(payload_clone.as_slice())
-                                    };
+                            for rendered in rendered_messages {
+                                let topic_str = rendered.topic.clone();
 
-                                    let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
-                                        topic_str.as_str().into(),
-                                        payload_arg.into(),
-                                        (rendered.qos as i32).into(),
-                                        false.into(), // CDC messages are not retained
-                                    ];
+                                // Skip if no subscribers (CDC events are never retained).
+                                if subscriptions::match_topic(&topic_str).is_empty() {
+                                    log!(
+                                        "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
+                                        topic_str
+                                    );
+                                    continue;
+                                }
 
-                                    let mut msg_id_opt: Option<i64> = None;
-                                    if let Ok(table) = client.update(
-                                        "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
-                                         VALUES ($1, $2, $3, $4) RETURNING id",
-                                        None,
-                                        &spi_args,
-                                    ) {
-                                        for row in table {
-                                            if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
-                                                msg_id_opt = Some(id);
+                                if rendered.qos > 0 {
+                                    // Persist within this transaction — committed atomically
+                                    // with the slot advance above.
+                                    let payload_clone = rendered.payload.clone();
+                                    let result = pgrx::spi::Spi::connect_mut(|client| {
+                                        let payload_arg = if payload_clone.is_empty() {
+                                            None
+                                        } else {
+                                            Some(payload_clone.as_slice())
+                                        };
+
+                                        let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
+                                            topic_str.as_str().into(),
+                                            payload_arg.into(),
+                                            (rendered.qos as i32).into(),
+                                            false.into(), // CDC messages are not retained
+                                        ];
+
+                                        let mut msg_id_opt: Option<i64> = None;
+                                        if let Ok(table) = client.update(
+                                            "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
+                                             VALUES ($1, $2, $3, $4) RETURNING id",
+                                            None,
+                                            &spi_args,
+                                        ) {
+                                            for row in table {
+                                                if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+                                                    msg_id_opt = Some(id);
+                                                }
+                                                break;
                                             }
-                                            break;
+                                        }
+                                        Ok::<_, pgrx::spi::Error>(msg_id_opt)
+                                    });
+
+                                    match result {
+                                        Ok(msg_id) => {
+                                            log!(
+                                                "pgmqtt cdc: persisted QOS {} to '{}' (msg_id={:?})",
+                                                rendered.qos,
+                                                rendered.topic,
+                                                msg_id
+                                            );
+                                            to_publish.push(topic_buffer::MqttMessage {
+                                                id: msg_id,
+                                                topic: rendered.topic,
+                                                payload: rendered.payload,
+                                                qos: rendered.qos,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log!(
+                                                "pgmqtt cdc: error persisting QOS {} to '{}': {:?} \
+                                                 — batch rolls back, events retried next tick",
+                                                rendered.qos,
+                                                topic_str,
+                                                e
+                                            );
+                                            return (Vec::new(), batch_count, false);
                                         }
                                     }
-                                    Ok::<_, pgrx::spi::Error>(msg_id_opt)
-                                });
-
-                                match result {
-                                    Ok(msg_id) => {
-                                        log!(
-                                            "pgmqtt cdc: persisted QOS {} to '{}' (msg_id={:?})",
-                                            rendered.qos,
-                                            rendered.topic,
-                                            msg_id
-                                        );
-                                        // Collected — pushed to topic_buffer after commit.
-                                        to_publish.push(topic_buffer::MqttMessage {
-                                            id: msg_id,
-                                            topic: rendered.topic,
-                                            payload: rendered.payload,
-                                            qos: rendered.qos,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        log!(
-                                            "pgmqtt cdc: error persisting QOS {} to '{}': {:?} \
-                                             — batch rolls back, events retried next tick",
-                                            rendered.qos,
-                                            topic_str,
-                                            e
-                                        );
-                                        // Return false → caller drops to_publish and stops.
-                                        return (Vec::new(), batch_count, false);
-                                    }
+                                } else {
+                                    // QOS 0 — fire-and-forget, pushed after commit.
+                                    to_publish.push(topic_buffer::MqttMessage {
+                                        id: None,
+                                        topic: rendered.topic,
+                                        payload: rendered.payload,
+                                        qos: 0,
+                                    });
                                 }
-                            } else {
-                                // QOS 0 — collected for post-commit push (fire-and-forget).
-                                to_publish.push(topic_buffer::MqttMessage {
-                                    id: None,
-                                    topic: rendered.topic,
-                                    payload: rendered.payload,
-                                    qos: 0,
-                                });
-                            }
 
-                            log!(
-                                "pgmqtt: processed {} on {}.{} → topic='{}'",
-                                event.op,
-                                event.schema,
-                                event.table,
-                                topic_str
-                            );
-                        }
-                        None => {
-                            log!(
-                                "pgmqtt: no mapping match for {}.{}",
-                                event.schema,
-                                event.table
-                            );
+                                log!(
+                                    "pgmqtt: processed {} on {}.{} → topic='{}'",
+                                    change.op,
+                                    change.schema,
+                                    change.table,
+                                    topic_str
+                                );
+                            }
                         }
                     }
                 }

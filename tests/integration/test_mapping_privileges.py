@@ -134,7 +134,7 @@ def test_granted_user_allowed():
     run_sql("CREATE USER pgmqtt_test_priv WITH PASSWORD 'testpass';")
     run_sql("GRANT CONNECT ON DATABASE postgres TO pgmqtt_test_priv;")
     run_sql(
-        "GRANT EXECUTE ON FUNCTION pgmqtt_add_mapping(text, text, text, text, int) "
+        "GRANT EXECUTE ON FUNCTION pgmqtt_add_mapping(text, text, text, text, int, text) "
         "TO pgmqtt_test_priv;"
     )
     run_sql("GRANT SELECT, INSERT, UPDATE ON TABLE pgmqtt_topic_mappings TO pgmqtt_test_priv;")

@@ -13,17 +13,63 @@ fn run_sql_or_error(sql: &str, operation: &str) {
 
 /// Initialize all v0.1.0 tables and indexes.
 pub fn init_010() {
-    // Topic mappings: CDC → MQTT topic + payload templates
+    // Topic mappings: CDC → MQTT topic + payload templates.
+    // Multiple mappings per (schema, table) are allowed via distinct mapping_name values,
+    // enabling parallel publish to multiple topics during schema migrations.
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_topic_mappings (
-            schema_name text NOT NULL,
-            table_name text NOT NULL,
+            schema_name   text NOT NULL,
+            table_name    text NOT NULL,
+            mapping_name  text NOT NULL DEFAULT 'default',
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
-            PRIMARY KEY (schema_name, table_name)
+            PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create mappings table",
+    );
+
+    // Migration guard: add mapping_name column to existing deployments that were created
+    // before this column was introduced.
+    let _ = Spi::run(
+        "ALTER TABLE pgmqtt_topic_mappings \
+         ADD COLUMN IF NOT EXISTS mapping_name text NOT NULL DEFAULT 'default'",
+    );
+
+    // Migration guard: upgrade the PK from (schema_name, table_name) to include mapping_name.
+    // Safe to run repeatedly — the DO block checks the existing PK width before acting.
+    let _ = Spi::run(
+        "DO $$ BEGIN
+           IF EXISTS (
+               SELECT 1 FROM pg_constraint c
+               JOIN pg_class r ON r.oid = c.conrelid
+               WHERE r.relname = 'pgmqtt_topic_mappings'
+                 AND c.conname = 'pgmqtt_topic_mappings_pkey'
+                 AND c.contype = 'p'
+                 AND array_length(c.conkey, 1) = 2
+           ) THEN
+               ALTER TABLE pgmqtt_topic_mappings DROP CONSTRAINT pgmqtt_topic_mappings_pkey;
+               ALTER TABLE pgmqtt_topic_mappings ADD PRIMARY KEY (schema_name, table_name, mapping_name);
+           END IF;
+         END $$",
+    );
+
+    // Internal WAL-synchronized mapping checkpoint.
+    // Updated atomically with each slot advance (same BackgroundWorker::transaction).
+    // On restart the worker loads from here — never from pgmqtt_topic_mappings — so the
+    // in-memory cache always reflects the mapping state at confirmed_flush_lsn, not
+    // a "future" state that the WAL hasn't reached yet.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_slot_mappings (
+            schema_name   text NOT NULL,
+            table_name    text NOT NULL,
+            mapping_name  text NOT NULL DEFAULT 'default',
+            topic_template text NOT NULL,
+            payload_template text NOT NULL,
+            qos int DEFAULT 0,
+            PRIMARY KEY (schema_name, table_name, mapping_name)
+        )",
+        "create slot mappings table",
     );
 
     // Message store: all MQTT messages routed through pgmqtt
