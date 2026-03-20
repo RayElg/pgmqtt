@@ -11,11 +11,15 @@
 //! server-to-client frames are unmasked.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Maximum WebSocket frame payload we will allocate.  A client claiming a
+/// larger frame is almost certainly malicious; reject it before touching the
+/// heap.  65 536 bytes is well above any realistic MQTT packet size.
+const MAX_WS_FRAME_SIZE: usize = 65_536;
 
 // Opcodes
 const OP_CONT: u8 = 0x0;
@@ -28,12 +32,14 @@ const OP_PONG: u8 = 0xA;
 // ── Handshake ─────────────────────────────────────────────────────────────────
 
 /// Read the HTTP Upgrade request from `stream` and send a `101 Switching
-/// Protocols` response.  Returns `Ok(leftover_bytes)` on success, `Err` otherwise.
+/// Protocols` response.  Returns `Ok((leftover_bytes, jwt_token))` on success,
+/// where `jwt_token` is extracted from `?jwt=<token>` in the request-line query
+/// string or the `Authorization: Bearer <token>` header.
 ///
 /// We intentionally use a hand-rolled parser instead of httparse to avoid
 /// strict token-character validation that rejects valid MQTT-over-WebSocket
 /// clients (e.g. `Connection: Upgrade, keep-alive`).
-pub fn handshake(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+pub fn handshake<S: Read + Write>(stream: &mut S) -> io::Result<(Vec<u8>, Option<String>)> {
     // Accumulate bytes until we see the end-of-headers marker \r\n\r\n.
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut tmp = [0u8; 1024];
@@ -68,24 +74,53 @@ pub fn handshake(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     // Convert to string — allow lossy UTF-8 so non-ASCII header values don't abort
     let request = String::from_utf8_lossy(&buf[..header_end_pos]);
 
-    // Extract Sec-WebSocket-Key by scanning header lines
-    let key = request
-        .lines()
-        .find_map(|line| {
-            // Case-insensitive prefix match
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("sec-websocket-key:") {
-                line.find(':').map(|idx| line[idx + 1..].trim().to_string())
-            } else {
-                None
+    // Extract Sec-WebSocket-Key by scanning header lines.
+    // Also extract JWT token from query param or Authorization header.
+    let mut ws_key: Option<String> = None;
+    let mut jwt_token: Option<String> = None;
+    let mut lines = request.lines();
+
+    // Parse request line for ?jwt= query param: e.g. "GET /?jwt=<token> HTTP/1.1"
+    if let Some(request_line) = lines.next() {
+        if let Some(query_start) = request_line.find('?') {
+            let query = &request_line[query_start + 1..];
+            // Strip trailing " HTTP/1.1" if present
+            let query = if let Some(space) = query.find(' ') { &query[..space] } else { query };
+            for param in query.split('&') {
+                if let Some(val) = param.strip_prefix("jwt=") {
+                    if !val.is_empty() {
+                        jwt_token = Some(val.to_string());
+                    }
+                    break;
+                }
             }
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WebSocket Upgrade missing Sec-WebSocket-Key header",
-            )
-        })?;
+        }
+    }
+
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("sec-websocket-key:") {
+            if let Some(idx) = line.find(':') {
+                ws_key = Some(line[idx + 1..].trim().to_string());
+            }
+        } else if jwt_token.is_none() && lower.starts_with("authorization:") {
+            if let Some(idx) = line.find(':') {
+                let val = line[idx + 1..].trim();
+                if let Some(bearer) = val.strip_prefix("Bearer ").or_else(|| val.strip_prefix("bearer ")) {
+                    if !bearer.is_empty() {
+                        jwt_token = Some(bearer.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let key = ws_key.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebSocket Upgrade missing Sec-WebSocket-Key header",
+        )
+    })?;
 
     // Compute Sec-WebSocket-Accept = base64(SHA-1(key + magic))
     let accept = compute_accept(&key);
@@ -101,7 +136,7 @@ pub fn handshake(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
         accept
     );
     stream.write_all(response.as_bytes())?;
-    Ok(leftover)
+    Ok((leftover, jwt_token))
 }
 
 fn compute_accept(key: &str) -> String {
@@ -121,16 +156,16 @@ fn compute_accept(key: &str) -> String {
 /// stripped of their frame header and unmasked.
 ///
 /// `Write` wraps the supplied bytes as a single unmasked Binary data frame.
-pub struct WsStream {
-    inner: TcpStream,
+pub struct WsStream<S: Read + Write> {
+    inner: S,
     /// Leftover unprocessed payload from a previous `read` call.
     read_buf: Vec<u8>,
     /// True once a Close frame has been sent or received.
     closed: bool,
 }
 
-impl WsStream {
-    pub fn new(stream: TcpStream, initial_data: Vec<u8>) -> Self {
+impl<S: Read + Write> WsStream<S> {
+    pub fn new(stream: S, initial_data: Vec<u8>) -> Self {
         Self {
             inner: stream,
             read_buf: initial_data,
@@ -139,12 +174,12 @@ impl WsStream {
     }
 
     /// Borrow the underlying stream (e.g. to set timeouts / non-blocking mode).
-    pub fn get_ref(&self) -> &TcpStream {
+    pub fn get_ref(&self) -> &S {
         &self.inner
     }
 
     #[allow(dead_code)]
-    pub fn get_mut(&mut self) -> &mut TcpStream {
+    pub fn get_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
@@ -210,6 +245,15 @@ impl WsStream {
             };
 
             // ── Payload ───────────────────────────────────────────────────────
+            if payload_len > MAX_WS_FRAME_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ws frame too large: {} bytes (max {})",
+                        payload_len, MAX_WS_FRAME_SIZE
+                    ),
+                ));
+            }
             let mut payload = vec![0u8; payload_len];
             if payload_len > 0 {
                 self.read_exact_inner(&mut payload)?;
@@ -279,7 +323,7 @@ impl WsStream {
 
 // ── std::io::Read / Write impls ───────────────────────────────────────────────
 
-impl Read for WsStream {
+impl<S: Read + Write> Read for WsStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // If we have leftover bytes from a previous frame, drain them first.
         if !self.read_buf.is_empty() {
@@ -309,7 +353,7 @@ impl Read for WsStream {
     }
 }
 
-impl Write for WsStream {
+impl<S: Read + Write> Write for WsStream<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_frame(OP_BIN, buf)?;
         Ok(buf.len())

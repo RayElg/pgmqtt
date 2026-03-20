@@ -82,6 +82,57 @@ Output:
   public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1
 ```
 
+---
+
+### 4. `pgmqtt_status`
+
+Returns a single-row operational snapshot of the broker.
+
+**Signature:**
+```sql
+pgmqtt_status() RETURNS TABLE (...)
+```
+
+**Example:**
+```sql
+SELECT * FROM pgmqtt_status();
+```
+
+Output columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `active_connections` | int | Clients currently connected (session has no `disconnected_at`) |
+| `total_subscriptions` | int | Total active topic filter subscriptions across all clients |
+| `total_retained_messages` | int | Number of topics with a retained message stored |
+| `pending_session_messages` | int | Messages queued for offline or slow clients |
+| `cdc_mappings` | int | Number of registered CDC topic mappings |
+| `cdc_slot_active` | bigint | `1` if the `pgmqtt_slot` logical replication slot is active, `0` otherwise |
+
+All counts are taken from a single SQL statement and reflect a consistent snapshot.
+
+---
+
+### 5. `pgmqtt_license_status` *(enterprise)*
+
+Returns the current license state. See [enterprise.md](enterprise.md#license-management) for full details.
+
+**Example:**
+```sql
+SELECT * FROM pgmqtt_license_status();
+```
+
+| Column | Type | Example |
+|--------|------|---------|
+| `customer` | text | `"acme-corp"` |
+| `status` | text | `"active"`, `"grace"`, `"expired"`, `"community"`, `"invalid: <reason>"` |
+| `expires_at` | bigint | Unix timestamp |
+| `grace_expires_at` | bigint | Unix timestamp |
+| `features` | text[] | `{tls,jwt}` |
+| `max_connections` | int | `100` |
+
+---
+
 ## Internal Tables
 
 The extension maintains several internal tables to track state and persist messages.
@@ -114,5 +165,35 @@ Columns:
 Stores the latest retained message for each topic.
 
 Columns:
-- `topic`: MQTT topic (Primary Key).
+- `topic`: MQTT topic (primary key).
 - `message_id`: Reference to the message in `pgmqtt_messages`.
+
+### `pgmqtt_sessions`
+
+Tracks persistent session state for each client.
+
+Columns:
+- `client_id`: MQTT client identifier (primary key).
+- `next_packet_id`: Next packet ID to assign for QoS 1 delivery.
+- `expiry_interval`: Session Expiry Interval in seconds (0 = expires on disconnect).
+- `disconnected_at`: Timestamp of last disconnect; `NULL` means currently connected.
+
+### `pgmqtt_session_messages`
+
+Per-session queue of pending messages for offline or slow clients.
+
+Columns:
+- `client_id`: References `pgmqtt_sessions`.
+- `message_id`: References `pgmqtt_messages`.
+- `packet_id`: Assigned packet ID when inflight (QoS 1); `NULL` when queued.
+- `sent_at`: Timestamp of last send attempt (used for redelivery timing).
+- `created_at`: When the message was enqueued.
+
+### `pgmqtt_subscriptions`
+
+Stores all active topic filter subscriptions.
+
+Columns:
+- `client_id`: References `pgmqtt_sessions`.
+- `topic_filter`: MQTT topic filter (may include `+` and `#` wildcards).
+- `qos`: Subscribed QoS level.

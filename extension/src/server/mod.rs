@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -39,7 +39,35 @@ const MAX_INFLIGHT_MESSAGES: usize = 800;
 /// Threshold for warning when a client's message queue exceeds this size.
 const QUEUE_WARNING_THRESHOLD: usize = 10_000;
 
+/// Hard cap on the per-client pending queue.  Clients that exceed this are
+/// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
+const MAX_QUEUE_SIZE: usize = 50_000;
+
 // Individual db_* functions were refactored into execute_session_db_actions.
+
+/// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
+///
+/// After a crash, sessions keep `disconnected_at = NULL` because the broker never
+/// reached the normal disconnect path. This causes two problems:
+///   1. `pgmqtt_status()` reports them as active connections indefinitely.
+///   2. Session expiry timers never start, so stale sessions accumulate forever.
+///
+/// Setting `disconnected_at = now()` for all NULL-disconnected sessions fixes both:
+/// the status view is accurate, and expiry timers begin from broker restart.
+/// `db_load_sessions_on_startup` then reads the updated timestamps and
+/// correctly restores in-memory expiry state.
+fn db_mark_sessions_disconnected_on_startup() {
+    BackgroundWorker::transaction(|| {
+        let _ = pgrx::spi::Spi::connect_mut(|client| {
+            let _ = client.update(
+                "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE disconnected_at IS NULL",
+                None,
+                &[],
+            );
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
 
 fn db_load_sessions_on_startup() {
     BackgroundWorker::transaction(|| {
@@ -223,6 +251,10 @@ struct MqttClient {
     keep_alive: u16,
     last_received_at: std::time::Instant,
     receive_maximum: u16,
+    /// JWT claim-based topic filters for subscribe authorization.
+    sub_claims: Vec<String>,
+    /// JWT claim-based topic filters for publish authorization.
+    pub_claims: Vec<String>,
 }
 
 impl MqttClient {
@@ -241,6 +273,8 @@ impl MqttClient {
             keep_alive,
             last_received_at: std::time::Instant::now(),
             receive_maximum,
+            sub_claims: Vec::new(),
+            pub_claims: Vec::new(),
         }
     }
 }
@@ -268,6 +302,7 @@ pub fn run_http(port: u16) {
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt http: SIGHUP received");
+            unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
         }
         drain_http_connections(&listener);
     }
@@ -368,38 +403,116 @@ method not allowed";
 ///
 /// Both share the same `clients` map and topic_buffer, so CDC events are
 /// delivered to all connected clients regardless of transport.
-pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
+pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
+    db_mark_sessions_disconnected_on_startup();
     db_load_sessions_on_startup();
 
-    let mqtt_addr = format!("0.0.0.0:{}", mqtt_port);
-    let ws_addr = format!("0.0.0.0:{}", ws_port);
-
-    let mqtt_listener = match TcpListener::bind(&mqtt_addr) {
-        Ok(l) => l,
-        Err(e) => {
-            log!("pgmqtt mqtt: failed to bind {}: {}", mqtt_addr, e);
-            return;
+    // Bind MQTT TCP listener (optional)
+    let mqtt_listener = if ports.mqtt_enabled {
+        let addr = format!("0.0.0.0:{}", ports.mqtt_port);
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    log!("pgmqtt mqtt: failed to set non-blocking: {}", e);
+                    return;
+                }
+                log!("pgmqtt mqtt: listening on {} (raw TCP)", addr);
+                Some(l)
+            }
+            Err(e) => {
+                log!("pgmqtt mqtt: failed to bind {}: {}", addr, e);
+                return;
+            }
         }
+    } else {
+        log!("pgmqtt mqtt: TCP listener disabled");
+        None
     };
-    let ws_listener = match TcpListener::bind(&ws_addr) {
-        Ok(l) => l,
-        Err(e) => {
-            log!("pgmqtt ws: failed to bind {}: {}", ws_addr, e);
-            return;
+
+    // Bind WebSocket listener (optional)
+    let ws_listener = if ports.ws_enabled {
+        let addr = format!("0.0.0.0:{}", ports.ws_port);
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    log!("pgmqtt ws: failed to set non-blocking: {}", e);
+                    return;
+                }
+                log!("pgmqtt ws: listening on {} (WebSocket)", addr);
+                Some(l)
+            }
+            Err(e) => {
+                log!("pgmqtt ws: failed to bind {}: {}", addr, e);
+                return;
+            }
         }
+    } else {
+        log!("pgmqtt ws: WebSocket listener disabled");
+        None
     };
 
-    if let Err(e) = mqtt_listener.set_nonblocking(true) {
-        log!("pgmqtt mqtt: failed to set non-blocking: {}", e);
-        return;
-    }
-    if let Err(e) = ws_listener.set_nonblocking(true) {
-        log!("pgmqtt ws: failed to set non-blocking: {}", e);
-        return;
-    }
+    // Bind MQTT TLS listener (optional)
+    let mqtts_listener = if ports.mqtts_enabled {
+        let addr = format!("0.0.0.0:{}", ports.mqtts_port);
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    log!("pgmqtt mqtts: failed to set non-blocking: {}", e);
+                    return;
+                }
+                log!("pgmqtt mqtts: listening on {} (TLS)", addr);
+                Some(l)
+            }
+            Err(e) => {
+                log!("pgmqtt mqtts: failed to bind {}: {}", addr, e);
+                return;
+            }
+        }
+    } else {
+        log!("pgmqtt mqtts: TLS listener disabled");
+        None
+    };
 
-    log!("pgmqtt mqtt+cdc: listening on {} (raw TCP)", mqtt_addr);
-    log!("pgmqtt ws: listening on {} (WebSocket)", ws_addr);
+    // Bind WSS listener (optional)
+    let wss_listener = if ports.wss_enabled {
+        let addr = format!("0.0.0.0:{}", ports.wss_port);
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    log!("pgmqtt wss: failed to set non-blocking: {}", e);
+                    return;
+                }
+                log!("pgmqtt wss: listening on {} (WSS)", addr);
+                Some(l)
+            }
+            Err(e) => {
+                log!("pgmqtt wss: failed to bind {}: {}", addr, e);
+                return;
+            }
+        }
+    } else {
+        log!("pgmqtt wss: WSS listener disabled");
+        None
+    };
+
+    // Load TLS configuration if any secure listener is enabled
+    let tls_config = if ports.mqtts_enabled || ports.wss_enabled {
+        match build_tls_config(&ports.tls_cert_file, &ports.tls_key_file) {
+            Some(cfg) => Some(cfg),
+            None => {
+                log!(
+                    "pgmqtt tls: failed to load TLS config (cert='{}', key='{}') — \
+                     check that tls_cert_file and tls_key_file are set to valid PEM files \
+                     readable by the postgres process; aborting",
+                    ports.tls_cert_file,
+                    ports.tls_key_file,
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
@@ -407,13 +520,28 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt mqtt+cdc: SIGHUP received");
+            unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
         }
 
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
         let mut session_db_actions = Vec::new();
 
-        accept_mqtt_connections(&mqtt_listener, &mut clients, &mut session_db_actions);
-        accept_ws_connections(&ws_listener, &mut clients, &mut session_db_actions);
+        if let Some(ref listener) = mqtt_listener {
+            accept_mqtt_connections(listener, &mut clients, &mut session_db_actions);
+        }
+        if let Some(ref listener) = ws_listener {
+            accept_ws_connections(listener, &mut clients, &mut session_db_actions);
+        }
+        if let Some(ref listener) = mqtts_listener {
+            if let Some(ref cfg) = tls_config {
+                accept_mqtts_connections(listener, cfg, &mut clients, &mut session_db_actions);
+            }
+        }
+        if let Some(ref listener) = wss_listener {
+            if let Some(ref cfg) = tls_config {
+                accept_wss_connections(listener, cfg, &mut clients, &mut session_db_actions);
+            }
+        }
 
         let mut publishes = Vec::new();
         poll_mqtt_clients(
@@ -442,13 +570,67 @@ pub fn run_mqtt_cdc(mqtt_port: u16, ws_port: u16, slot_name: &str) {
 
         // Execute all collected session DB actions in one transaction
         execute_session_db_actions(session_db_actions);
+
     }
 
-    // Clean up
-    for (id, _) in clients.drain() {
+    // Graceful shutdown: send DISCONNECT to all clients, fire will messages,
+    // and persist session state so reconnecting clients find correct disconnected_at.
+    log!("pgmqtt mqtt+cdc: SIGTERM received, shutting down gracefully");
+    let mut shutdown_db_actions = Vec::new();
+    let mut will_publishes = Vec::new();
+
+    for (id, mut client) in clients.drain() {
+        // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
+        let _ = client.transport.write_all(
+            &mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN),
+        );
+
+        // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
+        // The client did NOT send a normal DISCONNECT, so the will fires.
+        if let Some(will) = client.will.take() {
+            log!("pgmqtt mqtt: firing Will for '{}' on shutdown", id);
+            will_publishes.push(PendingPublish {
+                topic: will.topic,
+                payload: will.payload,
+                qos: will.qos,
+                retain: will.retain,
+                log_sender: format!("{} (Will/shutdown)", id),
+                packet_id: None,
+            });
+        }
+
+        // Remove in-memory subscriptions and mark session state.
         subscriptions::remove_client(&id);
+        let (should_remove, mark_disc) = with_sessions(|s| {
+            let remove = s
+                .get(&id)
+                .map(|sess| sess.expiry_interval == 0)
+                .unwrap_or(false);
+            if remove {
+                s.remove(&id);
+            } else if let Some(sess) = s.get_mut(&id) {
+                sess.disconnected_at = Some(std::time::Instant::now());
+            }
+            (remove, !remove)
+        });
+        if should_remove {
+            shutdown_db_actions.push(SessionDbAction::DeleteSession { client_id: id });
+        } else if mark_disc {
+            shutdown_db_actions.push(SessionDbAction::MarkDisconnected { client_id: id });
+        }
     }
-    log!("pgmqtt mqtt+cdc: shutting down");
+
+    // Persist will messages (QoS ≥ 1 wills land in pgmqtt_messages so reconnecting
+    // subscribers receive them; QoS 0 wills are fire-and-forget as per spec).
+    if !will_publishes.is_empty() {
+        let mut no_clients: HashMap<String, MqttClient> = HashMap::new();
+        publish_messages_batch(will_publishes, &mut no_clients);
+    }
+
+    // Flush session disconnect state to DB.
+    execute_session_db_actions(shutdown_db_actions);
+
+    log!("pgmqtt mqtt+cdc: shutdown complete");
 }
 
 /// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
@@ -719,7 +901,81 @@ fn cdc_tick(slot_name: &str) {
         }
     }
 }
-/// Accept new raw TCP MQTT connections and perform the MQTT CONNECT handshake.
+/// Accept new MQTTS (TCP + TLS) connections and perform the MQTT CONNECT handshake.
+fn accept_mqtts_connections(
+    listener: &TcpListener,
+    tls_config: &Arc<rustls::ServerConfig>,
+    clients: &mut HashMap<String, MqttClient>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                log!("pgmqtt mqtts: new MQTTS connection from {}", addr);
+                match Transport::new_tls(stream, tls_config.clone()) {
+                    Ok(transport) => {
+                        handle_new_connection(transport, None, clients, session_db_actions);
+                    }
+                    Err(e) => {
+                        log!("pgmqtt mqtts: TLS handshake failed for {}: {}", addr, e);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                log!("pgmqtt mqtts: accept error: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+fn accept_wss_connections(
+    listener: &TcpListener,
+    tls_config: &Arc<rustls::ServerConfig>,
+    clients: &mut HashMap<String, MqttClient>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                log!("pgmqtt wss: new WSS connection from {}", addr);
+
+                // Keep the stream in blocking mode with a timeout.
+                // rustls::StreamOwned drives the TLS handshake lazily on the first
+                // read/write inside websocket::handshake — identical to how MQTTS works.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+                let conn = match rustls::ServerConnection::new(tls_config.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log!("pgmqtt wss: failed to create TLS session for {}: {}", addr, e);
+                        continue;
+                    }
+                };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+
+                match websocket::handshake(&mut tls_stream) {
+                    Ok((leftover, ws_jwt)) => {
+                        log!("pgmqtt wss: WSS upgrade complete for {}", addr);
+                        let ws = websocket::WsStream::new(tls_stream, leftover);
+                        handle_new_connection(Transport::Wss(ws), ws_jwt, clients, session_db_actions);
+                    }
+                    Err(e) => {
+                        log!("pgmqtt wss: upgrade failed for {}: {}", addr, e);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                log!("pgmqtt wss: accept error: {}", e);
+                break;
+            }
+        }
+    }
+}
+
 fn accept_mqtt_connections(
     listener: &TcpListener,
     clients: &mut HashMap<String, MqttClient>,
@@ -729,7 +985,7 @@ fn accept_mqtt_connections(
         match listener.accept() {
             Ok((stream, addr)) => {
                 log!("pgmqtt mqtt: new TCP connection from {}", addr);
-                handle_new_connection(Transport::Raw(stream), clients, session_db_actions);
+                handle_new_connection(Transport::Raw(stream), None, clients, session_db_actions);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -757,10 +1013,10 @@ fn accept_ws_connections(
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
                 match websocket::handshake(&mut stream) {
-                    Ok(leftover) => {
+                    Ok((leftover, ws_jwt)) => {
                         log!("pgmqtt ws: WebSocket upgrade complete for {}", addr);
                         let ws = websocket::WsStream::new(stream, leftover);
-                        handle_new_connection(Transport::Ws(ws), clients, session_db_actions);
+                        handle_new_connection(Transport::Ws(ws), ws_jwt, clients, session_db_actions);
                     }
                     Err(e) => {
                         log!("pgmqtt ws: upgrade failed for {}: {}", addr, e);
@@ -780,6 +1036,7 @@ fn accept_ws_connections(
 /// Common MQTT CONNECT handshake for both TCP and WebSocket transports.
 fn handle_new_connection(
     mut transport: Transport,
+    ws_jwt: Option<String>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
 ) {
@@ -804,7 +1061,7 @@ fn handle_new_connection(
         match mqtt::parse_packet(&connect_buf) {
             Ok((mqtt::InboundPacket::Connect(connect), _consumed)) => {
                 // Success! Proceed to register the client.
-                finish_connect(transport, connect, clients, session_db_actions);
+                finish_connect(transport, connect, ws_jwt, clients, session_db_actions);
                 return;
             }
             Ok(_) => {
@@ -832,6 +1089,7 @@ fn handle_new_connection(
 fn finish_connect(
     mut transport: Transport,
     packet: mqtt::ConnectPacket,
+    ws_jwt: Option<String>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
 ) {
@@ -843,6 +1101,85 @@ fn finish_connect(
     };
 
     log!("pgmqtt mqtt: CONNECT from client '{}'", client_id);
+
+    // ── JWT authentication ────────────────────────────────────────────────────
+    let jwt_key_str = crate::get_jwt_public_key_guc();
+    let is_ws = matches!(transport, Transport::Ws(_) | Transport::Wss(_));
+    let jwt_required = if is_ws && crate::get_jwt_required_ws_guc() {
+        true
+    } else {
+        crate::get_jwt_required_guc()
+    };
+    let mut jwt_sub_claims: Vec<String> = Vec::new();
+    let mut jwt_pub_claims: Vec<String> = Vec::new();
+
+    if !jwt_key_str.is_empty() {
+        // Try to parse the JWT: password field first, then WS token (query param / header).
+        let token_opt = packet
+            .password
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim().to_string())
+            .or(ws_jwt);
+
+        match (token_opt, parse_jwt_public_key(&jwt_key_str)) {
+            (Some(token), Some(pubkey)) => match validate_jwt(&token, &pubkey) {
+                Ok(claims) => {
+                    // Enforce client_id claim: if JWT specifies a client_id, CONNECT must match
+                    if let Some(ref jwt_cid) = claims.client_id {
+                        if jwt_cid != &client_id {
+                            log!(
+                                "pgmqtt mqtt: JWT client_id '{}' does not match CONNECT client_id '{}'",
+                                jwt_cid,
+                                client_id
+                            );
+                            let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                            return;
+                        }
+                    }
+                    jwt_sub_claims = claims.sub_claims;
+                    jwt_pub_claims = claims.pub_claims;
+                    log!("pgmqtt mqtt: JWT validated for '{}'", client_id);
+                }
+                Err(e) => {
+                    log!("pgmqtt mqtt: JWT validation failed for '{}': {}", client_id, e);
+                    if jwt_required {
+                        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                        return;
+                    }
+                }
+            },
+            (None, _) => {
+                if jwt_required {
+                    log!("pgmqtt mqtt: JWT required but no token provided for '{}'", client_id);
+                    let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                    return;
+                }
+            }
+            (_, None) => {
+                log!("pgmqtt mqtt: failed to parse JWT public key GUC");
+                if jwt_required {
+                    let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Connection limit enforcement ──────────────────────────────────────────
+    // Session takeover (same client_id reconnecting) replaces an existing slot
+    // and is always allowed.  A genuinely new client is rejected when the limit
+    // is reached so operators can control memory usage.
+    let limit = crate::license::max_connections();
+    if !clients.contains_key(&client_id) && clients.len() >= limit {
+        log!(
+            "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
+            limit,
+            client_id
+        );
+        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::QUOTA_EXCEEDED));
+        return;
+    }
 
     // If clean_start, remove any previous session
     if packet.clean_start {
@@ -893,10 +1230,10 @@ fn finish_connect(
     // Set non-blocking for ongoing reads
     let _ = transport.set_nonblocking(true);
     log!("pgmqtt mqtt: client '{}' ready for polling", client_id);
-    clients.insert(
-        client_id.clone(),
-        MqttClient::new(transport, client_id.clone(), packet.will, packet.keep_alive, packet.receive_maximum),
-    );
+    let mut mqtt_client = MqttClient::new(transport, client_id.clone(), packet.will, packet.keep_alive, packet.receive_maximum);
+    mqtt_client.sub_claims = jwt_sub_claims;
+    mqtt_client.pub_claims = jwt_pub_claims;
+    clients.insert(client_id.clone(), mqtt_client);
 
     // ── Session resumption: redeliver inflight + drain queue ─────────────────
     // MQTT 5.0 §4.4: The broker MUST retransmit all unacknowledged PUBLISH
@@ -1139,44 +1476,53 @@ fn publish_messages_batch(pending: Vec<PendingPublish>, clients: &mut HashMap<St
             let mut to_publish = Vec::new();
             pgrx::spi::Spi::connect_mut(|client| {
                 for p in &persistent {
-                    let payload_arg = if p.payload.is_empty() {
-                        None
-                    } else {
-                        Some(p.payload.as_slice())
-                    };
-
-                    let insert_msg = "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ($1, $2, $3, $4) RETURNING id";
                     let mut msg_id_opt: Option<i64> = None;
 
-                    let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
-                        p.topic.as_str().into(),
-                        payload_arg.into(),
-                        (p.qos as i32).into(),
-                        p.retain.into(),
-                    ];
-
-                    if let Ok(table) = client.update(insert_msg, None, &spi_args) {
+                    // Issue 10: an empty-payload retain is a "clear retained" command.
+                    // We must NOT insert a pgmqtt_messages row here — it would be an orphan
+                    // with no pgmqtt_retained entry pointing to it after the DELETE.
+                    // We still push to topic_buffer so live subscribers receive the message.
+                    if p.retain && p.payload.is_empty() {
+                        // Clear retained entry; errors are propagated so the transaction
+                        // rolls back cleanly (issue 13).
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![p.topic.as_str().into()];
+                        client.update(
+                            "DELETE FROM pgmqtt_retained WHERE topic = $1",
+                            None,
+                            &args,
+                        )?;
+                    } else {
+                        // Normal publish: persist the message and update retained index.
+                        let payload_arg = Some(p.payload.as_slice());
+                        let insert_msg = "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ($1, $2, $3, $4) RETURNING id";
+                        let spi_args: Vec<pgrx::datum::DatumWithOid> = vec![
+                            p.topic.as_str().into(),
+                            payload_arg.into(),
+                            (p.qos as i32).into(),
+                            p.retain.into(),
+                        ];
+                        // Issue 13: use ? so any INSERT failure rolls back the whole
+                        // transaction rather than leaving a partial write.
+                        let table = client.update(insert_msg, None, &spi_args)?;
                         for row in table {
                             if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
                                 msg_id_opt = Some(id);
                             }
                             break;
                         }
-                    }
 
-                    if p.retain {
-                        if p.payload.is_empty() {
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![p.topic.as_str().into()];
-                            let _ = client.update(
-                                "DELETE FROM pgmqtt_retained WHERE topic = $1",
-                                None,
-                                &args,
-                            );
-                        } else if let Some(msg_id) = msg_id_opt {
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![p.topic.as_str().into(), msg_id.into()];
-                            let _ = client.update("INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id", None, &args);
+                        if p.retain {
+                            if let Some(msg_id) = msg_id_opt {
+                                let args: Vec<pgrx::datum::DatumWithOid> =
+                                    vec![p.topic.as_str().into(), msg_id.into()];
+                                client.update(
+                                    "INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
+                                     ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id",
+                                    None,
+                                    &args,
+                                )?;
+                            }
                         }
                     }
 
@@ -1327,6 +1673,23 @@ fn handle_mqtt_packet(
         mqtt::InboundPacket::Subscribe(sub) => {
             let mut reason_codes = Vec::with_capacity(sub.topics.len());
             for (topic_filter, requested_qos) in &sub.topics {
+                // JWT subscribe authorization
+                let jwt_authorized = if client.sub_claims.is_empty() {
+                    true
+                } else {
+                    client.sub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(topic_filter, claim))
+                };
+
+                if !jwt_authorized {
+                    log!(
+                        "pgmqtt mqtt: '{}' not authorized to subscribe to '{}'",
+                        client_id,
+                        topic_filter
+                    );
+                    reason_codes.push(mqtt::reason::NOT_AUTHORIZED);
+                    continue;
+                }
+
                 let granted = subscriptions::subscribe(&client_id, topic_filter, *requested_qos);
                 reason_codes.push(granted);
                 if granted <= 0x02 {
@@ -1348,6 +1711,53 @@ fn handle_mqtt_packet(
             if transport.write_all(&suback).is_err() {
                 return false;
             }
+
+            // Deliver retained messages for successfully subscribed filters (MQTT §3.8.4)
+            let subscribed_filters: Vec<&String> = sub
+                .topics
+                .iter()
+                .zip(reason_codes.iter())
+                .filter_map(|((filter, _), &rc)| if rc <= 0x02 { Some(filter) } else { None })
+                .collect();
+
+            if !subscribed_filters.is_empty() {
+                let retained_msgs: Vec<(String, Vec<u8>)> = BackgroundWorker::transaction(|| {
+                    let mut results = Vec::new();
+                    let _ = pgrx::spi::Spi::connect(|spi| {
+                        if let Ok(table) = spi.select(
+                            "SELECT r.topic, m.payload \
+                             FROM pgmqtt_retained r \
+                             JOIN pgmqtt_messages m ON r.message_id = m.id",
+                            None,
+                            &[],
+                        ) {
+                            for row in table {
+                                let topic: String =
+                                    row.get_by_name("topic").ok().flatten().unwrap_or_default();
+                                let payload: Option<Vec<u8>> =
+                                    row.get_by_name("payload").ok().flatten();
+                                if !topic.is_empty() {
+                                    results.push((topic, payload.unwrap_or_default()));
+                                }
+                            }
+                        }
+                        Ok::<_, pgrx::spi::Error>(())
+                    });
+                    Ok::<Vec<(String, Vec<u8>)>, pgrx::spi::Error>(results)
+                })
+                .unwrap_or_default();
+
+                for (topic, payload) in &retained_msgs {
+                    for filter in &subscribed_filters {
+                        if mqtt::topic_matches_filter(topic, filter) {
+                            let pkt = mqtt::build_publish_qos0_retain(topic, payload);
+                            let _ = transport.write_all(&pkt);
+                            break; // deliver each retained message at most once per SUBSCRIBE
+                        }
+                    }
+                }
+            }
+
             true
         }
         mqtt::InboundPacket::Unsubscribe(unsub) => {
@@ -1404,6 +1814,45 @@ fn handle_mqtt_packet(
             false // signal removal
         }
         mqtt::InboundPacket::Publish(pub_pkt) => {
+            // JWT publish authorization
+            if !client.pub_claims.is_empty() {
+                let authorized = client.pub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(&pub_pkt.topic, claim));
+                if !authorized {
+                    log!(
+                        "pgmqtt mqtt: '{}' not authorized to publish to '{}'",
+                        client_id,
+                        pub_pkt.topic
+                    );
+                    if pub_pkt.qos == 1 {
+                        if let Some(pid) = pub_pkt.packet_id {
+                            // Send PUBACK with NOT_AUTHORIZED reason code
+                            let mut vh = Vec::with_capacity(4);
+                            vh.extend_from_slice(&pid.to_be_bytes());
+                            vh.push(mqtt::reason::NOT_AUTHORIZED);
+                            vh.push(0x00); // no properties
+                            use crate::mqtt::PacketType;
+                            let first_byte = ((PacketType::Puback as u8) << 4) | 0x00;
+                            let mut pkt = vec![first_byte, vh.len() as u8];
+                            pkt.extend_from_slice(&vh);
+                            let _ = transport.write_all(&pkt);
+                        }
+                    }
+                    // QoS 0: silently drop
+                    return true;
+                }
+            }
+
+            // Validate topic name: MQTT §4.7.3 prohibits wildcards in PUBLISH; §1.5.3 prohibits null chars
+            if pub_pkt.topic.contains('\0') || pub_pkt.topic.contains('+') || pub_pkt.topic.contains('#') {
+                log!(
+                    "pgmqtt mqtt: '{}' published to invalid topic '{}' — disconnecting",
+                    client_id,
+                    pub_pkt.topic
+                );
+                let _ = transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID));
+                return false;
+            }
+
             // Optimization: skip all processing if no one is listening (and not retained)
             // But for QoS 1, we still owe the client a PUBACK.
             let subscriber_ids = subscriptions::match_topic(&pub_pkt.topic);
@@ -1519,12 +1968,23 @@ fn publish_pending_messages(
                 None,
                 Queue,
                 Inflight(u16),
+                Disconnect,
             }
             let (pkt_res, db_action) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(sub_id) {
                     let delivery_qos = std::cmp::min(msg.qos, *granted_qos);
                     if delivery_qos == 1 {
                         if session.inflight.len() >= inflight_limit {
+                            if session.queue.len() >= MAX_QUEUE_SIZE {
+                                // Client is hopelessly backed up; signal disconnection to
+                                // reclaim memory.  The caller adds it to to_remove.
+                                pgrx::log!(
+                                    "pgmqtt: client '{}' queue hit hard limit ({} messages). Disconnecting.",
+                                    sub_id,
+                                    MAX_QUEUE_SIZE,
+                                );
+                                return (None, DbAction::Disconnect);
+                            }
                             // Queue instead of drop to preserve at-least-once semantics.
                             session.queue.push_back(topic_buffer::MqttMessage {
                                 id: msg.id,
@@ -1534,7 +1994,7 @@ fn publish_pending_messages(
                             });
                             if session.queue.len() > QUEUE_WARNING_THRESHOLD {
                                 pgrx::log!(
-                                    "pgmqtt: client '{}' queue exceeded {} messages ({}). Consider increasing MAX_INFLIGHT_MESSAGES or investigating client health.",
+                                    "pgmqtt: client '{}' queue exceeded {} messages ({}). Consider investigating client health.",
                                     sub_id,
                                     QUEUE_WARNING_THRESHOLD,
                                     session.queue.len()
@@ -1574,14 +2034,17 @@ fn publish_pending_messages(
 
             match db_action {
                 DbAction::Queue => {
-                    if let Some(msg_id) = msg.id {
+                    if msg.id.is_some() {
                         batch_entries.push((sub_id.clone(), None));
                     }
                 }
                 DbAction::Inflight(pid) => {
-                    if let Some(msg_id) = msg.id {
+                    if msg.id.is_some() {
                         batch_entries.push((sub_id.clone(), Some(pid)));
                     }
+                }
+                DbAction::Disconnect => {
+                    to_remove.push(sub_id.clone());
                 }
                 DbAction::None => {}
             }
@@ -1648,5 +2111,197 @@ fn redeliver_unacked_messages(
 
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS helpers
+// ---------------------------------------------------------------------------
+
+/// Build a rustls ServerConfig from a PEM cert file and a PEM private key file.
+/// Returns None on any error (missing files, parse errors, etc.).
+pub fn build_tls_config(cert_path: &str, key_path: &str) -> Option<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(cert_path).ok()?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(|r| r.ok())
+        .map(|c| c.into_owned())
+        .collect();
+    if certs.is_empty() {
+        return None;
+    }
+
+    let key_file = File::open(key_path).ok()?;
+    let mut key_reader = BufReader::new(key_file);
+    let private_key: PrivateKeyDer<'static> = match rustls_pemfile::private_key(&mut key_reader) {
+        Ok(Some(k)) => k.clone_key(),
+        _ => return None,
+    };
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
+        .ok()?;
+
+    Some(Arc::new(config))
+}
+
+// ---------------------------------------------------------------------------
+// JWT helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a JWT public key from either PEM format or raw base64url-encoded bytes.
+/// Returns 32-byte Ed25519 public key on success.
+fn parse_jwt_public_key(key_str: &str) -> Option<[u8; 32]> {
+    let key_str = key_str.trim();
+    if key_str.starts_with("-----BEGIN") {
+        // PEM format — extract the base64 body (standard base64, not URL-safe)
+        use base64::Engine;
+        let body: String = key_str
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        let der = base64::engine::general_purpose::STANDARD.decode(&body).ok()?;
+        // Ed25519 SubjectPublicKeyInfo: last 32 bytes are the raw key
+        if der.len() < 32 {
+            return None;
+        }
+        let raw = &der[der.len() - 32..];
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(raw);
+        Some(arr)
+    } else {
+        // Raw base64url
+        let raw = crate::license::base64_url_decode(key_str).ok()?;
+        if raw.len() != 32 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        Some(arr)
+    }
+}
+
+/// JWT claims extracted from a token.
+struct JwtClaims {
+    /// If present, the CONNECT client_id must match this value.
+    client_id: Option<String>,
+    sub_claims: Vec<String>,
+    pub_claims: Vec<String>,
+}
+
+/// Validate a JWT token using an Ed25519 public key.
+/// Returns Ok(JwtClaims) on success, Err on failure.
+fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, String> {
+    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err("invalid JWT format".into());
+    }
+
+    let payload_b64 = parts[1];
+    let sig_b64 = parts[2];
+
+    // Decode payload
+    let payload_bytes = crate::license::base64_url_decode(payload_b64)
+        .map_err(|_| "bad payload base64".to_string())?;
+
+    // Decode signature
+    let sig_bytes = crate::license::base64_url_decode(sig_b64)
+        .map_err(|_| "bad sig base64".to_string())?;
+
+    if sig_bytes.len() != 64 {
+        return Err("signature must be 64 bytes".into());
+    }
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .expect("unreachable: length already checked to be exactly 64");
+    let signature = Signature::from_bytes(&sig_arr);
+
+    // Verify signature over "header.payload" (slice the original token to avoid allocation)
+    let last_dot = token.rfind('.')
+        .expect("unreachable: token already confirmed to have 3 dot-separated parts");
+    let signed_data = &token[..last_dot];
+    let verifying_key = VerifyingKey::from_bytes(pubkey_bytes)
+        .map_err(|e| format!("bad public key: {}", e))?;
+    verifying_key
+        .verify(signed_data.as_bytes(), &signature)
+        .map_err(|_| "signature verification failed".to_string())?;
+
+    // Parse payload JSON
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("bad payload JSON: {}", e))?;
+
+    // Check exp claim (mandatory)
+    let now = crate::license::now_secs();
+    let exp = payload.get("exp").and_then(|v| v.as_i64())
+        .ok_or_else(|| "missing or invalid exp claim".to_string())?;
+    if now > exp {
+        return Err("token expired".into());
+    }
+
+    // Extract client_id claim
+    let client_id = payload
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Extract sub_claims and pub_claims arrays
+    let sub_claims = payload
+        .get("sub_claims")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let pub_claims = payload
+        .get("pub_claims")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(JwtClaims { client_id, sub_claims, pub_claims })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_build_tls_config_valid() {
+        // These files were generated in /tmp during verification step
+        let cert_path = "/tmp/server.crt";
+        let key_path = "/tmp/server.key";
+
+        if fs::metadata(cert_path).is_ok() && fs::metadata(key_path).is_ok() {
+            let config = build_tls_config(cert_path, key_path);
+            assert!(config.is_some(), "Should be able to load valid TLS config");
+        } else {
+            pgrx::log!("Skipping test_build_tls_config_valid: certs not found in /tmp");
+        }
+    }
+
+    #[test]
+    fn test_build_tls_config_invalid() {
+        let config = build_tls_config("/tmp/nonexistent.crt", "/tmp/nonexistent.key");
+        assert!(config.is_none(), "Should return None for nonexistent files");
+
+        let garbage_path = "/tmp/garbage.txt";
+        fs::write(garbage_path, "not a certificate").unwrap();
+        let config = build_tls_config(garbage_path, garbage_path);
+        assert!(config.is_none(), "Should return None for garbage files");
+        let _ = fs::remove_file(garbage_path);
     }
 }
