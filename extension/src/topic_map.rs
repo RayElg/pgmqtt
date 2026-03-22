@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct TopicMapping {
+    pub name: String,
     pub schema: String,
     pub table: String,
     pub topic_template: String,
@@ -63,45 +64,51 @@ pub fn get() -> Option<Vec<TopicMapping>> {
     lock.clone()
 }
 
+/// Apply a WAL-decoded INSERT or UPDATE to the in-process cache.
+/// Upserts by (schema, table, name) — safe to call during WAL replay on restart.
+pub fn wal_upsert(mapping: TopicMapping) {
+    let mut lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let mappings = lock.get_or_insert_with(Vec::new);
+    match mappings
+        .iter_mut()
+        .find(|m| m.schema == mapping.schema && m.table == mapping.table && m.name == mapping.name)
+    {
+        Some(existing) => *existing = mapping,
+        None => mappings.push(mapping),
+    }
+}
+
+/// Apply a WAL-decoded DELETE to the in-process cache.
+/// No-op if the mapping is not found (safe for idempotent WAL replay).
+pub fn wal_remove(schema: &str, table: &str, name: &str) {
+    let mut lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    if let Some(mappings) = lock.as_mut() {
+        mappings.retain(|m| !(m.schema == schema && m.table == table && m.name == name));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Template rendering
 // ---------------------------------------------------------------------------
 
 /// Render a CDC event against the topic map.
 ///
-/// Returns `None` if no mapping matches.
+/// Returns one `RenderedMessage` per matching mapping. Returns an empty vec if
+/// no mapping matches or if mappings have not been loaded yet.
 pub fn render(
     schema: &str,
     table: &str,
     op: &str,
     columns: &[(String, String)],
-) -> Option<RenderedMessage> {
+) -> Vec<RenderedMessage> {
     let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
 
-    let mappings = lock.as_ref()?;
-
-    let mapping = match mappings
-        .iter()
-        .find(|m| m.schema == schema && m.table == table)
-    {
+    let mappings = match lock.as_ref() {
         Some(m) => m,
-        None => {
-            // We log this as a warning, but gracefully return None so the worker
-            // does not crash.
-            pgrx::log!(
-                "WARNING: pgmqtt.topic_map no mapping match for {}.{}. Active mappings: {:?}",
-                schema,
-                table,
-                mappings
-                    .iter()
-                    .map(|m| format!("{}.{}", m.schema, m.table))
-                    .collect::<Vec<_>>()
-            );
-            return None;
-        }
+        None => return vec![],
     };
 
-    // Build the column map for template context
+    // Build the column map for template context once, shared across all matching mappings.
     let col_map: HashMap<&str, &str> = columns
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -110,41 +117,70 @@ pub fn render(
     static ENV: OnceLock<Environment<'static>> = OnceLock::new();
     let env = ENV.get_or_init(Environment::new);
 
-    let topic = match env.render_str(
-        &mapping.topic_template,
-        context! {
-            schema => schema,
-            table => table,
-            op => op,
-            columns => col_map,
-        },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            pgrx::log!("WARNING: pgmqtt topic template render error: {}", e);
-            return None;
-        }
-    };
+    let mut results = Vec::new();
+    let mut matched = false;
 
-    let payload = match env.render_str(
-        &mapping.payload_template,
-        context! {
-            schema => schema,
-            table => table,
-            op => op,
-            columns => col_map,
-        },
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            pgrx::log!("WARNING: pgmqtt payload template render error: {}", e);
-            return None;
-        }
-    };
+    for mapping in mappings.iter().filter(|m| m.schema == schema && m.table == table) {
+        matched = true;
 
-    Some(RenderedMessage {
-        topic,
-        payload: payload.into_bytes(),
-        qos: mapping.qos,
-    })
+        let topic = match env.render_str(
+            &mapping.topic_template,
+            context! {
+                schema => schema,
+                table => table,
+                op => op,
+                columns => col_map,
+            },
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                pgrx::log!(
+                    "WARNING: pgmqtt topic template render error for mapping '{}': {}",
+                    mapping.name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        let payload = match env.render_str(
+            &mapping.payload_template,
+            context! {
+                schema => schema,
+                table => table,
+                op => op,
+                columns => col_map,
+            },
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                pgrx::log!(
+                    "WARNING: pgmqtt payload template render error for mapping '{}': {}",
+                    mapping.name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        results.push(RenderedMessage {
+            topic,
+            payload: payload.into_bytes(),
+            qos: mapping.qos,
+        });
+    }
+
+    if !matched {
+        pgrx::log!(
+            "WARNING: pgmqtt.topic_map no mapping match for {}.{}. Active mappings: {:?}",
+            schema,
+            table,
+            mappings
+                .iter()
+                .map(|m| format!("{}.{} ({})", m.schema, m.table, m.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    results
 }

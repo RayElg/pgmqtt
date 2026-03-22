@@ -15,9 +15,26 @@ pub struct ChangeEvent {
     pub columns: Vec<(String, String)>,
 }
 
+/// An event that can be pushed into the ring buffer.
+#[derive(Debug, Clone)]
+pub enum RingEvent {
+    /// A CDC data change on a user table.
+    Data(ChangeEvent),
+    /// A change to `pgmqtt_topic_mappings` decoded directly from WAL.
+    /// The consumer applies this delta in-place to the in-memory mapping cache,
+    /// keeping the cache in sync at the exact WAL position of the change.
+    MappingUpdate {
+        /// INSERT, UPDATE, or DELETE
+        op: &'static str,
+        /// Column name → value from the WAL record (new tuple for INSERT/UPDATE,
+        /// old/PK tuple for DELETE).
+        columns: Vec<(String, String)>,
+    },
+}
+
 /// Fixed-capacity ring buffer that drops the oldest entry on overflow.
 struct RingBuffer {
-    buf: VecDeque<ChangeEvent>,
+    buf: VecDeque<RingEvent>,
     capacity: usize,
     dropped: u64,
 }
@@ -31,7 +48,7 @@ impl RingBuffer {
         }
     }
 
-    fn push(&mut self, event: ChangeEvent) {
+    fn push(&mut self, event: RingEvent) {
         if self.buf.len() >= self.capacity {
             self.buf.pop_front();
             self.dropped += 1;
@@ -45,7 +62,7 @@ impl RingBuffer {
         self.buf.push_back(event);
     }
 
-    fn drain(&mut self) -> Vec<ChangeEvent> {
+    fn drain(&mut self) -> Vec<RingEvent> {
         self.buf.drain(..).collect()
     }
 
@@ -65,14 +82,14 @@ fn ensure_init(guard: &mut Option<RingBuffer>) {
 }
 
 /// Push a change event into the global ring buffer.
-pub fn push(event: ChangeEvent) {
+pub fn push(event: RingEvent) {
     let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
     ensure_init(&mut lock);
     lock.as_mut().unwrap().push(event);
 }
 
 /// Drain all buffered events, returning them in FIFO order.
-pub fn drain() -> Vec<ChangeEvent> {
+pub fn drain() -> Vec<RingEvent> {
     let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
     ensure_init(&mut lock);
     lock.as_mut().unwrap().drain()

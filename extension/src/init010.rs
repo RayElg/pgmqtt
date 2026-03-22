@@ -13,17 +13,38 @@ fn run_sql_or_error(sql: &str, operation: &str) {
 
 /// Initialize all v0.1.0 tables and indexes.
 pub fn init_010() {
-    // Topic mappings: CDC → MQTT topic + payload templates
+    // Topic mappings: CDC → MQTT topic + payload templates.
+    // Multiple mappings per (schema, table) are allowed via distinct mapping_name values,
+    // enabling parallel publish to multiple topics during schema migrations.
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_topic_mappings (
-            schema_name text NOT NULL,
-            table_name text NOT NULL,
+            schema_name   text NOT NULL,
+            table_name    text NOT NULL,
+            mapping_name  text NOT NULL DEFAULT 'default',
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
-            PRIMARY KEY (schema_name, table_name)
+            PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create mappings table",
+    );
+
+    // Internal WAL-synchronized mapping checkpoint.
+    // Updated atomically with each slot advance (same BackgroundWorker::transaction).
+    // On restart the worker loads from here — never from pgmqtt_topic_mappings — so the
+    // in-memory cache always reflects the mapping state at confirmed_flush_lsn, not
+    // a "future" state that the WAL hasn't reached yet.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_slot_mappings (
+            schema_name   text NOT NULL,
+            table_name    text NOT NULL,
+            mapping_name  text NOT NULL DEFAULT 'default',
+            topic_template text NOT NULL,
+            payload_template text NOT NULL,
+            qos int DEFAULT 0,
+            PRIMARY KEY (schema_name, table_name, mapping_name)
+        )",
+        "create slot mappings table",
     );
 
     // Message store: all MQTT messages routed through pgmqtt
