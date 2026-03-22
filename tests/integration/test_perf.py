@@ -5,6 +5,7 @@ All tests are marked @pytest.mark.slow — skip with: pytest -m "not slow"
 Results are printed in a table format for GHA step summary output.
 """
 
+import json
 import socket
 import threading
 import time
@@ -368,7 +369,6 @@ def test_inbound_qos0_throughput():
     s.sendall(create_connect_packet("perf_inbound_q0", clean_start=True))
     recv_packet(s)
 
-    import json
     start = time.time()
     for i in range(NUM_INBOUND):
         payload = json.dumps({"value": i * 0.1}).encode()
@@ -387,7 +387,7 @@ def test_inbound_qos0_throughput():
     rows = run_sql("SELECT COUNT(*) FROM perf_inbound;")
     count = rows[0][0] if rows else 0
     _print_result("Inbound QoS 0 (5k)", count, elapsed)
-    assert count >= NUM_INBOUND * 0.80, f"Only {count}/{NUM_INBOUND} rows written"
+    assert count >= NUM_INBOUND * 0.95, f"Only {count}/{NUM_INBOUND} rows written"
 
 
 @pytest.mark.slow
@@ -401,7 +401,6 @@ def test_inbound_qos1_throughput():
     s.sendall(create_connect_packet("perf_inbound_q1", clean_start=True))
     recv_packet(s)
 
-    import json
     start = time.time()
     for i in range(NUM_MESSAGES):
         payload = json.dumps({"value": i * 0.1}).encode()
@@ -506,7 +505,6 @@ def test_inbound_coexistence_throughput():
     s_pub.sendall(create_connect_packet("perf_coex_pub", clean_start=True))
     recv_packet(s_pub)
 
-    import json
     start = time.time()
     for i in range(NUM_MESSAGES):
         payload = json.dumps({"value": i}).encode()

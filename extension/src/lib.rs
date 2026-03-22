@@ -338,7 +338,7 @@ fn pgmqtt_add_inbound_mapping(
     };
 
     // 2. Validate op
-    let inbound_op = match InboundOp::from_str(op) {
+    let inbound_op = match InboundOp::parse(op) {
         Ok(o) => o,
         Err(e) => pgrx::error!("pgmqtt: {}", e),
     };
@@ -449,46 +449,20 @@ fn pgmqtt_add_inbound_mapping(
     let column_map_json = serde_json::to_string(&column_map.0)
         .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to serialize column_map: {}", e));
 
-    let conflict_arr = conflict_columns.as_ref();
+    let query = "\
+        INSERT INTO pgmqtt_inbound_mappings \
+            (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns, template_type) \
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::text[], $8) \
+         ON CONFLICT (mapping_name) DO UPDATE \
+         SET topic_pattern = EXCLUDED.topic_pattern, \
+             target_schema = EXCLUDED.target_schema, \
+             target_table = EXCLUDED.target_table, \
+             column_map = EXCLUDED.column_map, \
+             op = EXCLUDED.op, \
+             conflict_columns = EXCLUDED.conflict_columns, \
+             template_type = EXCLUDED.template_type";
 
     pgrx::spi::Spi::connect_mut(|client| {
-        // Build the SQL with proper array handling
-        let query = if let Some(cc) = conflict_arr {
-            let arr_literal = format!(
-                "ARRAY[{}]::text[]",
-                cc.iter()
-                    .map(|c| format!("'{}'", c.replace('\'', "''")))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            format!(
-                "INSERT INTO pgmqtt_inbound_mappings \
-                    (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns, template_type) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, {}, $7) \
-                 ON CONFLICT (mapping_name) DO UPDATE \
-                 SET topic_pattern = EXCLUDED.topic_pattern, \
-                     target_schema = EXCLUDED.target_schema, \
-                     target_table = EXCLUDED.target_table, \
-                     column_map = EXCLUDED.column_map, \
-                     op = EXCLUDED.op, \
-                     conflict_columns = EXCLUDED.conflict_columns, \
-                     template_type = EXCLUDED.template_type",
-                arr_literal
-            )
-        } else {
-            "INSERT INTO pgmqtt_inbound_mappings \
-                (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns, template_type) \
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6, NULL, $7) \
-             ON CONFLICT (mapping_name) DO UPDATE \
-             SET topic_pattern = EXCLUDED.topic_pattern, \
-                 target_schema = EXCLUDED.target_schema, \
-                 target_table = EXCLUDED.target_table, \
-                 column_map = EXCLUDED.column_map, \
-                 op = EXCLUDED.op, \
-                 conflict_columns = EXCLUDED.conflict_columns, \
-                 template_type = EXCLUDED.template_type".to_string()
-        };
-
         let args: Vec<pgrx::datum::DatumWithOid> = vec![
             mapping_name.into(),
             topic_pattern.into(),
@@ -496,9 +470,10 @@ fn pgmqtt_add_inbound_mapping(
             target_table.into(),
             column_map_json.as_str().into(),
             op.into(),
+            conflict_columns.into(),
             template_type.into(),
         ];
-        client.update(&query, None, &args).map(|_| ())
+        client.update(query, None, &args).map(|_| ())
     })
     .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to upsert inbound mapping: {}", e));
 

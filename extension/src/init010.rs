@@ -130,6 +130,11 @@ pub fn init_010() {
     // Tracks QoS 1 messages awaiting inbound table writes (virtual subscriber).
     // One row per (message, mapping) pair. Deleted on successful write;
     // moved to dead_letters after MAX_RETRIES or non-retryable errors.
+    //
+    // mapping_name intentionally has no FK to pgmqtt_inbound_mappings:
+    // if a mapping is removed while pending rows still reference it, the
+    // virtual subscriber detects "mapping no longer exists" and dead-letters
+    // the orphaned row rather than silently dropping it.
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_inbound_pending (
             message_id   bigint NOT NULL REFERENCES pgmqtt_messages(id) ON DELETE CASCADE,

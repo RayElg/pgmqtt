@@ -27,7 +27,7 @@ pub enum InboundOp {
 }
 
 impl InboundOp {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "insert" => Ok(InboundOp::Insert),
             "upsert" => Ok(InboundOp::Upsert),
@@ -319,7 +319,7 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => return String::new(), // unreachable: filtered by resolve_single_value
+        serde_json::Value::Null => unreachable!("filtered by resolve_single_value"),
         // For objects/arrays, return JSON text
         other => other.to_string(),
     }
@@ -403,9 +403,7 @@ pub fn generate_sql(
                 .expect("delete requires conflict_columns");
             let where_clauses: Vec<String> = where_cols
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    // Find the positional index of this column in column_names
+                .map(|c| {
                     let pos = column_names.iter().position(|n| n == c)
                         .expect("conflict column must be in column_map");
                     let typ = &column_types[pos];

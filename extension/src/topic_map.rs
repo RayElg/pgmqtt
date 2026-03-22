@@ -41,7 +41,7 @@ static MAPPINGS: Mutex<Option<Vec<TopicMapping>>> = Mutex::new(None);
 
 #[allow(dead_code)]
 fn with_mappings<R>(f: impl FnOnce(&Vec<TopicMapping>) -> R) -> Option<R> {
-    let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     lock.as_ref().map(f)
 }
 
@@ -61,7 +61,7 @@ pub fn mapping_count() -> usize {
 /// Get a clone of the current mappings (for diagnostics).
 #[allow(dead_code)]
 pub fn get() -> Option<Vec<TopicMapping>> {
-    let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     lock.clone()
 }
 
@@ -102,7 +102,7 @@ pub fn render(
     op: &str,
     columns: &[(String, String)],
 ) -> Vec<RenderedMessage> {
-    let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
 
     let mappings = match lock.as_ref() {
         Some(m) => m,

@@ -290,7 +290,7 @@ fn load_inbound_mappings() {
                         }
                     };
 
-                    let inbound_op = match inbound_map::InboundOp::from_str(&op_str) {
+                    let inbound_op = match inbound_map::InboundOp::parse(&op_str) {
                         Ok(o) => o,
                         Err(e) => {
                             log!("pgmqtt: skipping inbound mapping '{}': {}", mn, e);
@@ -405,20 +405,21 @@ fn load_inbound_mappings() {
     });
 }
 
-/// Execute a batch of inbound table writes in a single transaction.
-/// Message tracking (pgmqtt_messages), PUBACKs, and subscriber delivery are
-/// handled by the normal publish_messages_batch path — this function only
-/// performs the downstream table writes.
+/// Execute inbound table writes (QoS 0, best-effort).
+///
+/// Each write is executed in its own transaction so a single failure
+/// (constraint violation, bad data) doesn't roll back the entire batch.
 fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     if writes.is_empty() {
         return;
     }
 
-    let write_count = writes.len();
+    let total = writes.len();
+    let mut err_count = 0usize;
 
-    BackgroundWorker::transaction(|| {
-        let result = pgrx::spi::Spi::connect_mut(|client| {
-            for write in &writes {
+    for write in &writes {
+        let ok: bool = BackgroundWorker::transaction(|| {
+            pgrx::spi::Spi::connect_mut(|client| {
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = write.args
                     .iter()
                     .map(|a| {
@@ -427,22 +428,22 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
                     })
                     .collect();
                 client.update(&*write.sql, None, &spi_args)?;
-            }
-            Ok::<_, pgrx::spi::Error>(())
+                Ok::<_, pgrx::spi::Error>(())
+            })
+            .is_ok()
         });
-        match result {
-            Ok(_) => {
-                log!("pgmqtt inbound: committed {} writes", write_count);
-            }
-            Err(e) => {
-                log!(
-                    "pgmqtt inbound: transaction failed for {} writes: {:?}",
-                    write_count,
-                    e
-                );
-            }
+        if !ok {
+            err_count += 1;
         }
-    });
+    }
+
+    let ok_count = total - err_count;
+    if ok_count > 0 {
+        log!("pgmqtt inbound: committed {} writes", ok_count);
+    }
+    if err_count > 0 {
+        log!("pgmqtt inbound: {} writes failed", err_count);
+    }
 }
 
 /// Virtual subscriber: process QoS 1 inbound-pending messages.
