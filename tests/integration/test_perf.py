@@ -353,7 +353,7 @@ def _setup_inbound_perf():
         "  'perf_inbound'"
         ");"
     )
-    time.sleep(10)  # Wait for mapping reload
+    time.sleep(2)  # Wait for mapping reload (per-tick, ~80ms)
 
 
 @pytest.mark.slow

@@ -786,20 +786,14 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
-    let mut inbound_reload_counter: usize = 0;
-
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt mqtt+cdc: SIGHUP received");
             unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
         }
 
-        // Periodic inbound mapping reload (~8s = 100 ticks × 80ms)
-        inbound_reload_counter += 1;
-        if inbound_reload_counter >= 100 {
-            inbound_reload_counter = 0;
-            load_inbound_mappings();
-        }
+        // Reload inbound mappings every tick for synchronous pickup (~80ms)
+        load_inbound_mappings();
 
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
         let mut session_db_actions = Vec::new();

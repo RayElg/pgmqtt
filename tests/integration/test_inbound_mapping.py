@@ -72,7 +72,7 @@ def _cleanup():
     run_sql("DROP TABLE IF EXISTS test_nested_data CASCADE")
     run_sql("DROP TABLE IF EXISTS test_multi_target CASCADE")
     # Wait for inbound mapping reload
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
 
 def _setup_test_table():
@@ -188,7 +188,7 @@ def test_insert_via_mqtt_publish():
     """)
 
     # Wait for mapping to be picked up by background worker
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_insert")
     _publish_qos0(sock, "sensor/site-A/temperature/s1", {"temperature": 22.5})
@@ -221,7 +221,7 @@ def test_upsert_via_mqtt_publish():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_upsert")
     _publish_qos0(sock, "sensor/site-B/temperature/s2", {"temperature": 18.0})
@@ -258,7 +258,7 @@ def test_delete_via_mqtt_publish():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_delete")
     # Send empty JSON object as payload
@@ -288,7 +288,7 @@ def test_qos1_puback_after_db_write():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_qos1")
     _publish_qos1(sock, "sensor/site-D/temperature/s4", {"temperature": 42.0}, packet_id=1)
@@ -331,7 +331,7 @@ def test_nested_json_path():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_nested")
     payload = {"readings": {"temp": 21.5, "humidity": 65.2}}
@@ -365,7 +365,7 @@ def test_missing_json_field_inserts_null():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_null")
     # Publish with no "temperature" field
@@ -399,7 +399,7 @@ def test_non_json_payload_skipped():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_nonjson")
     # Publish non-JSON payload
@@ -511,7 +511,7 @@ def test_coexistence_inbound_and_subscriber():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     # Connect a subscriber
     sub_sock = _connect("inbound_test_sub")
@@ -558,7 +558,7 @@ def test_topic_pattern_no_match():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_nomatch")
     # Publish to a topic that doesn't match the pattern
@@ -597,7 +597,7 @@ def test_payload_and_topic_sources():
         )
     """)
 
-    time.sleep(TICK_WAIT * 5)
+    time.sleep(TICK_WAIT)
 
     sock = _connect("inbound_test_special")
     payload = {"msg": "hello"}
