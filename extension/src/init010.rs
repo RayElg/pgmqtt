@@ -29,31 +29,6 @@ pub fn init_010() {
         "create mappings table",
     );
 
-    // Migration guard: add mapping_name column to existing deployments that were created
-    // before this column was introduced.
-    let _ = Spi::run(
-        "ALTER TABLE pgmqtt_topic_mappings \
-         ADD COLUMN IF NOT EXISTS mapping_name text NOT NULL DEFAULT 'default'",
-    );
-
-    // Migration guard: upgrade the PK from (schema_name, table_name) to include mapping_name.
-    // Safe to run repeatedly — the DO block checks the existing PK width before acting.
-    let _ = Spi::run(
-        "DO $$ BEGIN
-           IF EXISTS (
-               SELECT 1 FROM pg_constraint c
-               JOIN pg_class r ON r.oid = c.conrelid
-               WHERE r.relname = 'pgmqtt_topic_mappings'
-                 AND c.conname = 'pgmqtt_topic_mappings_pkey'
-                 AND c.contype = 'p'
-                 AND array_length(c.conkey, 1) = 2
-           ) THEN
-               ALTER TABLE pgmqtt_topic_mappings DROP CONSTRAINT pgmqtt_topic_mappings_pkey;
-               ALTER TABLE pgmqtt_topic_mappings ADD PRIMARY KEY (schema_name, table_name, mapping_name);
-           END IF;
-         END $$",
-    );
-
     // Internal WAL-synchronized mapping checkpoint.
     // Updated atomically with each slot advance (same BackgroundWorker::transaction).
     // On restart the worker loads from here — never from pgmqtt_topic_mappings — so the
