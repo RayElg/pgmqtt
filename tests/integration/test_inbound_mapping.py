@@ -271,8 +271,8 @@ def test_delete_via_mqtt_publish():
     sock.close()
 
 
-def test_qos1_puback_after_db_write():
-    """Test: QoS 1 PUBACK is deferred until DB write commits."""
+def test_qos1_puback_with_inbound_write():
+    """Test: QoS 1 publish triggers both PUBACK and inbound DB write."""
     _cleanup()
     _setup_test_table()
 

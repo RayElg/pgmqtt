@@ -111,6 +111,8 @@ Output columns:
 | `cdc_mappings` | int | Number of registered CDC topic mappings |
 | `cdc_slot_active` | bigint | `1` if the `pgmqtt_slot` logical replication slot is active, `0` otherwise |
 | `inbound_mappings` | int | Number of registered inbound MQTT → table mappings |
+| `inbound_pending` | int | QoS 1 inbound messages awaiting table writes (virtual subscriber queue) |
+| `dead_letters` | int | Inbound messages that failed permanently and were dead-lettered |
 
 All counts are taken from a single SQL statement and reflect a consistent snapshot.
 
@@ -348,3 +350,31 @@ Columns:
 - `template_type`: Template engine type (e.g., `'jsonpath'`).
 
 The background worker loads mappings from this table at startup and reloads periodically (~8s). Changes made via the SQL functions take effect on the next reload cycle.
+
+### `pgmqtt_inbound_pending`
+
+Tracks QoS 1 messages awaiting inbound table writes. Acts as a durable queue for the "virtual subscriber" — a background process that reads pending rows, executes the table write, and deletes the row on success.
+
+Columns:
+- `message_id`: Reference to the message in `pgmqtt_messages` (part of composite PK).
+- `mapping_name`: The inbound mapping that matched (part of composite PK).
+- `retry_count`: Number of retry attempts so far.
+- `last_error`: Error message from the most recent failed attempt.
+- `next_retry_at`: When the next retry should be attempted (exponential backoff: 1s, 2s, 4s… capped at 256s).
+- `created_at`: When this pending entry was created.
+
+Rows are inserted atomically with the message in `pgmqtt_messages` during QoS 1 publish handling, ensuring the PUBACK is only sent after both are durably committed. After 10 failed retries (or a non-retryable error), the row is moved to `pgmqtt_dead_letters`.
+
+### `pgmqtt_dead_letters`
+
+Stores inbound messages that failed permanently — either after exceeding the maximum retry count (10) or due to a non-retryable error (e.g., target table does not exist, permission denied, constraint violation).
+
+Columns:
+- `id`: Auto-incrementing primary key.
+- `original_message_id`: The message ID from `pgmqtt_messages` (may no longer exist).
+- `topic`: MQTT topic of the original message.
+- `payload`: Original message payload (bytea).
+- `mapping_name`: The inbound mapping that was being applied.
+- `error_message`: The error that caused the dead-letter.
+- `retry_count`: How many retries were attempted before dead-lettering.
+- `dead_lettered_at`: When this entry was created.

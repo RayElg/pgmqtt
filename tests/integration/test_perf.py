@@ -392,7 +392,7 @@ def test_inbound_qos0_throughput():
 
 @pytest.mark.slow
 def test_inbound_qos1_throughput():
-    """Throughput: 200 QoS 1 inbound writes with deferred PUBACK."""
+    """Throughput: 200 QoS 1 inbound writes with PUBACK."""
     _setup_inbound_perf()
     run_sql("TRUNCATE perf_inbound;")
 
@@ -409,7 +409,7 @@ def test_inbound_qos1_throughput():
             f"perf/site-B/data/s{i}", payload, qos=1, packet_id=i + 1,
         ))
 
-    # Collect all PUBACKs (deferred until DB write commits)
+    # Collect all PUBACKs
     acks = 0
     while acks < NUM_MESSAGES:
         pkt = recv_packet(s, timeout=10.0)

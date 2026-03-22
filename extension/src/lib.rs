@@ -241,8 +241,11 @@ fn pgmqtt_remove_outbound_mapping(
     let args: Vec<pgrx::datum::DatumWithOid> =
         vec![schema_name.into(), table_name.into(), mapping_name.into()];
 
-    let deleted =
-        pgrx::spi::Spi::connect_mut(|client| client.update(query, None, &args).map(|_| ())).is_ok();
+    let deleted = pgrx::spi::Spi::connect_mut(|client| {
+        let status = client.update(query, None, &args)?;
+        Ok::<bool, spi::Error>(status.len() > 0)
+    })
+    .unwrap_or(false);
 
     pgrx::log!(
         "pgmqtt: remove outbound mapping {}.{} (name='{}') → {}",
@@ -377,14 +380,14 @@ fn pgmqtt_add_inbound_mapping(
     // 6. Verify target table exists and collect column names via pg_catalog
     let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
 
-    // First check table existence with a safe query (no regclass cast that can throw)
+    // Check table existence using parameterized query (safe against injection)
+    let qualified_name = format!("{}.{}", target_schema, target_table);
     let table_exists = pgrx::spi::Spi::connect(|client| {
-        let check_query = format!(
-            "SELECT to_regclass('{}.{}')::text",
-            target_schema.replace('\'', "''"),
-            target_table.replace('\'', "''")
-        );
-        let result = client.select(&check_query, None, &[])?
+        let result = client.select(
+            "SELECT to_regclass($1)::text",
+            None,
+            &[qualified_name.as_str().into()],
+        )?
             .first()
             .get_one::<String>()?;
         Ok::<bool, spi::Error>(result.is_some())
@@ -400,15 +403,14 @@ fn pgmqtt_add_inbound_mapping(
     }
 
     let existing_cols: Vec<String> = pgrx::spi::Spi::connect(|client| {
-        let col_query = format!(
-            "SELECT attname::text FROM pg_attribute \
-             WHERE attrelid = '{}.{}'::regclass \
-               AND attnum > 0 AND NOT attisdropped",
-            target_schema.replace('\'', "''"),
-            target_table.replace('\'', "''")
-        );
         let mut cols = Vec::new();
-        if let Ok(table) = client.select(&col_query, None, &[]) {
+        if let Ok(table) = client.select(
+            "SELECT attname::text FROM pg_attribute \
+             WHERE attrelid = $1::regclass \
+               AND attnum > 0 AND NOT attisdropped",
+            None,
+            &[qualified_name.as_str().into()],
+        ) {
             for row in table {
                 if let Ok(Some(name)) = row.get_by_name::<String, _>("attname") {
                     cols.push(name);
@@ -521,9 +523,10 @@ fn pgmqtt_remove_inbound_mapping(
     let args: Vec<pgrx::datum::DatumWithOid> = vec![mapping_name.into()];
 
     let deleted = pgrx::spi::Spi::connect_mut(|client| {
-        client.update(query, None, &args).map(|_| ())
+        let status = client.update(query, None, &args)?;
+        Ok::<bool, spi::Error>(status.len() > 0)
     })
-    .is_ok();
+    .unwrap_or(false);
 
     pgrx::log!(
         "pgmqtt: remove inbound mapping '{}' → {}",
@@ -661,9 +664,11 @@ fn pgmqtt_status() -> TableIterator<
         name!(cdc_mappings, i32),
         name!(cdc_slot_active, i64),
         name!(inbound_mappings, i32),
+        name!(inbound_pending, i32),
+        name!(dead_letters, i32),
     ),
 > {
-    let row = Spi::connect(|client| -> Result<(i32, i32, i32, i32, i32, i64, i32), spi::Error> {
+    let row = Spi::connect(|client| -> Result<(i32, i32, i32, i32, i32, i64, i32, i32, i32), spi::Error> {
         // Single statement: all counts share one snapshot, preventing torn reads.
         let q = "\
             SELECT \
@@ -674,7 +679,9 @@ fn pgmqtt_status() -> TableIterator<
               (SELECT COUNT(*)::int  FROM pgmqtt_topic_mappings)                                 AS cdc_mappings, \
               (SELECT COUNT(*)::int8 FROM pg_replication_slots \
                  WHERE slot_name = 'pgmqtt_slot' AND slot_type = 'logical' AND active)           AS cdc_slot_active, \
-              (SELECT COUNT(*)::int  FROM pgmqtt_inbound_mappings)                               AS inbound_mappings\
+              (SELECT COUNT(*)::int  FROM pgmqtt_inbound_mappings)                               AS inbound_mappings, \
+              (SELECT COUNT(*)::int  FROM pgmqtt_inbound_pending)                                AS inbound_pending, \
+              (SELECT COUNT(*)::int  FROM pgmqtt_dead_letters)                                   AS dead_letters\
         ";
 
         if let Ok(mut rows) = client.select(q, None, &[]) {
@@ -686,11 +693,13 @@ fn pgmqtt_status() -> TableIterator<
                 let cm  = row.get_by_name::<i32, _>("cdc_mappings").ok().flatten().unwrap_or(0);
                 let csa = row.get_by_name::<i64, _>("cdc_slot_active").ok().flatten().unwrap_or(0);
                 let im  = row.get_by_name::<i32, _>("inbound_mappings").ok().flatten().unwrap_or(0);
-                return Ok((ac, ts, tr, ps, cm, csa, im));
+                let ip  = row.get_by_name::<i32, _>("inbound_pending").ok().flatten().unwrap_or(0);
+                let dl  = row.get_by_name::<i32, _>("dead_letters").ok().flatten().unwrap_or(0);
+                return Ok((ac, ts, tr, ps, cm, csa, im, ip, dl));
             }
         }
-        Ok((0, 0, 0, 0, 0, 0, 0))
-    }).unwrap_or((0, 0, 0, 0, 0, 0, 0));
+        Ok((0, 0, 0, 0, 0, 0, 0, 0, 0))
+    }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
 
     TableIterator::new(std::iter::once(row))
 }

@@ -14,7 +14,7 @@ def test_status_function_exists_and_returns_row():
     assert result
     assert len(result) == 1  # Single row
     row = result[0]
-    assert len(row) == 7  # 7 columns (including inbound_mappings)
+    assert len(row) == 9  # 9 columns (including inbound_pending, dead_letters)
 
 
 def test_status_reports_zero_connections_on_empty_database():
@@ -174,7 +174,8 @@ def test_status_returns_complete_row():
 
     result = run_sql(
         "SELECT active_connections, total_subscriptions, total_retained_messages, "
-        "pending_session_messages, cdc_mappings, cdc_slot_active FROM pgmqtt_status();"
+        "pending_session_messages, cdc_mappings, cdc_slot_active, inbound_mappings, "
+        "inbound_pending, dead_letters FROM pgmqtt_status();"
     )
     assert result
     row = result[0]
@@ -184,3 +185,6 @@ def test_status_returns_complete_row():
     assert row[3] >= 0  # pending_session_messages
     assert row[4] >= 1  # cdc_mappings
     assert row[5] >= 0  # cdc_slot_active
+    assert row[6] >= 0  # inbound_mappings
+    assert row[7] >= 0  # inbound_pending
+    assert row[8] >= 0  # dead_letters

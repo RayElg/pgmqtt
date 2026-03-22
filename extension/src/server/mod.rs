@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -366,151 +366,263 @@ fn load_inbound_mappings() {
     });
 }
 
-/// Replace `$1`, `$2`, ... placeholders with inline SQL-escaped values.
-/// Single-pass: scans the template once, emitting literal text between placeholders.
-fn build_inline_sql(template: &str, args: &[Option<String>]) -> String {
-    let mut result = String::with_capacity(template.len() + args.len() * 16);
-    let bytes = template.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut copy_from = 0;
-
-    while i < len {
-        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
-            // Flush text before this placeholder
-            result.push_str(&template[copy_from..i]);
-
-            let start = i + 1;
-            let mut end = start;
-            while end < len && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            let num: usize = template[start..end].parse().unwrap_or(0);
-            if num >= 1 && num <= args.len() {
-                match &args[num - 1] {
-                    Some(val) => {
-                        result.push('\'');
-                        for ch in val.chars() {
-                            if ch == '\'' {
-                                result.push_str("''");
-                            } else {
-                                result.push(ch);
-                            }
-                        }
-                        result.push('\'');
-                    }
-                    None => result.push_str("NULL"),
-                }
-            } else {
-                result.push_str(&template[i..end]);
-            }
-            i = end;
-            copy_from = end;
-        } else {
-            i += 1;
-        }
-    }
-    if copy_from < len {
-        result.push_str(&template[copy_from..]);
-    }
-    result
-}
-
-/// Execute a batch of inbound writes in a single transaction.
-/// Each write also inserts into pgmqtt_messages for tracking.
-/// Returns the list of (client_id, packet_id) pairs for deferred PUBACKs.
-fn execute_inbound_writes(
-    writes: Vec<inbound_map::PendingInboundWrite>,
-    clients: &mut HashMap<String, MqttClient>,
-) {
+/// Execute a batch of inbound table writes in a single transaction.
+/// Message tracking (pgmqtt_messages), PUBACKs, and subscriber delivery are
+/// handled by the normal publish_messages_batch path — this function only
+/// performs the downstream table writes.
+fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     if writes.is_empty() {
         return;
     }
 
     let write_count = writes.len();
 
-    // Collect PUBACK info before moving writes into the transaction closure
-    let puback_info: Vec<(String, Option<u16>, u8)> = writes
-        .iter()
-        .map(|w| (w.client_id.clone(), w.packet_id, w.qos))
-        .collect();
-
-    let ok = BackgroundWorker::transaction(|| {
+    BackgroundWorker::transaction(|| {
         let result = pgrx::spi::Spi::connect_mut(|client| {
-            // 1. Batch INSERT into pgmqtt_messages (single statement for all writes)
-            let mut msgs_sql = String::with_capacity(writes.len() * 128);
-            msgs_sql.push_str(
-                "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ",
-            );
-            for (i, write) in writes.iter().enumerate() {
-                if i > 0 {
-                    msgs_sql.push_str(", ");
-                }
-                msgs_sql.push('(');
-                // topic (text, quote-escaped)
-                msgs_sql.push('\'');
-                for ch in write.topic.chars() {
-                    if ch == '\'' {
-                        msgs_sql.push_str("''");
-                    } else {
-                        msgs_sql.push(ch);
-                    }
-                }
-                msgs_sql.push_str("', ");
-                // payload (bytea via decode, or NULL)
-                if write.payload.is_empty() {
-                    msgs_sql.push_str("NULL, ");
-                } else {
-                    msgs_sql.push_str("decode('");
-                    for &b in &write.payload {
-                        const HEX: &[u8; 16] = b"0123456789abcdef";
-                        msgs_sql.push(HEX[(b >> 4) as usize] as char);
-                        msgs_sql.push(HEX[(b & 0x0f) as usize] as char);
-                    }
-                    msgs_sql.push_str("', 'hex'), ");
-                }
-                // qos, retain
-                msgs_sql.push_str(&write.qos.to_string());
-                msgs_sql.push_str(", false)");
-            }
-            client.update(&msgs_sql, None, &[])?;
-
-            // 2. Execute downstream table writes (inline SQL per mapping)
             for write in &writes {
-                let inline_sql = build_inline_sql(&write.sql, &write.args);
-                client.update(&inline_sql, None, &[])?;
+                let spi_args: Vec<pgrx::datum::DatumWithOid> = write.args
+                    .iter()
+                    .map(|a| {
+                        let opt: Option<&str> = a.as_deref();
+                        opt.into()
+                    })
+                    .collect();
+                client.update(&*write.sql, None, &spi_args)?;
             }
             Ok::<_, pgrx::spi::Error>(())
         });
         match result {
-            Ok(_) => true,
+            Ok(_) => {
+                if write_count > 0 {
+                    log!("pgmqtt inbound: committed {} writes", write_count);
+                }
+            }
             Err(e) => {
                 log!(
-                    "pgmqtt inbound: transaction failed for {} writes: {:?} — no PUBACKs sent",
+                    "pgmqtt inbound: transaction failed for {} writes: {:?}",
                     write_count,
                     e
                 );
-                false
             }
         }
     });
+}
 
-    if ok {
-        // Send deferred PUBACKs for QoS 1 publishes
-        for (client_id, packet_id, qos) in &puback_info {
-            if *qos == 1 {
-                if let Some(pid) = packet_id {
-                    if let Some(client) = clients.get_mut(client_id) {
-                        let puback = mqtt::build_puback(*pid);
-                        let _ = client.transport.write_all(&puback);
-                    }
+/// Virtual subscriber: process QoS 1 inbound-pending messages.
+///
+/// Reads from pgmqtt_inbound_pending (joined with pgmqtt_messages),
+/// re-matches against inbound mappings to get SQL + args, executes the
+/// table write, and on success removes the pending row and cleans up
+/// the message if no other references remain.
+///
+/// Each pending row is processed in its own transaction so a single
+/// failure doesn't block the rest of the batch.
+fn process_inbound_pending() {
+    const BATCH_SIZE: i64 = 50;
+    const MAX_RETRIES: i32 = 10;
+
+    // Step 1: read a batch of pending rows (read-only transaction)
+    struct PendingRow {
+        message_id: i64,
+        mapping_name: String,
+        retry_count: i32,
+        topic: String,
+        payload: Vec<u8>,
+    }
+
+    let rows: Vec<PendingRow> = BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect(|client| {
+            let mut out = Vec::new();
+            if let Ok(table) = client.select(
+                "SELECT p.message_id, p.mapping_name, p.retry_count, \
+                        m.topic, m.payload \
+                 FROM pgmqtt_inbound_pending p \
+                 JOIN pgmqtt_messages m ON p.message_id = m.id \
+                 WHERE p.next_retry_at <= now() \
+                 ORDER BY p.next_retry_at ASC \
+                 LIMIT $1",
+                None,
+                &[BATCH_SIZE.into()],
+            ) {
+                for row in table {
+                    let message_id: i64 = row.get_by_name("message_id").ok().flatten().unwrap_or(0);
+                    let mapping_name: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
+                    let retry_count: i32 = row.get_by_name("retry_count").ok().flatten().unwrap_or(0);
+                    let topic: String = row.get_by_name("topic").ok().flatten().unwrap_or_default();
+                    let payload: Option<Vec<u8>> = row.get_by_name("payload").ok().flatten();
+                    out.push(PendingRow {
+                        message_id,
+                        mapping_name,
+                        retry_count,
+                        topic,
+                        payload: payload.unwrap_or_default(),
+                    });
                 }
             }
-        }
-        if write_count > 0 {
-            log!("pgmqtt inbound: committed {} writes", write_count);
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+    })
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return;
+    }
+
+    // Step 2: process each row in its own transaction
+    for pending in &rows {
+        let matches = inbound_map::try_match(&pending.topic, &pending.payload);
+        let target_match = matches.into_iter()
+            .find(|(_, m)| m.mapping_name.as_ref() == pending.mapping_name);
+
+        match target_match {
+            Some((_, match_result)) => {
+                // Attempt the table write
+                let write_ok = BackgroundWorker::transaction(|| {
+                    pgrx::spi::Spi::connect_mut(|client| {
+                        let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result.values
+                            .iter()
+                            .map(|a| {
+                                let opt: Option<&str> = a.as_deref();
+                                opt.into()
+                            })
+                            .collect();
+                        client.update(&*match_result.sql, None, &spi_args)?;
+
+                        // Success: remove pending row and clean up message
+                        client.update(
+                            "DELETE FROM pgmqtt_inbound_pending \
+                             WHERE message_id = $1 AND mapping_name = $2",
+                            None,
+                            &[pending.message_id.into(), pending.mapping_name.as_str().into()],
+                        )?;
+                        client.update(
+                            "DELETE FROM pgmqtt_messages \
+                             WHERE id = $1 AND retain = false \
+                               AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+                               AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+                            None,
+                            &[pending.message_id.into()],
+                        )?;
+                        Ok::<_, pgrx::spi::Error>(())
+                    })
+                });
+
+                if write_ok.is_ok() {
+                    log!(
+                        "pgmqtt inbound: processed message {} for mapping '{}'",
+                        pending.message_id,
+                        pending.mapping_name,
+                    );
+                } else {
+                    // Write failed — classify and handle
+                    let err_msg = format!("{:?}", write_ok.err().unwrap());
+                    handle_inbound_failure(pending.message_id, &pending.mapping_name,
+                        pending.retry_count, &err_msg, MAX_RETRIES,
+                        &pending.topic, &pending.payload);
+                }
+            }
+            None => {
+                // Mapping was removed since the message was published
+                handle_inbound_failure(pending.message_id, &pending.mapping_name,
+                    pending.retry_count, "mapping no longer exists", MAX_RETRIES,
+                    &pending.topic, &pending.payload);
+            }
         }
     }
+
+    log!("pgmqtt inbound: processed {} pending rows", rows.len());
+}
+
+/// Classify an inbound write failure and either retry or dead-letter.
+fn handle_inbound_failure(
+    message_id: i64,
+    mapping_name: &str,
+    retry_count: i32,
+    error_msg: &str,
+    max_retries: i32,
+    topic: &str,
+    payload: &[u8],
+) {
+    let retryable = is_retryable_error(error_msg);
+    let should_dead_letter = !retryable || retry_count >= max_retries;
+
+    if should_dead_letter {
+        log!(
+            "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
+            message_id, mapping_name, error_msg
+        );
+        BackgroundWorker::transaction(|| {
+            let _ = pgrx::spi::Spi::connect_mut(|client| {
+                let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
+                client.update(
+                    "INSERT INTO pgmqtt_dead_letters \
+                        (original_message_id, topic, payload, mapping_name, error_message, retry_count) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    None,
+                    &[
+                        message_id.into(),
+                        topic.into(),
+                        payload_arg.into(),
+                        mapping_name.into(),
+                        error_msg.into(),
+                        retry_count.into(),
+                    ],
+                )?;
+                client.update(
+                    "DELETE FROM pgmqtt_inbound_pending \
+                     WHERE message_id = $1 AND mapping_name = $2",
+                    None,
+                    &[message_id.into(), mapping_name.into()],
+                )?;
+                client.update(
+                    "DELETE FROM pgmqtt_messages \
+                     WHERE id = $1 AND retain = false \
+                       AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+                       AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+                    None,
+                    &[message_id.into()],
+                )?;
+                Ok::<_, pgrx::spi::Error>(())
+            });
+        });
+    } else {
+        log!(
+            "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
+            retry_count + 1, max_retries, message_id, mapping_name, error_msg
+        );
+        BackgroundWorker::transaction(|| {
+            let _ = pgrx::spi::Spi::connect_mut(|client| {
+                // Exponential backoff: 1s, 2s, 4s, ... capped at 256s
+                client.update(
+                    "UPDATE pgmqtt_inbound_pending \
+                     SET retry_count = retry_count + 1, \
+                         last_error = $3, \
+                         next_retry_at = now() + (interval '1 second' * power(2, LEAST($4, 8))) \
+                     WHERE message_id = $1 AND mapping_name = $2",
+                    None,
+                    &[
+                        message_id.into(),
+                        mapping_name.into(),
+                        error_msg.into(),
+                        retry_count.into(),
+                    ],
+                )?;
+                Ok::<_, pgrx::spi::Error>(())
+            });
+        });
+    }
+}
+
+/// Classify whether an inbound write error is retryable.
+fn is_retryable_error(err_msg: &str) -> bool {
+    let non_retryable = [
+        "does not exist",
+        "permission denied",
+        "invalid input syntax",
+        "violates not-null constraint",
+        "mapping no longer exists",
+    ];
+    !non_retryable.iter().any(|pat| err_msg.contains(pat))
 }
 
 struct MqttClient {
@@ -826,7 +938,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         );
 
         // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
-        execute_inbound_writes(pending_inbound_writes, &mut clients);
+        execute_inbound_writes(pending_inbound_writes);
 
         // ── CDC: load mappings, advance slot, drain ring buffer ──
         cdc_tick(slot_name);
@@ -842,6 +954,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
 
         publish_messages_batch(publishes, &mut clients);
+
+        // Virtual subscriber: process QoS 1 inbound-pending messages
+        process_inbound_pending();
 
         // Sweep sessions whose Session Expiry Interval has elapsed
         sweep_expired_sessions(&mut session_db_actions);
@@ -874,6 +989,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
                 retain: will.retain,
                 log_sender: format!("{} (Will/shutdown)", id),
                 packet_id: None,
+                inbound_mappings: Vec::new(),
             });
         }
 
@@ -1674,6 +1790,11 @@ struct PendingPublish {
     retain: bool,
     log_sender: String,
     packet_id: Option<u16>,
+    /// Mapping names that matched this publish for inbound table writes.
+    /// Only populated for QoS >= 1; used by publish_messages_batch to insert
+    /// tracking rows into pgmqtt_inbound_pending atomically with message
+    /// persistence.
+    inbound_mappings: Vec<Arc<str>>,
 }
 
 fn disconnect_client(
@@ -1695,6 +1816,7 @@ fn disconnect_client(
                 retain: will.retain,
                 log_sender: format!("{} (Will)", id),
                 packet_id: None,
+                inbound_mappings: Vec::new(),
             });
         }
     }
@@ -1895,6 +2017,22 @@ fn publish_messages_batch(pending: Vec<PendingPublish>, clients: &mut HashMap<St
                                     &args,
                                 )?;
                             }
+                        }
+                    }
+
+                    // Insert inbound-pending tracking rows (virtual subscriber).
+                    // These are committed atomically with the message so the
+                    // PUBACK reflects durable intent to process.
+                    if let Some(msg_id) = msg_id_opt {
+                        for mapping_name in &p.inbound_mappings {
+                            let args: Vec<pgrx::datum::DatumWithOid> =
+                                vec![msg_id.into(), mapping_name.as_ref().into()];
+                            client.update(
+                                "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
+                                 VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                                None,
+                                &args,
+                            )?;
                         }
                     }
 
@@ -2228,27 +2366,26 @@ fn handle_mqtt_packet(
 
             // Check for inbound mapping matches (MQTT → PostgreSQL table writes)
             let inbound_matches = inbound_map::try_match(&pub_pkt.topic, &pub_pkt.payload);
-            let has_inbound_match = !inbound_matches.is_empty();
 
-            if has_inbound_match {
-                for (_idx, match_result) in inbound_matches {
+            // QoS 0: collect for inline best-effort execution
+            // QoS 1: collect mapping names to attach to PendingPublish for
+            //         durable tracking via pgmqtt_inbound_pending
+            let mut inbound_mapping_names: Vec<Arc<str>> = Vec::new();
+            for (_idx, match_result) in inbound_matches {
+                if pub_pkt.qos == 0 {
                     pending_inbound_writes.push(inbound_map::PendingInboundWrite {
                         sql: match_result.sql,
                         args: match_result.values,
-                        client_id: client_id.clone(),
-                        packet_id: pub_pkt.packet_id,
-                        qos: pub_pkt.qos,
-                        topic: pub_pkt.topic.clone(),
-                        payload: pub_pkt.payload.clone(),
                     });
+                } else {
+                    inbound_mapping_names.push(match_result.mapping_name);
                 }
             }
 
-            // Optimization: skip all processing if no one is listening (and not retained)
-            // and no inbound mapping matched. For QoS 1 without inbound match, still PUBACK.
-            // For QoS 1 with inbound match, PUBACK is deferred to execute_inbound_writes.
+            // Optimization: skip all processing if no one is listening, not
+            // retained, and no QoS 1 inbound mappings need durable tracking.
             let subscriber_ids = subscriptions::match_topic(&pub_pkt.topic);
-            if !pub_pkt.retain && subscriber_ids.is_empty() && !has_inbound_match {
+            if !pub_pkt.retain && subscriber_ids.is_empty() && inbound_mapping_names.is_empty() {
                 if pub_pkt.qos == 1 {
                     if let Some(pid) = pub_pkt.packet_id {
                         log!(
@@ -2269,30 +2406,15 @@ fn handle_mqtt_packet(
                 return true;
             }
 
-            // If inbound match handled this message, still add to pending_publishes
-            // for MQTT subscriber delivery, but with QoS 0 (fire-and-forget to subscribers)
-            // and without packet_id (PUBACK is handled by execute_inbound_writes).
-            if has_inbound_match {
-                if !subscriber_ids.is_empty() || pub_pkt.retain {
-                    pending_publishes.push(PendingPublish {
-                        topic: pub_pkt.topic,
-                        payload: pub_pkt.payload,
-                        qos: 0, // Downgrade to QoS 0 for subscriber delivery
-                        retain: pub_pkt.retain,
-                        log_sender: client_id,
-                        packet_id: None, // PUBACK handled by inbound write path
-                    });
-                }
-            } else {
-                pending_publishes.push(PendingPublish {
-                    topic: pub_pkt.topic,
-                    payload: pub_pkt.payload,
-                    qos: pub_pkt.qos,
-                    retain: pub_pkt.retain,
-                    log_sender: client_id,
-                    packet_id: pub_pkt.packet_id,
-                });
-            }
+            pending_publishes.push(PendingPublish {
+                topic: pub_pkt.topic,
+                payload: pub_pkt.payload,
+                qos: pub_pkt.qos,
+                retain: pub_pkt.retain,
+                log_sender: client_id,
+                packet_id: pub_pkt.packet_id,
+                inbound_mappings: inbound_mapping_names,
+            });
             true
         }
         mqtt::InboundPacket::Connect(_) => {

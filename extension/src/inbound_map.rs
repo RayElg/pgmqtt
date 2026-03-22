@@ -76,16 +76,12 @@ pub struct InboundMapping {
     pub template_type: String,
 }
 
-/// A pending inbound write, accumulated during a tick.
+/// A pending QoS 0 inbound table write, executed inline (best-effort).
+/// QoS 1 inbound writes are handled by the virtual subscriber via
+/// pgmqtt_inbound_pending after the message is durably persisted.
 pub struct PendingInboundWrite {
     pub sql: Arc<str>,
     pub args: Vec<Option<String>>,
-    pub client_id: String,
-    pub packet_id: Option<u16>,
-    pub qos: u8,
-    /// Pre-computed args for the pgmqtt_messages INSERT
-    pub topic: String,
-    pub payload: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,13 +92,13 @@ static INBOUND_MAPPINGS: Mutex<Option<Vec<InboundMapping>>> = Mutex::new(None);
 
 /// Replace the in-memory inbound mapping cache.
 pub fn set_mappings(mappings: Vec<InboundMapping>) {
-    let mut lock = INBOUND_MAPPINGS.lock().expect("inbound_map: poisoned mutex");
+    let mut lock = INBOUND_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     *lock = Some(mappings);
 }
 
 /// Check if mappings have been loaded.
 pub fn is_loaded() -> bool {
-    let lock = INBOUND_MAPPINGS.lock().expect("inbound_map: poisoned mutex");
+    let lock = INBOUND_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     lock.is_some()
 }
 
@@ -118,7 +114,7 @@ pub fn try_match(
     topic: &str,
     payload: &[u8],
 ) -> Vec<(usize, InboundMatchResult)> {
-    let lock = INBOUND_MAPPINGS.lock().expect("inbound_map: poisoned mutex");
+    let lock = INBOUND_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     let mappings = match lock.as_ref() {
         Some(m) if !m.is_empty() => m,
         _ => return vec![],
