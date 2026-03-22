@@ -107,6 +107,23 @@ pub fn init_010() {
         "create subscriptions table",
     );
 
+    // Inbound MQTT → PostgreSQL table mappings.
+    // Allows MQTT devices to publish messages that are automatically written
+    // to PostgreSQL tables based on topic pattern matching and column maps.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_inbound_mappings (
+            mapping_name     text NOT NULL DEFAULT 'default',
+            topic_pattern    text NOT NULL,
+            target_schema    text NOT NULL DEFAULT 'public',
+            target_table     text NOT NULL,
+            column_map       jsonb NOT NULL,
+            op               text NOT NULL DEFAULT 'insert',
+            conflict_columns text[] DEFAULT NULL,
+            PRIMARY KEY (mapping_name)
+        )",
+        "create inbound mappings table",
+    );
+
     // Indexes for efficient queries
     let _ = Spi::run(
         "CREATE INDEX IF NOT EXISTS idx_session_messages_message_id ON pgmqtt_session_messages(message_id)",

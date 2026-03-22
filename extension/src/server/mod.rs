@@ -7,6 +7,7 @@ pub mod transport;
 pub use db_action::{execute_session_db_actions, SessionDbAction};
 pub use session::{with_sessions, MqttSession};
 pub use transport::Transport;
+use crate::inbound_map;
 use crate::mqtt;
 use crate::subscriptions;
 use crate::topic_buffer;
@@ -243,6 +244,274 @@ fn db_load_sessions_on_startup() {
     });
 }
 
+/// Load inbound mappings from pgmqtt_inbound_mappings into the in-memory cache.
+fn load_inbound_mappings() {
+    BackgroundWorker::transaction(|| {
+        let _ = pgrx::spi::Spi::connect(|client| {
+            let table_exists = client
+                .select(
+                    "SELECT to_regclass('pgmqtt_inbound_mappings')::text",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get_one::<String>()?
+                .is_some();
+
+            if !table_exists {
+                inbound_map::set_mappings(Vec::new());
+                return Ok::<_, pgrx::spi::Error>(());
+            }
+
+            let mut mappings = Vec::new();
+            if let Ok(table) = client.select(
+                "SELECT mapping_name, topic_pattern, target_schema, target_table, \
+                        column_map::text, op, conflict_columns \
+                 FROM pgmqtt_inbound_mappings",
+                None,
+                &[],
+            ) {
+                for row in table {
+                    let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
+                    let tp: String = row.get_by_name("topic_pattern").ok().flatten().unwrap_or_default();
+                    let ts: String = row.get_by_name("target_schema").ok().flatten().unwrap_or_else(|| "public".to_string());
+                    let tt: String = row.get_by_name("target_table").ok().flatten().unwrap_or_default();
+                    let cm_str: String = row.get_by_name("column_map").ok().flatten().unwrap_or_else(|| "{}".to_string());
+                    let op_str: String = row.get_by_name("op").ok().flatten().unwrap_or_else(|| "insert".to_string());
+                    let cc: Option<Vec<String>> = row.get_by_name("conflict_columns").ok().flatten();
+
+                    // Parse the mapping at load time
+                    let segments = match inbound_map::parse_pattern(&tp) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log!("pgmqtt: skipping inbound mapping '{}': invalid pattern: {}", mn, e);
+                            continue;
+                        }
+                    };
+
+                    let inbound_op = match inbound_map::InboundOp::from_str(&op_str) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            log!("pgmqtt: skipping inbound mapping '{}': {}", mn, e);
+                            continue;
+                        }
+                    };
+
+                    // Parse column_map JSON
+                    let cm_json: serde_json::Value = match serde_json::from_str(&cm_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log!("pgmqtt: skipping inbound mapping '{}': invalid column_map JSON: {}", mn, e);
+                            continue;
+                        }
+                    };
+
+                    let map_obj = match cm_json.as_object() {
+                        Some(obj) => obj,
+                        None => {
+                            log!("pgmqtt: skipping inbound mapping '{}': column_map is not an object", mn);
+                            continue;
+                        }
+                    };
+
+                    let mut parsed_columns = Vec::new();
+                    let mut parse_ok = true;
+                    for (col_name, expr_val) in map_obj {
+                        if let Some(expr) = expr_val.as_str() {
+                            match inbound_map::parse_column_source(expr) {
+                                Ok(s) => parsed_columns.push((col_name.clone(), s)),
+                                Err(e) => {
+                                    log!("pgmqtt: skipping inbound mapping '{}': column '{}': {}", mn, col_name, e);
+                                    parse_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !parse_ok {
+                        continue;
+                    }
+
+                    let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
+                    let sql = inbound_map::generate_sql(
+                        &ts,
+                        &tt,
+                        &col_names,
+                        &inbound_op,
+                        cc.as_deref(),
+                    );
+
+                    mappings.push(inbound_map::InboundMapping {
+                        mapping_name: Arc::from(mn.as_str()),
+                        pattern_segments: segments,
+                        target_schema: ts,
+                        target_table: tt,
+                        column_map: parsed_columns,
+                        op: inbound_op,
+                        conflict_columns: cc,
+                        sql: Arc::from(sql.as_str()),
+                        topic_pattern: tp,
+                    });
+                }
+            }
+
+            let count = mappings.len();
+            inbound_map::set_mappings(mappings);
+            if count > 0 {
+                log!("pgmqtt: loaded {} inbound mappings", count);
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
+
+/// Replace `$1`, `$2`, ... placeholders with inline SQL-escaped values.
+/// Single-pass: scans the template once, emitting literal text between placeholders.
+fn build_inline_sql(template: &str, args: &[Option<String>]) -> String {
+    let mut result = String::with_capacity(template.len() + args.len() * 16);
+    let bytes = template.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut copy_from = 0;
+
+    while i < len {
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+            // Flush text before this placeholder
+            result.push_str(&template[copy_from..i]);
+
+            let start = i + 1;
+            let mut end = start;
+            while end < len && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let num: usize = template[start..end].parse().unwrap_or(0);
+            if num >= 1 && num <= args.len() {
+                match &args[num - 1] {
+                    Some(val) => {
+                        result.push('\'');
+                        for ch in val.chars() {
+                            if ch == '\'' {
+                                result.push_str("''");
+                            } else {
+                                result.push(ch);
+                            }
+                        }
+                        result.push('\'');
+                    }
+                    None => result.push_str("NULL"),
+                }
+            } else {
+                result.push_str(&template[i..end]);
+            }
+            i = end;
+            copy_from = end;
+        } else {
+            i += 1;
+        }
+    }
+    if copy_from < len {
+        result.push_str(&template[copy_from..]);
+    }
+    result
+}
+
+/// Execute a batch of inbound writes in a single transaction.
+/// Each write also inserts into pgmqtt_messages for tracking.
+/// Returns the list of (client_id, packet_id) pairs for deferred PUBACKs.
+fn execute_inbound_writes(
+    writes: Vec<inbound_map::PendingInboundWrite>,
+    clients: &mut HashMap<String, MqttClient>,
+) {
+    if writes.is_empty() {
+        return;
+    }
+
+    let write_count = writes.len();
+
+    // Collect PUBACK info before moving writes into the transaction closure
+    let puback_info: Vec<(String, Option<u16>, u8)> = writes
+        .iter()
+        .map(|w| (w.client_id.clone(), w.packet_id, w.qos))
+        .collect();
+
+    let ok = BackgroundWorker::transaction(|| {
+        let result = pgrx::spi::Spi::connect_mut(|client| {
+            // 1. Batch INSERT into pgmqtt_messages (single statement for all writes)
+            let mut msgs_sql = String::with_capacity(writes.len() * 128);
+            msgs_sql.push_str(
+                "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) VALUES ",
+            );
+            for (i, write) in writes.iter().enumerate() {
+                if i > 0 {
+                    msgs_sql.push_str(", ");
+                }
+                msgs_sql.push('(');
+                // topic (text, quote-escaped)
+                msgs_sql.push('\'');
+                for ch in write.topic.chars() {
+                    if ch == '\'' {
+                        msgs_sql.push_str("''");
+                    } else {
+                        msgs_sql.push(ch);
+                    }
+                }
+                msgs_sql.push_str("', ");
+                // payload (bytea via decode, or NULL)
+                if write.payload.is_empty() {
+                    msgs_sql.push_str("NULL, ");
+                } else {
+                    msgs_sql.push_str("decode('");
+                    for &b in &write.payload {
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        msgs_sql.push(HEX[(b >> 4) as usize] as char);
+                        msgs_sql.push(HEX[(b & 0x0f) as usize] as char);
+                    }
+                    msgs_sql.push_str("', 'hex'), ");
+                }
+                // qos, retain
+                msgs_sql.push_str(&write.qos.to_string());
+                msgs_sql.push_str(", false)");
+            }
+            client.update(&msgs_sql, None, &[])?;
+
+            // 2. Execute downstream table writes (inline SQL per mapping)
+            for write in &writes {
+                let inline_sql = build_inline_sql(&write.sql, &write.args);
+                client.update(&inline_sql, None, &[])?;
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+        match result {
+            Ok(_) => true,
+            Err(e) => {
+                log!(
+                    "pgmqtt inbound: transaction failed for {} writes: {:?} — no PUBACKs sent",
+                    write_count,
+                    e
+                );
+                false
+            }
+        }
+    });
+
+    if ok {
+        // Send deferred PUBACKs for QoS 1 publishes
+        for (client_id, packet_id, qos) in &puback_info {
+            if *qos == 1 {
+                if let Some(pid) = packet_id {
+                    if let Some(client) = clients.get_mut(client_id) {
+                        let puback = mqtt::build_puback(*pid);
+                        let _ = client.transport.write_all(&puback);
+                    }
+                }
+            }
+        }
+        if write_count > 0 {
+            log!("pgmqtt inbound: committed {} writes", write_count);
+        }
+    }
+}
+
 struct MqttClient {
     transport: Transport,
     client_id: String,
@@ -406,6 +675,7 @@ method not allowed";
 pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     db_mark_sessions_disconnected_on_startup();
     db_load_sessions_on_startup();
+    load_inbound_mappings();
 
     // Bind MQTT TCP listener (optional)
     let mqtt_listener = if ports.mqtt_enabled {
@@ -516,6 +786,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
+    let mut inbound_reload_counter: usize = 0;
 
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
@@ -523,8 +794,16 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
         }
 
+        // Periodic inbound mapping reload (~8s = 100 ticks × 80ms)
+        inbound_reload_counter += 1;
+        if inbound_reload_counter >= 100 {
+            inbound_reload_counter = 0;
+            load_inbound_mappings();
+        }
+
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
         let mut session_db_actions = Vec::new();
+        let mut pending_inbound_writes: Vec<inbound_map::PendingInboundWrite> = Vec::new();
 
         if let Some(ref listener) = mqtt_listener {
             accept_mqtt_connections(listener, &mut clients, &mut session_db_actions);
@@ -548,7 +827,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             &mut clients,
             &mut publishes,
             &mut session_db_actions,
+            &mut pending_inbound_writes,
         );
+
+        // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
+        execute_inbound_writes(pending_inbound_writes, &mut clients);
 
         // ── CDC: load mappings, advance slot, drain ring buffer ──
         cdc_tick(slot_name);
@@ -1445,6 +1728,7 @@ fn poll_mqtt_clients(
     clients: &mut HashMap<String, MqttClient>,
     pending_publishes: &mut Vec<PendingPublish>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_inbound_writes: &mut Vec<inbound_map::PendingInboundWrite>,
 ) {
     let mut to_remove = Vec::new();
 
@@ -1503,7 +1787,7 @@ fn poll_mqtt_clients(
 
             match mqtt::parse_packet(&pkt_data) {
                 Ok((packet, _)) => {
-                    if !handle_mqtt_packet(client, packet, pending_publishes, session_db_actions) {
+                    if !handle_mqtt_packet(client, packet, pending_publishes, session_db_actions, pending_inbound_writes) {
                         to_remove.push(client_id.clone());
                         break;
                     }
@@ -1672,6 +1956,7 @@ fn handle_mqtt_packet(
     packet: mqtt::InboundPacket,
     pending_publishes: &mut Vec<PendingPublish>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_inbound_writes: &mut Vec<inbound_map::PendingInboundWrite>,
 ) -> bool {
     let client_id = client.client_id.clone();
     let transport = &mut client.transport;
@@ -1940,10 +2225,29 @@ fn handle_mqtt_packet(
                 return false;
             }
 
+            // Check for inbound mapping matches (MQTT → PostgreSQL table writes)
+            let inbound_matches = inbound_map::try_match(&pub_pkt.topic, &pub_pkt.payload);
+            let has_inbound_match = !inbound_matches.is_empty();
+
+            if has_inbound_match {
+                for (_idx, match_result) in inbound_matches {
+                    pending_inbound_writes.push(inbound_map::PendingInboundWrite {
+                        sql: match_result.sql,
+                        args: match_result.values,
+                        client_id: client_id.clone(),
+                        packet_id: pub_pkt.packet_id,
+                        qos: pub_pkt.qos,
+                        topic: pub_pkt.topic.clone(),
+                        payload: pub_pkt.payload.clone(),
+                    });
+                }
+            }
+
             // Optimization: skip all processing if no one is listening (and not retained)
-            // But for QoS 1, we still owe the client a PUBACK.
+            // and no inbound mapping matched. For QoS 1 without inbound match, still PUBACK.
+            // For QoS 1 with inbound match, PUBACK is deferred to execute_inbound_writes.
             let subscriber_ids = subscriptions::match_topic(&pub_pkt.topic);
-            if !pub_pkt.retain && subscriber_ids.is_empty() {
+            if !pub_pkt.retain && subscriber_ids.is_empty() && !has_inbound_match {
                 if pub_pkt.qos == 1 {
                     if let Some(pid) = pub_pkt.packet_id {
                         log!(
@@ -1964,14 +2268,30 @@ fn handle_mqtt_packet(
                 return true;
             }
 
-            pending_publishes.push(PendingPublish {
-                topic: pub_pkt.topic,
-                payload: pub_pkt.payload,
-                qos: pub_pkt.qos,
-                retain: pub_pkt.retain,
-                log_sender: client_id,
-                packet_id: pub_pkt.packet_id,
-            });
+            // If inbound match handled this message, still add to pending_publishes
+            // for MQTT subscriber delivery, but with QoS 0 (fire-and-forget to subscribers)
+            // and without packet_id (PUBACK is handled by execute_inbound_writes).
+            if has_inbound_match {
+                if !subscriber_ids.is_empty() || pub_pkt.retain {
+                    pending_publishes.push(PendingPublish {
+                        topic: pub_pkt.topic,
+                        payload: pub_pkt.payload,
+                        qos: 0, // Downgrade to QoS 0 for subscriber delivery
+                        retain: pub_pkt.retain,
+                        log_sender: client_id,
+                        packet_id: None, // PUBACK handled by inbound write path
+                    });
+                }
+            } else {
+                pending_publishes.push(PendingPublish {
+                    topic: pub_pkt.topic,
+                    payload: pub_pkt.payload,
+                    qos: pub_pkt.qos,
+                    retain: pub_pkt.retain,
+                    log_sender: client_id,
+                    packet_id: pub_pkt.packet_id,
+                });
+            }
             true
         }
         mqtt::InboundPacket::Connect(_) => {

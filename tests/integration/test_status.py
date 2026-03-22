@@ -14,7 +14,7 @@ def test_status_function_exists_and_returns_row():
     assert result
     assert len(result) == 1  # Single row
     row = result[0]
-    assert len(row) == 6  # 6 columns
+    assert len(row) == 7  # 7 columns (including inbound_mappings)
 
 
 def test_status_reports_zero_connections_on_empty_database():

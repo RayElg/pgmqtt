@@ -108,12 +108,141 @@ Output columns:
 | `pending_session_messages` | int | Messages queued for offline or slow clients |
 | `cdc_mappings` | int | Number of registered CDC topic mappings |
 | `cdc_slot_active` | bigint | `1` if the `pgmqtt_slot` logical replication slot is active, `0` otherwise |
+| `inbound_mappings` | int | Number of registered inbound MQTT → table mappings |
 
 All counts are taken from a single SQL statement and reflect a consistent snapshot.
 
 ---
 
-### 5. `pgmqtt_license_status` *(enterprise)*
+### 5. `pgmqtt_add_inbound_mapping`
+
+Registers a mapping that automatically writes incoming MQTT messages to a PostgreSQL table. Topic patterns with `{variable}` segments capture values from the topic path; column maps reference those variables and JSON payload fields.
+
+**Signature:**
+```sql
+pgmqtt_add_inbound_mapping(
+    topic_pattern text,
+    target_table text,
+    column_map jsonb,
+    op text DEFAULT 'insert',
+    conflict_columns text[] DEFAULT NULL,
+    target_schema text DEFAULT 'public',
+    mapping_name text DEFAULT 'default'
+) RETURNS text
+```
+
+**Parameters:**
+- `topic_pattern`: Pattern with `{variable}` segments to match incoming topics (e.g., `'sensor/{site_id}/temperature/{sensor_id}'`). MQTT wildcards (`+`, `#`) are not allowed.
+- `target_table`: Name of the PostgreSQL table to write to.
+- `column_map`: JSON object mapping column names to source expressions (see below).
+- `op`: Operation type — `'insert'`, `'upsert'`, or `'delete'`. Defaults to `'insert'`.
+- `conflict_columns`: Required for `upsert` (ON CONFLICT columns) and `delete` (WHERE columns). Must reference columns in the column map.
+- `target_schema`: Schema of the target table. Defaults to `'public'`.
+- `mapping_name`: Unique identifier for this mapping. Defaults to `'default'`.
+
+**Column Map Expressions:**
+
+| Expression | Meaning | Example |
+|---|---|---|
+| `{var_name}` | Value captured from a topic pattern variable | `{site_id}` |
+| `$.path.to.field` | Value extracted from the JSON payload (dot-path) | `$.temperature` |
+| `$payload` | Entire raw payload as text | |
+| `$topic` | Raw topic string | |
+
+**Validation** (performed at creation time):
+- Target table and all column map keys must exist
+- All `{var}` references in column map must appear in the topic pattern
+- For `upsert`: conflict columns must be provided
+- For `delete`: conflict columns define the WHERE clause
+
+**Examples:**
+
+Insert sensor readings:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'sensor/{site_id}/temperature/{sensor_id}',
+    'sensor_readings',
+    '{"site_id": "{site_id}", "sensor_id": "{sensor_id}", "value": "$.temperature"}'::jsonb,
+    'insert',
+    NULL,
+    'public',
+    'temp_readings'
+);
+```
+
+Upsert device status:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'device/{device_id}/status',
+    'device_status',
+    '{"device_id": "{device_id}", "online": "$.online", "last_seen": "$.ts"}'::jsonb,
+    'upsert',
+    ARRAY['device_id'],
+    'public',
+    'device_status'
+);
+```
+
+Delete by key:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'device/{device_id}/deregister',
+    'devices',
+    '{"device_id": "{device_id}"}'::jsonb,
+    'delete',
+    ARRAY['device_id'],
+    'public',
+    'device_deregister'
+);
+```
+
+---
+
+### 6. `pgmqtt_remove_inbound_mapping`
+
+Removes an inbound mapping by name.
+
+**Signature:**
+```sql
+pgmqtt_remove_inbound_mapping(
+    mapping_name text DEFAULT 'default'
+) RETURNS boolean
+```
+
+Returns `true` if the mapping was found and removed, `false` otherwise.
+
+**Example:**
+```sql
+SELECT pgmqtt_remove_inbound_mapping('temp_readings');
+```
+
+---
+
+### 7. `pgmqtt_list_inbound_mappings`
+
+Lists all registered inbound mappings.
+
+**Signature:**
+```sql
+pgmqtt_list_inbound_mappings() RETURNS TABLE (
+    mapping_name text,
+    topic_pattern text,
+    target_schema text,
+    target_table text,
+    column_map jsonb,
+    op text,
+    conflict_columns text[]
+)
+```
+
+**Example:**
+```sql
+SELECT * FROM pgmqtt_list_inbound_mappings();
+```
+
+---
+
+### 8. `pgmqtt_license_status` *(enterprise)*
 
 Returns the current license state. See [enterprise.md](enterprise.md#license-management) for full details.
 
@@ -197,3 +326,18 @@ Columns:
 - `client_id`: References `pgmqtt_sessions`.
 - `topic_filter`: MQTT topic filter (may include `+` and `#` wildcards).
 - `qos`: Subscribed QoS level.
+
+### `pgmqtt_inbound_mappings`
+
+Stores inbound MQTT → PostgreSQL table mapping configurations. Managed via `pgmqtt_add_inbound_mapping` / `pgmqtt_remove_inbound_mapping`.
+
+Columns:
+- `mapping_name`: Unique mapping identifier (primary key).
+- `topic_pattern`: Topic pattern with `{variable}` capture segments.
+- `target_schema`: Schema of the target table.
+- `target_table`: Target table name.
+- `column_map`: JSONB object mapping column names to source expressions.
+- `op`: Operation type (`'insert'`, `'upsert'`, or `'delete'`).
+- `conflict_columns`: Array of column names for upsert (ON CONFLICT) or delete (WHERE clause).
+
+The background worker loads mappings from this table at startup and reloads periodically (~8s). Changes made via the SQL functions take effect on the next reload cycle.
