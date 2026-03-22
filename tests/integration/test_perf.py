@@ -421,10 +421,18 @@ def test_inbound_qos1_throughput():
     elapsed = time.time() - start
     s.close()
 
-    rows = run_sql("SELECT COUNT(*) FROM perf_inbound;")
-    count = rows[0][0] if rows else 0
     _print_result("Inbound QoS 1 (PUBACK)", acks, elapsed)
     assert acks == NUM_MESSAGES, f"Only {acks}/{NUM_MESSAGES} PUBACKs received"
+
+    # Virtual subscriber processes pending writes asynchronously (batch of 50/tick).
+    # Wait for the queue to drain.
+    count = 0
+    for _ in range(60):
+        rows = run_sql("SELECT COUNT(*) FROM perf_inbound;")
+        count = rows[0][0] if rows else 0
+        if count >= NUM_MESSAGES:
+            break
+        time.sleep(0.5)
     assert count == NUM_MESSAGES, f"Only {count}/{NUM_MESSAGES} rows written"
 
 

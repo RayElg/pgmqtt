@@ -298,7 +298,10 @@ fn resolve_single_value(
             for key in path {
                 current = current.get(key)?;
             }
-            // Convert JSON value to string representation
+            // JSON null → SQL NULL
+            if current.is_null() {
+                return None;
+            }
             Some(json_value_to_string(current))
         }
         ColumnSource::RawPayload => {
@@ -316,7 +319,7 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => return String::new(), // will be treated as NULL upstream
+        serde_json::Value::Null => return String::new(), // unreachable: filtered by resolve_single_value
         // For objects/arrays, return JSON text
         other => other.to_string(),
     }
@@ -327,10 +330,16 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Generate the pre-computed SQL for an inbound mapping.
+///
+/// `column_types` provides the PostgreSQL type name for each column (same
+/// order as `column_names`).  When present, each `$N` placeholder is emitted
+/// as `$N::type` so that text-typed SPI parameters are correctly cast to
+/// the target column type (e.g. `numeric`, `integer`, `boolean`).
 pub fn generate_sql(
     schema: &str,
     table: &str,
     column_names: &[String],
+    column_types: &[String],
     op: &InboundOp,
     conflict_columns: Option<&[String]>,
 ) -> String {
@@ -340,7 +349,16 @@ pub fn generate_sql(
         quote_ident(table)
     );
     let cols: Vec<String> = column_names.iter().map(|c| quote_ident(c)).collect();
-    let placeholders: Vec<String> = (1..=column_names.len()).map(|i| format!("${}", i)).collect();
+    let placeholders: Vec<String> = (1..=column_names.len())
+        .zip(column_types.iter())
+        .map(|(i, typ)| {
+            if typ == "text" || typ == "character varying" || typ == "varchar" {
+                format!("${}", i)
+            } else {
+                format!("${}::{}", i, typ)
+            }
+        })
+        .collect();
 
     match op {
         InboundOp::Insert => {
@@ -390,7 +408,12 @@ pub fn generate_sql(
                     // Find the positional index of this column in column_names
                     let pos = column_names.iter().position(|n| n == c)
                         .expect("conflict column must be in column_map");
-                    format!("{} = ${}", quote_ident(c), pos + 1)
+                    let typ = &column_types[pos];
+                    if typ == "text" || typ == "character varying" || typ == "varchar" {
+                        format!("{} = ${}", quote_ident(c), pos + 1)
+                    } else {
+                        format!("{} = ${}::{}", quote_ident(c), pos + 1, typ)
+                    }
                 })
                 .collect();
             format!(

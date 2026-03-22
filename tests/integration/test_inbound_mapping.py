@@ -636,7 +636,7 @@ def test_status_includes_inbound_mappings():
     result = run_sql("SELECT * FROM pgmqtt_status()")
     assert result is not None
     # The new column should be the 7th (index 6)
-    assert len(result[0]) == 7, f"Expected 7 columns in pgmqtt_status(), got {len(result[0])}"
+    assert len(result[0]) == 9, f"Expected 9 columns in pgmqtt_status(), got {len(result[0])}"
     inbound_count = result[0][6]
     assert inbound_count >= 1, f"Expected at least 1 inbound mapping, got {inbound_count}"
 

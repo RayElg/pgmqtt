@@ -266,7 +266,7 @@ fn load_inbound_mappings() {
             let mut mappings = Vec::new();
             if let Ok(table) = client.select(
                 "SELECT mapping_name, topic_pattern, target_schema, target_table, \
-                        column_map::text, op, conflict_columns \
+                        column_map::text, op, conflict_columns, template_type \
                  FROM pgmqtt_inbound_mappings",
                 None,
                 &[],
@@ -279,6 +279,7 @@ fn load_inbound_mappings() {
                     let cm_str: String = row.get_by_name("column_map").ok().flatten().unwrap_or_else(|| "{}".to_string());
                     let op_str: String = row.get_by_name("op").ok().flatten().unwrap_or_else(|| "insert".to_string());
                     let cc: Option<Vec<String>> = row.get_by_name("conflict_columns").ok().flatten();
+                    let tmpl_type: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jsonpath".to_string());
 
                     // Parse the mapping at load time
                     let segments = match inbound_map::parse_pattern(&tp) {
@@ -333,10 +334,48 @@ fn load_inbound_mappings() {
                     }
 
                     let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
+
+                    // Look up column types for typed placeholder casts
+                    let qualified_name = format!("{}.{}", ts, tt);
+                    let mut col_types: Vec<String> = Vec::new();
+                    let mut types_ok = true;
+                    for col_name in &col_names {
+                        let type_args: Vec<pgrx::datum::DatumWithOid> = vec![
+                            qualified_name.as_str().into(),
+                            col_name.as_str().into(),
+                        ];
+                        match client.select(
+                            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+                             WHERE attrelid = $1::regclass AND attname = $2 AND attnum > 0 AND NOT attisdropped",
+                            None,
+                            &type_args,
+                        ) {
+                            Ok(table) => {
+                                match table.first().get_one::<String>() {
+                                    Ok(Some(type_name)) => col_types.push(type_name),
+                                    _ => {
+                                        log!("pgmqtt: skipping inbound mapping '{}': column '{}' type not found", mn, col_name);
+                                        types_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log!("pgmqtt: skipping inbound mapping '{}': failed to look up column '{}' type: {}", mn, col_name, e);
+                                types_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !types_ok {
+                        continue;
+                    }
+
                     let sql = inbound_map::generate_sql(
                         &ts,
                         &tt,
                         &col_names,
+                        &col_types,
                         &inbound_op,
                         cc.as_deref(),
                     );
@@ -351,7 +390,7 @@ fn load_inbound_mappings() {
                         conflict_columns: cc,
                         sql: Arc::from(sql.as_str()),
                         topic_pattern: tp,
-                        template_type: "jsonpath".to_string(),
+                        template_type: tmpl_type,
                     });
                 }
             }
@@ -393,9 +432,7 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
         });
         match result {
             Ok(_) => {
-                if write_count > 0 {
-                    log!("pgmqtt inbound: committed {} writes", write_count);
-                }
+                log!("pgmqtt inbound: committed {} writes", write_count);
             }
             Err(e) => {
                 log!(
