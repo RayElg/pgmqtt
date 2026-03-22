@@ -381,7 +381,7 @@ fn pgmqtt_add_inbound_mapping(
     let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
 
     // Check table existence using parameterized query (safe against injection)
-    let qualified_name = format!("{}.{}", target_schema, target_table);
+    let qualified_name = format!("{}.{}", quote_ident(target_schema), quote_ident(target_table));
     let table_exists = pgrx::spi::Spi::connect(|client| {
         let result = client.select(
             "SELECT to_regclass($1)::text",

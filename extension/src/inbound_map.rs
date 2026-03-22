@@ -424,7 +424,7 @@ pub fn generate_sql(
 }
 
 /// Simple identifier quoting (double-quote, escape internal double-quotes).
-fn quote_ident(name: &str) -> String {
+pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

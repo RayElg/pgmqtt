@@ -244,7 +244,15 @@ fn db_load_sessions_on_startup() {
     });
 }
 
+/// Cached xmin fingerprint: changes whenever pgmqtt_inbound_mappings is modified.
+/// A reload is only performed when this value changes, avoiding the full
+/// mapping + column-type query overhead on every tick.
+static INBOUND_XMIN_FINGERPRINT: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+
 /// Load inbound mappings from pgmqtt_inbound_mappings into the in-memory cache.
+///
+/// Uses a lightweight change-detection query (`sum(xmin)`) to skip the
+/// expensive full reload when nothing has changed.
 fn load_inbound_mappings() {
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect(|client| {
@@ -261,6 +269,27 @@ fn load_inbound_mappings() {
             if !table_exists {
                 inbound_map::set_mappings(Vec::new());
                 return Ok::<_, pgrx::spi::Error>(());
+            }
+
+            // Change detection: sum of xmin values changes on any INSERT/UPDATE/DELETE.
+            let current_fingerprint: i64 = client
+                .select(
+                    "SELECT COALESCE(SUM(xmin::text::bigint), 0)::bigint FROM pgmqtt_inbound_mappings",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get_one::<i64>()?
+                .unwrap_or(0);
+
+            {
+                let mut cached = INBOUND_XMIN_FINGERPRINT.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(prev) = *cached {
+                    if prev == current_fingerprint {
+                        return Ok::<_, pgrx::spi::Error>(()); // no change
+                    }
+                }
+                *cached = Some(current_fingerprint);
             }
 
             let mut mappings = Vec::new();
@@ -335,36 +364,48 @@ fn load_inbound_mappings() {
 
                     let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
 
-                    // Look up column types for typed placeholder casts
-                    let qualified_name = format!("{}.{}", ts, tt);
+                    // Look up column types for typed placeholder casts (single query via JOIN)
+                    let qualified_name = format!(
+                        "{}.{}",
+                        inbound_map::quote_ident(&ts),
+                        inbound_map::quote_ident(&tt),
+                    );
                     let mut col_types: Vec<String> = Vec::new();
                     let mut types_ok = true;
-                    for col_name in &col_names {
-                        let type_args: Vec<pgrx::datum::DatumWithOid> = vec![
-                            qualified_name.as_str().into(),
-                            col_name.as_str().into(),
-                        ];
-                        match client.select(
-                            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
-                             WHERE attrelid = $1::regclass AND attname = $2 AND attnum > 0 AND NOT attisdropped",
-                            None,
-                            &type_args,
-                        ) {
-                            Ok(table) => {
-                                match table.first().get_one::<String>() {
-                                    Ok(Some(type_name)) => col_types.push(type_name),
-                                    _ => {
+                    match client.select(
+                        "SELECT a.attname::text AS col_name, \
+                                format_type(a.atttypid, a.atttypmod) AS col_type \
+                         FROM pg_attribute a \
+                         WHERE a.attrelid = $1::regclass \
+                           AND a.attnum > 0 AND NOT a.attisdropped",
+                        None,
+                        &[qualified_name.as_str().into()],
+                    ) {
+                        Ok(attr_table) => {
+                            // Build a lookup map from column name → type
+                            let mut type_map = std::collections::HashMap::new();
+                            for attr_row in attr_table {
+                                if let (Ok(Some(name)), Ok(Some(typ))) = (
+                                    attr_row.get_by_name::<String, _>("col_name"),
+                                    attr_row.get_by_name::<String, _>("col_type"),
+                                ) {
+                                    type_map.insert(name, typ);
+                                }
+                            }
+                            for col_name in &col_names {
+                                match type_map.get(col_name) {
+                                    Some(typ) => col_types.push(typ.clone()),
+                                    None => {
                                         log!("pgmqtt: skipping inbound mapping '{}': column '{}' type not found", mn, col_name);
                                         types_ok = false;
                                         break;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                log!("pgmqtt: skipping inbound mapping '{}': failed to look up column '{}' type: {}", mn, col_name, e);
-                                types_ok = false;
-                                break;
-                            }
+                        }
+                        Err(e) => {
+                            log!("pgmqtt: skipping inbound mapping '{}': failed to look up column types: {}", mn, e);
+                            types_ok = false;
                         }
                     }
                     if !types_ok {
