@@ -24,6 +24,7 @@ pub fn init_010() {
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
+            template_type text NOT NULL DEFAULT 'jinja2',
             PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create mappings table",
@@ -42,6 +43,7 @@ pub fn init_010() {
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
+            template_type text NOT NULL DEFAULT 'jinja2',
             PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create slot mappings table",
@@ -119,6 +121,7 @@ pub fn init_010() {
             column_map       jsonb NOT NULL,
             op               text NOT NULL DEFAULT 'insert',
             conflict_columns text[] DEFAULT NULL,
+            template_type    text NOT NULL DEFAULT 'jsonpath',
             PRIMARY KEY (mapping_name)
         )",
         "create inbound mappings table",

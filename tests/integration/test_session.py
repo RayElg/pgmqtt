@@ -50,7 +50,7 @@ def _setup_restart_table(table="session_restart_test"):
     run_psql(f"CREATE TABLE {table} (id serial primary key, msg text);")
     run_psql(f"ALTER TABLE {table} REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'test/session/restart', '{{{{ columns.msg }}}}', 1);"
     )
     time.sleep(6)

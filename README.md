@@ -9,7 +9,7 @@ With `pgmqtt`, your database changes (`INSERT`, `UPDATE`, `DELETE`) are automati
 To create a mapping, simply run:
 
 ```sql
-SELECT pgmqtt_add_mapping(
+SELECT pgmqtt_add_outbound_mapping(
     'public',
     'my_table',
     'topics/{{ op | lower }}',

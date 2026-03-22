@@ -112,11 +112,11 @@ def setup_module(module=None):
     run_sql("CREATE TABLE wct_qos0_table (id serial primary key, name text, val text);")
     run_sql("ALTER TABLE wct_qos0_table REPLICA IDENTITY FULL;")
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'wct_qos1_table', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'wct_qos1_table', "
         "'wct/qos1/{{ columns.name }}', '{{ columns.val }}', 1);"
     )
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'wct_qos0_table', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'wct_qos0_table', "
         "'wct/qos0/{{ columns.name }}', '{{ columns.val }}', 0);"
     )
     time.sleep(6)
@@ -216,7 +216,7 @@ def test_rendered_qos_switch():
     run_psql("CREATE TABLE qos_test_table (id serial primary key, name text, val text);")
     run_psql("ALTER TABLE qos_test_table REPLICA IDENTITY FULL;")
     run_psql(
-        "SELECT pgmqtt_add_mapping('public', 'qos_test_table', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'qos_test_table', "
         "'test/{{ columns.name }}', '{{ columns.val }}', 0);"
     )
     time.sleep(6)
@@ -238,7 +238,7 @@ def test_rendered_qos_switch():
 
     # Switch mapping to QoS 1
     run_psql(
-        "SELECT pgmqtt_add_mapping('public', 'qos_test_table', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'qos_test_table', "
         "'test/{{ columns.name }}', '{{ columns.val }}', 1);"
     )
     time.sleep(6)
@@ -274,11 +274,11 @@ def test_comprehensive_cdc_demo():
     run_psql("ALTER TABLE demo_iot REPLICA IDENTITY FULL;")
 
     run_psql(
-        "SELECT pgmqtt_add_mapping('public', 'demo_users', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'demo_users', "
         "'presence/{{columns.username}}', '{\"status\": \"{{columns.status}}\"}');"
     )
     run_psql(
-        "SELECT pgmqtt_add_mapping('public', 'demo_iot', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'demo_iot', "
         "'telemetry/{{columns.device_id}}', '{\"val\": {{columns.reading}}, \"u\": \"{{columns.unit}}\"}');"
     )
     time.sleep(6)

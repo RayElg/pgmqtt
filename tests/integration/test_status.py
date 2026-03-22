@@ -143,10 +143,10 @@ def test_status_counts_cdc_mappings():
 
     # Add mappings
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'users', 'users/{{ op }}', '{{ columns | tojson }}');"
+        "SELECT pgmqtt_add_outbound_mapping('public', 'users', 'users/{{ op }}', '{{ columns | tojson }}');"
     )
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'orders', 'orders/{{ op }}', '{{ columns | tojson }}', 1);"
+        "SELECT pgmqtt_add_outbound_mapping('public', 'orders', 'orders/{{ op }}', '{{ columns | tojson }}', 1);"
     )
 
     result = run_sql("SELECT cdc_mappings FROM pgmqtt_status();")
@@ -170,7 +170,7 @@ def test_status_returns_complete_row():
         "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) "
         "VALUES ('test_client', 'test/topic', 0);"
     )
-    run_sql("SELECT pgmqtt_add_mapping('public', 'test_table', 'test/cdc', 'payload');")
+    run_sql("SELECT pgmqtt_add_outbound_mapping('public', 'test_table', 'test/cdc', 'payload');")
 
     result = run_sql(
         "SELECT active_connections, total_subscriptions, total_retained_messages, "

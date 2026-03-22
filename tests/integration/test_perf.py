@@ -137,7 +137,7 @@ def _setup_perf_cdc(qos):
     run_psql("CREATE TABLE perf_table (id serial PRIMARY KEY, data text);")
     run_psql("ALTER TABLE perf_table REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', 'perf_table', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', 'perf_table', "
         f"'{TOPIC}', '{{{{columns.data}}}}', {qos});"
     )
     time.sleep(6)
@@ -215,7 +215,7 @@ def test_long_lived_connection():
     run_psql("DROP TABLE IF EXISTS heartbeat;")
     run_psql("CREATE TABLE heartbeat (id serial PRIMARY KEY, ts timestamp DEFAULT now());")
     run_psql("ALTER TABLE heartbeat REPLICA IDENTITY FULL;")
-    run_psql("SELECT pgmqtt_add_mapping('public', 'heartbeat', 'system/heartbeat', '{{ columns.ts }}');")
+    run_psql("SELECT pgmqtt_add_outbound_mapping('public', 'heartbeat', 'system/heartbeat', '{{ columns.ts }}');")
     time.sleep(6)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -272,7 +272,7 @@ def test_high_concurrency_cdc():
     run_sql("CREATE TABLE load_test (id serial PRIMARY KEY, val int);")
     run_sql("ALTER TABLE load_test REPLICA IDENTITY FULL;")
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'load_test', "
+        "SELECT pgmqtt_add_outbound_mapping('public', 'load_test', "
         "'load/test/{{columns.val}}', '{\"val\": {{columns.val}}}');"
     )
     time.sleep(6)

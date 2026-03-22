@@ -94,7 +94,7 @@ function withTimeout(ms, label, fn) {
         psql(`CREATE TABLE ${TABLE} (id serial PRIMARY KEY, data text)`);
         psql(`ALTER TABLE ${TABLE} REPLICA IDENTITY FULL`);
         psql(
-            `SELECT pgmqtt_add_mapping('public', '${TABLE}', ` +
+            `SELECT pgmqtt_add_outbound_mapping('public', '${TABLE}', ` +
             `'${TOPIC_BASE}/{{ op | lower }}', '{{ columns | tojson }}')`
         );
 

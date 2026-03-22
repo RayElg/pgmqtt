@@ -18,20 +18,20 @@ mod websocket;
 
 // Restrict topic-mapping administration to the extension owner by default.
 // DBAs can later open access with:
-//   GRANT EXECUTE ON FUNCTION pgmqtt_add_mapping(...) TO some_role;
+//   GRANT EXECUTE ON FUNCTION pgmqtt_add_outbound_mapping(...) TO some_role;
 extension_sql!(
     r#"
-    REVOKE EXECUTE ON FUNCTION pgmqtt_add_mapping(text, text, text, text, int, text) FROM PUBLIC;
-    REVOKE EXECUTE ON FUNCTION pgmqtt_remove_mapping(text, text, text) FROM PUBLIC;
-    REVOKE EXECUTE ON FUNCTION pgmqtt_list_mappings() FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_add_outbound_mapping(text, text, text, text, int, text, text) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_remove_outbound_mapping(text, text, text) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_list_outbound_mappings() FROM PUBLIC;
     "#,
     name = "revoke_mapping_from_public",
-    requires = [pgmqtt_add_mapping, pgmqtt_remove_mapping, pgmqtt_list_mappings],
+    requires = [pgmqtt_add_outbound_mapping, pgmqtt_remove_outbound_mapping, pgmqtt_list_outbound_mappings],
 );
 
 extension_sql!(
     r#"
-    REVOKE EXECUTE ON FUNCTION pgmqtt_add_inbound_mapping(text, text, jsonb, text, text[], text, text) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_add_inbound_mapping(text, text, jsonb, text, text[], text, text, text) FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pgmqtt_remove_inbound_mapping(text) FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pgmqtt_list_inbound_mappings() FROM PUBLIC;
     "#,
@@ -154,21 +154,21 @@ fn ensure_tables_exist() {
     init010::init_010();
 }
 
-/// Register a CDC → MQTT topic mapping (persisted to DB table).
+/// Register a CDC → MQTT outbound topic mapping (persisted to DB table).
 ///
 /// Multiple mappings per (schema, table) are supported via distinct `mapping_name` values,
 /// enabling parallel publish to multiple topics (e.g. for gradual reader schema migration).
 ///
 /// Example:
 /// ```sql
-/// SELECT pgmqtt_add_mapping(
+/// SELECT pgmqtt_add_outbound_mapping(
 ///     'public',
 ///     'events',
 ///     'events/{{ op | lower }}',
 ///     '{{ columns | tojson }}'
 /// );
 /// -- Add a second mapping for the same table:
-/// SELECT pgmqtt_add_mapping(
+/// SELECT pgmqtt_add_outbound_mapping(
 ///     'public',
 ///     'events',
 ///     'events/v2/{{ op | lower }}',
@@ -178,24 +178,26 @@ fn ensure_tables_exist() {
 /// );
 /// ```
 #[pg_extern]
-fn pgmqtt_add_mapping(
+fn pgmqtt_add_outbound_mapping(
     schema_name: &str,
     table_name: &str,
     topic_template: &str,
     payload_template: &str,
     qos: default!(i32, 0),
     mapping_name: default!(Option<&str>, "NULL"),
+    template_type: default!(&str, "'jinja2'"),
 ) -> &'static str {
     let mapping_name = mapping_name.unwrap_or("default");
 
     let query = "\
         INSERT INTO pgmqtt_topic_mappings \
-            (schema_name, table_name, mapping_name, topic_template, payload_template, qos) \
-        VALUES ($1, $2, $3, $4, $5, $6) \
+            (schema_name, table_name, mapping_name, topic_template, payload_template, qos, template_type) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7) \
         ON CONFLICT (schema_name, table_name, mapping_name) DO UPDATE \
         SET topic_template = EXCLUDED.topic_template, \
             payload_template = EXCLUDED.payload_template, \
-            qos = EXCLUDED.qos";
+            qos = EXCLUDED.qos, \
+            template_type = EXCLUDED.template_type";
 
     let args: Vec<pgrx::datum::DatumWithOid> = vec![
         schema_name.into(),
@@ -204,28 +206,30 @@ fn pgmqtt_add_mapping(
         topic_template.into(),
         payload_template.into(),
         qos.into(),
+        template_type.into(),
     ];
 
     pgrx::spi::Spi::connect_mut(|client| client.update(query, None, &args).map(|_| ()))
-        .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to upsert mapping: {}", e));
+        .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to upsert outbound mapping: {}", e));
 
     pgrx::log!(
-        "pgmqtt: added mapping {}.{} (name='{}') → topic='{}' payload='{}'",
+        "pgmqtt: added outbound mapping {}.{} (name='{}') → topic='{}' payload='{}' template_type='{}'",
         schema_name,
         table_name,
         mapping_name,
         topic_template,
-        payload_template
+        payload_template,
+        template_type
     );
     "ok"
 }
 
-/// Remove a CDC → MQTT topic mapping by name.
+/// Remove a CDC → MQTT outbound topic mapping by name.
 ///
 /// Removes the mapping with the given `mapping_name` (default `'default'`).
 /// To remove all mappings for a table, call this once per mapping name.
 #[pg_extern]
-fn pgmqtt_remove_mapping(
+fn pgmqtt_remove_outbound_mapping(
     schema_name: &str,
     table_name: &str,
     mapping_name: default!(Option<&str>, "NULL"),
@@ -241,7 +245,7 @@ fn pgmqtt_remove_mapping(
         pgrx::spi::Spi::connect_mut(|client| client.update(query, None, &args).map(|_| ())).is_ok();
 
     pgrx::log!(
-        "pgmqtt: remove mapping {}.{} (name='{}') → {}",
+        "pgmqtt: remove outbound mapping {}.{} (name='{}') → {}",
         schema_name,
         table_name,
         mapping_name,
@@ -250,9 +254,9 @@ fn pgmqtt_remove_mapping(
     deleted
 }
 
-/// List all active topic mappings.
+/// List all active outbound topic mappings.
 #[pg_extern]
-fn pgmqtt_list_mappings() -> TableIterator<
+fn pgmqtt_list_outbound_mappings() -> TableIterator<
     'static,
     (
         name!(schema_name, String),
@@ -261,6 +265,7 @@ fn pgmqtt_list_mappings() -> TableIterator<
         name!(topic_template, String),
         name!(payload_template, String),
         name!(qos, i32),
+        name!(template_type, String),
     ),
 > {
     let mappings = Spi::connect(|client| {
@@ -277,7 +282,7 @@ fn pgmqtt_list_mappings() -> TableIterator<
 
         let mut rows = Vec::new();
         if let Ok(table) = client.select(
-            "SELECT schema_name, table_name, mapping_name, topic_template, payload_template, qos \
+            "SELECT schema_name, table_name, mapping_name, topic_template, payload_template, qos, template_type \
              FROM pgmqtt_topic_mappings",
             None, &[],
         ) {
@@ -288,7 +293,8 @@ fn pgmqtt_list_mappings() -> TableIterator<
                 let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
                 let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
                 let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                rows.push((s, t, mn, tt, pt, q));
+                let tmpl: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jinja2".to_string());
+                rows.push((s, t, mn, tt, pt, q, tmpl));
             }
         }
         Ok::<_, spi::Error>(rows)
@@ -318,6 +324,7 @@ fn pgmqtt_add_inbound_mapping(
     conflict_columns: default!(Option<Vec<String>>, "NULL"),
     target_schema: default!(&str, "'public'"),
     mapping_name: default!(&str, "'default'"),
+    template_type: default!(&str, "'jsonpath'"),
 ) -> &'static str {
     use inbound_map::*;
 
@@ -454,28 +461,30 @@ fn pgmqtt_add_inbound_mapping(
             );
             format!(
                 "INSERT INTO pgmqtt_inbound_mappings \
-                    (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, {}) \
+                    (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns, template_type) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, {}, $7) \
                  ON CONFLICT (mapping_name) DO UPDATE \
                  SET topic_pattern = EXCLUDED.topic_pattern, \
                      target_schema = EXCLUDED.target_schema, \
                      target_table = EXCLUDED.target_table, \
                      column_map = EXCLUDED.column_map, \
                      op = EXCLUDED.op, \
-                     conflict_columns = EXCLUDED.conflict_columns",
+                     conflict_columns = EXCLUDED.conflict_columns, \
+                     template_type = EXCLUDED.template_type",
                 arr_literal
             )
         } else {
             "INSERT INTO pgmqtt_inbound_mappings \
-                (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns) \
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6, NULL) \
+                (mapping_name, topic_pattern, target_schema, target_table, column_map, op, conflict_columns, template_type) \
+             VALUES ($1, $2, $3, $4, $5::jsonb, $6, NULL, $7) \
              ON CONFLICT (mapping_name) DO UPDATE \
              SET topic_pattern = EXCLUDED.topic_pattern, \
                  target_schema = EXCLUDED.target_schema, \
                  target_table = EXCLUDED.target_table, \
                  column_map = EXCLUDED.column_map, \
                  op = EXCLUDED.op, \
-                 conflict_columns = EXCLUDED.conflict_columns".to_string()
+                 conflict_columns = EXCLUDED.conflict_columns, \
+                 template_type = EXCLUDED.template_type".to_string()
         };
 
         let args: Vec<pgrx::datum::DatumWithOid> = vec![
@@ -485,18 +494,20 @@ fn pgmqtt_add_inbound_mapping(
             target_table.into(),
             column_map_json.as_str().into(),
             op.into(),
+            template_type.into(),
         ];
         client.update(&query, None, &args).map(|_| ())
     })
     .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to upsert inbound mapping: {}", e));
 
     pgrx::log!(
-        "pgmqtt: added inbound mapping '{}' → {}.{} (pattern='{}', op='{}')",
+        "pgmqtt: added inbound mapping '{}' → {}.{} (pattern='{}', op='{}', template_type='{}')",
         mapping_name,
         target_schema,
         target_table,
         topic_pattern,
-        op
+        op,
+        template_type
     );
     "ok"
 }
@@ -534,6 +545,7 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
         name!(column_map, pgrx::JsonB),
         name!(op, String),
         name!(conflict_columns, Option<Vec<String>>),
+        name!(template_type, String),
     ),
 > {
     let mappings = Spi::connect(|client| {
@@ -550,7 +562,7 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
         let mut rows = Vec::new();
         if let Ok(table) = client.select(
             "SELECT mapping_name, topic_pattern, target_schema, target_table, \
-                    column_map::text, op, conflict_columns \
+                    column_map::text, op, conflict_columns, template_type \
              FROM pgmqtt_inbound_mappings",
             None,
             &[],
@@ -563,9 +575,10 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
                 let cm_str: String = row.get_by_name("column_map").ok().flatten().unwrap_or_else(|| "{}".to_string());
                 let op_str: String = row.get_by_name("op").ok().flatten().unwrap_or_else(|| "insert".to_string());
                 let cc: Option<Vec<String>> = row.get_by_name("conflict_columns").ok().flatten();
+                let tmpl: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jsonpath".to_string());
 
                 let cm_json: serde_json::Value = serde_json::from_str(&cm_str).unwrap_or(serde_json::json!({}));
-                rows.push((mn, tp, ts, tt, pgrx::JsonB(cm_json), op_str, cc));
+                rows.push((mn, tp, ts, tt, pgrx::JsonB(cm_json), op_str, cc, tmpl));
             }
         }
         Ok::<_, spi::Error>(rows)

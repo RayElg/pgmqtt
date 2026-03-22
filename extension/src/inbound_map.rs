@@ -73,6 +73,7 @@ pub struct InboundMapping {
     pub sql: Arc<str>,
     /// Original topic_pattern string (for diagnostics / reload)
     pub topic_pattern: String,
+    pub template_type: String,
 }
 
 /// A pending inbound write, accumulated during a tick.

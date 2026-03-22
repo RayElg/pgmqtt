@@ -6,18 +6,19 @@ This document describes the SQL-callable interfaces and configuration tables use
 
 `pgmqtt` introduces several functions to manage how changes in PostgreSQL tables map to MQTT topics.
 
-### 1. `pgmqtt_add_mapping`
+### 1. `pgmqtt_add_outbound_mapping`
 
 Registers a new logical decoding mapping for a given table.
 
 **Signature:**
 ```sql
-pgmqtt_add_mapping(
+pgmqtt_add_outbound_mapping(
     schema_name text,
     table_name text,
     topic_template text,
     payload_template text,
-    qos integer DEFAULT 0
+    qos integer DEFAULT 0,
+    template_type text DEFAULT 'jinja2'
 ) RETURNS text
 ```
 
@@ -27,10 +28,11 @@ pgmqtt_add_mapping(
 - `topic_template`: A Jinja2-compatible template string used to determine the MQTT topic for each change.
 - `payload_template`: A Jinja2-compatible template string defining what the MQTT message body will contain.
 - `qos`: Optional. The Quality of Service level for messages generated from this mapping (0 or 1). Defaults to 0.
+- `template_type`: Optional. The template engine to use for rendering topic and payload templates. Defaults to `'jinja2'`.
 
 **Example:**
 ```sql
-SELECT pgmqtt_add_mapping(
+SELECT pgmqtt_add_outbound_mapping(
     'public',
     'events',
     'events/{{ op | lower }}',
@@ -41,13 +43,13 @@ SELECT pgmqtt_add_mapping(
 
 ---
 
-### 2. `pgmqtt_remove_mapping`
+### 2. `pgmqtt_remove_outbound_mapping`
 
 Removes an existing topic mapping. Note that any changes already in the internal ring buffer for this mapping may still be dispatched.
 
 **Signature:**
 ```sql
-pgmqtt_remove_mapping(
+pgmqtt_remove_outbound_mapping(
     schema_name text,
     table_name text
 ) RETURNS boolean
@@ -56,30 +58,30 @@ Returns `true` if the mapping was found and successfully deleted, or `false` oth
 
 **Example:**
 ```sql
-SELECT pgmqtt_remove_mapping('public', 'events');
+SELECT pgmqtt_remove_outbound_mapping('public', 'events');
 ```
 
 ---
 
-### 3. `pgmqtt_list_mappings`
+### 3. `pgmqtt_list_outbound_mappings`
 
 Lists all currently active topic mappings.
 
 **Signature:**
 ```sql
-pgmqtt_list_mappings()
+pgmqtt_list_outbound_mappings()
 ```
 Returns a set of rows detailing the mappings.
 
 **Example:**
 ```sql
-SELECT * FROM pgmqtt_list_mappings();
+SELECT * FROM pgmqtt_list_outbound_mappings();
 ```
 Output:
 ```text
-  schema_name | table_name |       topic_template      |    payload_template   | qos 
- -------------+------------+---------------------------+-----------------------+-----
-  public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1
+  schema_name | table_name |       topic_template      |    payload_template   | qos | template_type
+ -------------+------------+---------------------------+-----------------------+-----+--------------
+  public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1 | jinja2
 ```
 
 ---
@@ -127,7 +129,8 @@ pgmqtt_add_inbound_mapping(
     op text DEFAULT 'insert',
     conflict_columns text[] DEFAULT NULL,
     target_schema text DEFAULT 'public',
-    mapping_name text DEFAULT 'default'
+    mapping_name text DEFAULT 'default',
+    template_type text DEFAULT 'jsonpath'
 ) RETURNS text
 ```
 
@@ -139,6 +142,7 @@ pgmqtt_add_inbound_mapping(
 - `conflict_columns`: Required for `upsert` (ON CONFLICT columns) and `delete` (WHERE columns). Must reference columns in the column map.
 - `target_schema`: Schema of the target table. Defaults to `'public'`.
 - `mapping_name`: Unique identifier for this mapping. Defaults to `'default'`.
+- `template_type`: Optional. The template engine to use for column map expressions. Defaults to `'jsonpath'`.
 
 **Column Map Expressions:**
 
@@ -231,7 +235,8 @@ pgmqtt_list_inbound_mappings() RETURNS TABLE (
     target_table text,
     column_map jsonb,
     op text,
-    conflict_columns text[]
+    conflict_columns text[],
+    template_type text
 )
 ```
 
@@ -276,6 +281,7 @@ Columns:
 - `topic_template`: Jinja2 template for topic.
 - `payload_template`: Jinja2 template for payload.
 - `qos`: Target QoS level for messages.
+- `template_type`: Template engine type (e.g., `'jinja2'`).
 
 ### `pgmqtt_messages`
 
@@ -339,5 +345,6 @@ Columns:
 - `column_map`: JSONB object mapping column names to source expressions.
 - `op`: Operation type (`'insert'`, `'upsert'`, or `'delete'`).
 - `conflict_columns`: Array of column names for upsert (ON CONFLICT) or delete (WHERE clause).
+- `template_type`: Template engine type (e.g., `'jsonpath'`).
 
 The background worker loads mappings from this table at startup and reloads periodically (~8s). Changes made via the SQL functions take effect on the next reload cycle.

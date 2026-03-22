@@ -22,6 +22,7 @@ pub struct TopicMapping {
     pub topic_template: String,
     pub payload_template: String,
     pub qos: u8,
+    pub template_type: String,
 }
 
 /// A rendered MQTT message ready for the per-topic buffer.

@@ -351,6 +351,7 @@ fn load_inbound_mappings() {
                         conflict_columns: cc,
                         sql: Arc::from(sql.as_str()),
                         topic_pattern: tp,
+                        template_type: "jsonpath".to_string(),
                     });
                 }
             }
@@ -975,7 +976,7 @@ fn cdc_tick(slot_name: &str) {
                 let _ = Spi::run(
                     "INSERT INTO pgmqtt_slot_mappings \
                          SELECT schema_name, table_name, mapping_name, \
-                                topic_template, payload_template, qos \
+                                topic_template, payload_template, qos, template_type \
                          FROM pgmqtt_topic_mappings \
                          ON CONFLICT DO NOTHING",
                 );
@@ -987,7 +988,7 @@ fn cdc_tick(slot_name: &str) {
                 let mut rows = Vec::new();
                 if let Ok(table) = client.select(
                     "SELECT schema_name, table_name, mapping_name, \
-                            topic_template, payload_template, qos \
+                            topic_template, payload_template, qos, template_type \
                      FROM pgmqtt_slot_mappings",
                     None,
                     &[],
@@ -999,9 +1000,11 @@ fn cdc_tick(slot_name: &str) {
                         let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
                         let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
                         let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
+                        let tmpl: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jinja2".to_string());
                         rows.push(topic_map::TopicMapping {
                             name: mn, schema: s, table: t,
                             topic_template: tt, payload_template: pt, qos: q as u8,
+                            template_type: tmpl,
                         });
                     }
                 }
@@ -1105,18 +1108,21 @@ fn cdc_tick(slot_name: &str) {
                                     topic_template: topic_template.clone(),
                                     payload_template: payload_template.clone(),
                                     qos,
+                                    template_type: col("template_type"),
                                 };
                                 topic_map::wal_upsert(mapping);
+                                let tmpl_type = col("template_type");
                                 let _ = pgrx::spi::Spi::connect_mut(|client| {
                                     client.update(
                                         "INSERT INTO pgmqtt_slot_mappings \
                                              (schema_name, table_name, mapping_name, \
-                                              topic_template, payload_template, qos) \
-                                         VALUES ($1, $2, $3, $4, $5, $6) \
+                                              topic_template, payload_template, qos, template_type) \
+                                         VALUES ($1, $2, $3, $4, $5, $6, $7) \
                                          ON CONFLICT (schema_name, table_name, mapping_name) DO UPDATE \
                                          SET topic_template = EXCLUDED.topic_template, \
                                              payload_template = EXCLUDED.payload_template, \
-                                             qos = EXCLUDED.qos",
+                                             qos = EXCLUDED.qos, \
+                                             template_type = EXCLUDED.template_type",
                                         None,
                                         &[
                                             schema.as_str().into(),
@@ -1125,6 +1131,7 @@ fn cdc_tick(slot_name: &str) {
                                             topic_template.as_str().into(),
                                             payload_template.as_str().into(),
                                             (qos as i32).into(),
+                                            tmpl_type.as_str().into(),
                                         ],
                                     ).map(|_| ())
                                 });
