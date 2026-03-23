@@ -586,25 +586,29 @@ fn process_inbound_pending() {
                     })
                 });
 
-                if write_ok.is_ok() {
-                    log!(
-                        "pgmqtt inbound: processed message {} for mapping '{}'",
-                        pending.message_id,
-                        pending.mapping_name,
-                    );
-                } else {
-                    // Write failed — classify and handle
-                    let err_msg = format!("{:?}", write_ok.err().unwrap());
-                    handle_inbound_failure(pending.message_id, &pending.mapping_name,
-                        pending.retry_count, &err_msg, MAX_RETRIES,
-                        &pending.topic, &pending.payload);
+                match write_ok {
+                    Ok(()) => {
+                        log!(
+                            "pgmqtt inbound: processed message {} for mapping '{}'",
+                            pending.message_id,
+                            pending.mapping_name,
+                        );
+                    }
+                    Err(e) => {
+                        handle_inbound_failure(pending.message_id, &pending.mapping_name,
+                            pending.retry_count, &e, MAX_RETRIES,
+                            &pending.topic, &pending.payload);
+                    }
                 }
             }
             None => {
-                // Mapping was removed since the message was published
-                handle_inbound_failure(pending.message_id, &pending.mapping_name,
-                    pending.retry_count, "mapping no longer exists", MAX_RETRIES,
-                    &pending.topic, &pending.payload);
+                // Mapping was removed since the message was published —
+                // dead-letter immediately (not retryable).
+                dead_letter_inbound(
+                    pending.message_id, &pending.mapping_name,
+                    pending.retry_count, "mapping no longer exists",
+                    &pending.topic, &pending.payload,
+                );
             }
         }
     }
@@ -612,58 +616,23 @@ fn process_inbound_pending() {
     log!("pgmqtt inbound: processed {} pending rows", rows.len());
 }
 
-/// Classify an inbound write failure and either retry or dead-letter.
+/// Classify an SPI write failure and either retry or dead-letter.
 fn handle_inbound_failure(
     message_id: i64,
     mapping_name: &str,
     retry_count: i32,
-    error_msg: &str,
+    error: &pgrx::spi::Error,
     max_retries: i32,
     topic: &str,
     payload: &[u8],
 ) {
-    let retryable = is_retryable_error(error_msg);
-    let should_dead_letter = !retryable || retry_count >= max_retries;
+    let retryable = is_retryable_error(error);
+    let error_msg = format!("{}", error);
 
-    if should_dead_letter {
-        log!(
-            "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
-            message_id, mapping_name, error_msg
+    if !retryable || retry_count >= max_retries {
+        dead_letter_inbound(
+            message_id, mapping_name, retry_count, &error_msg, topic, payload,
         );
-        BackgroundWorker::transaction(|| {
-            let _ = pgrx::spi::Spi::connect_mut(|client| {
-                let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
-                client.update(
-                    "INSERT INTO pgmqtt_dead_letters \
-                        (original_message_id, topic, payload, mapping_name, error_message, retry_count) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                    None,
-                    &[
-                        message_id.into(),
-                        topic.into(),
-                        payload_arg.into(),
-                        mapping_name.into(),
-                        error_msg.into(),
-                        retry_count.into(),
-                    ],
-                )?;
-                client.update(
-                    "DELETE FROM pgmqtt_inbound_pending \
-                     WHERE message_id = $1 AND mapping_name = $2",
-                    None,
-                    &[message_id.into(), mapping_name.into()],
-                )?;
-                client.update(
-                    "DELETE FROM pgmqtt_messages \
-                     WHERE id = $1 AND retain = false \
-                       AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
-                       AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
-                    None,
-                    &[message_id.into()],
-                )?;
-                Ok::<_, pgrx::spi::Error>(())
-            });
-        });
     } else {
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
@@ -682,7 +651,7 @@ fn handle_inbound_failure(
                     &[
                         message_id.into(),
                         mapping_name.into(),
-                        error_msg.into(),
+                        error_msg.as_str().into(),
                         retry_count.into(),
                     ],
                 )?;
@@ -692,16 +661,67 @@ fn handle_inbound_failure(
     }
 }
 
-/// Classify whether an inbound write error is retryable.
-fn is_retryable_error(err_msg: &str) -> bool {
-    let non_retryable = [
-        "does not exist",
-        "permission denied",
-        "invalid input syntax",
-        "violates not-null constraint",
-        "mapping no longer exists",
-    ];
-    !non_retryable.iter().any(|pat| err_msg.contains(pat))
+/// Move a failed inbound message to the dead-letter table.
+fn dead_letter_inbound(
+    message_id: i64,
+    mapping_name: &str,
+    retry_count: i32,
+    error_msg: &str,
+    topic: &str,
+    payload: &[u8],
+) {
+    log!(
+        "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
+        message_id, mapping_name, error_msg
+    );
+    BackgroundWorker::transaction(|| {
+        let _ = pgrx::spi::Spi::connect_mut(|client| {
+            let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
+            client.update(
+                "INSERT INTO pgmqtt_dead_letters \
+                    (original_message_id, topic, payload, mapping_name, error_message, retry_count) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                None,
+                &[
+                    message_id.into(),
+                    topic.into(),
+                    payload_arg.into(),
+                    mapping_name.into(),
+                    error_msg.into(),
+                    retry_count.into(),
+                ],
+            )?;
+            client.update(
+                "DELETE FROM pgmqtt_inbound_pending \
+                 WHERE message_id = $1 AND mapping_name = $2",
+                None,
+                &[message_id.into(), mapping_name.into()],
+            )?;
+            client.update(
+                "DELETE FROM pgmqtt_messages \
+                 WHERE id = $1 AND retain = false \
+                   AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+                   AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+                None,
+                &[message_id.into()],
+            )?;
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
+
+/// Classify whether an SPI error is retryable.
+///
+/// Most inbound write failures are deterministic (missing table, type mismatch,
+/// constraint violation) and will never succeed on retry.  Only SPI-level
+/// connection or transaction errors are transient and worth retrying.
+fn is_retryable_error(error: &pgrx::spi::Error) -> bool {
+    matches!(
+        error,
+        pgrx::spi::Error::SpiError(
+            pgrx::spi::SpiErrorCodes::Connect | pgrx::spi::SpiErrorCodes::Transaction
+        )
+    )
 }
 
 struct MqttClient {

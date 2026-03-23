@@ -349,7 +349,7 @@ Columns:
 - `conflict_columns`: Array of column names for upsert (ON CONFLICT) or delete (WHERE clause).
 - `template_type`: Template engine type (e.g., `'jsonpath'`).
 
-The background worker loads mappings from this table at startup and reloads periodically (~8s). Changes made via the SQL functions take effect on the next reload cycle.
+The background worker loads mappings from this table at startup and reloads periodically (~80ms). Changes made via the SQL functions take effect on the next reload cycle.
 
 ### `pgmqtt_inbound_pending`
 
@@ -367,7 +367,7 @@ Rows are inserted atomically with the message in `pgmqtt_messages` during QoS 1 
 
 ### `pgmqtt_dead_letters`
 
-Stores inbound messages that failed permanently — either after exceeding the maximum retry count (10) or due to a non-retryable error (e.g., target table does not exist, permission denied, constraint violation).
+Stores inbound messages that failed permanently — either after exceeding the maximum retry count (10) or due to a non-retryable error.
 
 Columns:
 - `id`: Auto-incrementing primary key.
