@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pgmqtt Queue Demo</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo"><span class="accent">pg</span>mqtt Queue</div>
+            <div class="header-badges">
+                <div class="status-badge" id="mqtt-status">
+                    <span class="dot red"></span><span>MQTT</span>
+                </div>
+                <div class="status-badge" id="rest-status">
+                    <span class="dot red"></span><span>REST</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="blurb">
+            Jobs are submitted via <strong>REST</strong> and stored as rows in <strong>PostgreSQL</strong>.
+            <strong>pgmqtt</strong> outbound CDC dispatches each new row to workers over <strong>MQTT</strong>
+            &mdash; no Redis, no RabbitMQ, no application server. Workers report results back via MQTT,
+            and inbound mappings update the job rows. Your queue <em>is</em> your database.
+        </div>
+
+        <section class="panel pipeline-section">
+            <h2>Pipeline <span class="source-label">PostgREST &rarr; queue_stats</span></h2>
+            <div class="pipeline" id="pipeline">
+                <div class="pipeline-stage stage-queued">
+                    <div class="stage-count" id="count-queued">&mdash;</div>
+                    <div class="stage-label">Queued</div>
+                </div>
+                <div class="pipeline-connector"></div>
+                <div class="pipeline-stage stage-running">
+                    <div class="stage-count" id="count-running">&mdash;</div>
+                    <div class="stage-label">Running</div>
+                </div>
+                <div class="pipeline-connector"></div>
+                <div class="pipeline-stage stage-completed">
+                    <div class="stage-count" id="count-completed">&mdash;</div>
+                    <div class="stage-label">Completed</div>
+                </div>
+                <div class="pipeline-stage stage-failed">
+                    <div class="stage-count" id="count-failed">&mdash;</div>
+                    <div class="stage-label">Failed</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="stats-row" id="stats-row">
+            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Throughput / min</div></div>
+            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Avg Latency</div></div>
+            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Success Rate</div></div>
+            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Total Jobs</div></div>
+        </section>
+
+        <section class="panel workers-section">
+            <h2>Workers <span class="source-label">PostgREST &rarr; workers</span></h2>
+            <div class="workers-grid" id="workers-grid">
+                <div class="placeholder">Waiting for workers...</div>
+            </div>
+        </section>
+
+        <main>
+            <div class="left-panel">
+                <section class="panel command-panel">
+                    <h2>Submit Job <span class="source-label">POST &rarr; jobs &rarr; CDC</span></h2>
+                    <div class="command-form">
+                        <select id="job-type">
+                            <option value="image_resize">image_resize</option>
+                            <option value="email_send">email_send</option>
+                            <option value="data_export">data_export</option>
+                            <option value="pdf_generate">pdf_generate</option>
+                        </select>
+                        <button id="submit-job">Submit Job</button>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <h2>Queue Metrics <span class="source-label">Rolling stats from queue_stats</span></h2>
+                    <div class="charts-row">
+                        <div class="chart-container">
+                            <div class="chart-title">Throughput (jobs/min)</div>
+                            <canvas id="throughput-chart"></canvas>
+                        </div>
+                        <div class="chart-container">
+                            <div class="chart-title">Avg Latency (s)</div>
+                            <canvas id="latency-chart"></canvas>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <h2>Job History <span class="source-label">PostgREST &rarr; jobs</span></h2>
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Worker</th>
+                                    <th>Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody id="jobs-body">
+                                <tr><td colspan="5" class="empty">Waiting for jobs...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <div class="right-panel">
+                <section class="panel mqtt-feed-panel">
+                    <h2>MQTT Stream <span class="source-label">WebSocket &rarr; jobs/#</span></h2>
+                    <div class="feed-container" id="mqtt-feed">
+                        <div class="feed-entry system">Waiting for connection...</div>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <footer>
+            <p>Powered by <strong>PostgreSQL</strong> + <strong>pgmqtt</strong> + <strong>PostgREST</strong> &mdash; Zero application code</p>
+        </footer>
+    </div>
+    <script type="module" src="/main.js"></script>
+</body>
+
+</html>
