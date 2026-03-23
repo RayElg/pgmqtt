@@ -18,9 +18,9 @@ vehicles.forEach((id, i) => {
     state[id] = {
         lat: sp.lat + (Math.random() - 0.5) * 0.008,
         lng: sp.lng + (Math.random() - 0.5) * 0.008,
-        speed: 25 + Math.random() * 35,
+        speed: 40 + Math.random() * 57,
         fuel: 50 + Math.random() * 50,
-        engine_temp: 185 + Math.random() * 20,
+        engine_temp: 85 + Math.random() * 10,
         odometer: 10000 + Math.random() * 50000,
     };
 });
@@ -49,9 +49,9 @@ client.on('connect', () => {
         // Random walk
         s.lat += (Math.random() - 0.5) * 0.0005;
         s.lng += (Math.random() - 0.5) * 0.0005;
-        s.speed = Math.max(0, Math.min(85, s.speed + (Math.random() - 0.5) * 8));
+        s.speed = Math.max(0, Math.min(137, s.speed + (Math.random() - 0.5) * 13));
         s.fuel = Math.max(0, Math.min(100, s.fuel - Math.random() * 0.05));
-        s.engine_temp = Math.max(160, Math.min(260, s.engine_temp + (Math.random() - 0.5) * 3));
+        s.engine_temp = Math.max(71, Math.min(127, s.engine_temp + (Math.random() - 0.5) * 1.7));
         s.odometer += s.speed / 3600;
 
         const payload = {
@@ -67,18 +67,18 @@ client.on('connect', () => {
         console.log(`[${vehicleId}] telemetry: speed=${payload.speed} fuel=${payload.fuel} engine=${payload.engine_temp}`);
 
         // Threshold-based events
-        if (s.speed > 75) {
+        if (s.speed > 120) {
             client.publish(`fleet/${vehicleId}/event`, JSON.stringify({
                 event_type: 'speeding',
                 severity: 'warning',
-                details: `Speed ${s.speed.toFixed(1)} mph exceeds 75 mph limit`,
+                details: `Speed ${s.speed.toFixed(1)} km/h exceeds 120 km/h limit`,
             }));
         }
-        if (s.engine_temp > 240) {
+        if (s.engine_temp > 115) {
             client.publish(`fleet/${vehicleId}/event`, JSON.stringify({
                 event_type: 'overheating',
                 severity: 'critical',
-                details: `Engine temp ${s.engine_temp.toFixed(1)}°F exceeds threshold`,
+                details: `Engine temp ${s.engine_temp.toFixed(1)}°C exceeds threshold`,
             }));
         }
         if (s.fuel < 15) {

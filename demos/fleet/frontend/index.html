@@ -27,9 +27,13 @@
             </div>
         </header>
 
+        <div class="blurb">
+            Vehicles publish telemetry over <strong>MQTT</strong>. <strong>pgmqtt</strong> inbound mappings write every message to PostgreSQL &mdash; no application code. <strong>PostgREST</strong> serves the tables as a REST API. Dispatch commands insert a row, and <strong>CDC</strong> publishes it back to the vehicle over MQTT.
+        </div>
+
         <section class="stats-row" id="stats-row">
             <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Vehicles</div></div>
-            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Avg Speed (mph)</div></div>
+            <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Avg Speed (km/h)</div></div>
             <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Avg Fuel (%)</div></div>
             <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Events (5 min)</div></div>
             <div class="stat-card"><div class="stat-value">&mdash;</div><div class="stat-label">Total Readings</div></div>
@@ -53,7 +57,7 @@
                     <h2>Fleet Trends <span class="source-label">Rolling averages from fleet_summary</span></h2>
                     <div class="charts-row">
                         <div class="chart-container">
-                            <div class="chart-title">Avg Speed (mph)</div>
+                            <div class="chart-title">Avg Speed (km/h)</div>
                             <canvas id="speed-chart"></canvas>
                         </div>
                         <div class="chart-container">

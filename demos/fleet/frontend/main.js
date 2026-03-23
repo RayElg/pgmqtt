@@ -45,7 +45,7 @@ function updateMapMarkers(vehicles) {
         if (mapMarkers[v.vehicle_id]) {
             mapMarkers[v.vehicle_id].setLatLng([lat, lng]);
             mapMarkers[v.vehicle_id].setTooltipContent(
-                `<b>${v.vehicle_id}</b><br>${v.speed} mph`
+                `<b>${v.vehicle_id}</b><br>${v.speed} km/h`
             );
         } else {
             mapMarkers[v.vehicle_id] = L.circleMarker([lat, lng], {
@@ -55,7 +55,7 @@ function updateMapMarkers(vehicles) {
                 fillOpacity: 0.8,
                 weight: 2,
             }).addTo(map).bindTooltip(
-                `<b>${v.vehicle_id}</b><br>${v.speed} mph`,
+                `<b>${v.vehicle_id}</b><br>${v.speed} km/h`,
                 { permanent: true, direction: 'top', offset: [0, -12], className: 'vehicle-tooltip' }
             );
         }
@@ -105,7 +105,7 @@ const speedChart = new Chart(document.getElementById('speed-chart'), {
             borderWidth: 2,
         }],
     },
-    options: chartOpts(0, 85),
+    options: chartOpts(0, 140),
 });
 
 const fuelChart = new Chart(document.getElementById('fuel-chart'), {
@@ -218,7 +218,7 @@ function setStatus(el, ok, label) {
 function renderSummary(s) {
     const cards = [
         { value: s.total_vehicles ?? 0, label: 'Vehicles' },
-        { value: s.avg_speed ?? '\u2014', label: 'Avg Speed (mph)' },
+        { value: s.avg_speed ?? '\u2014', label: 'Avg Speed (km/h)' },
         { value: s.avg_fuel ?? '\u2014', label: 'Avg Fuel (%)' },
         { value: s.recent_events ?? 0, label: 'Events (5 min)' },
         { value: s.total_readings ?? 0, label: 'Total Readings' },
@@ -237,11 +237,11 @@ function renderVehicleGrid(vehicles) {
         return;
     }
     dom.vehicleGrid.innerHTML = vehicles.map(v => {
-        const speedPct = Math.min(100, (v.speed / 85) * 100);
-        const speedColor = v.speed > 75 ? 'var(--danger)' : v.speed > 65 ? 'var(--warning)' : 'var(--accent-color)';
+        const speedPct = Math.min(100, (v.speed / 140) * 100);
+        const speedColor = v.speed > 120 ? 'var(--danger)' : v.speed > 105 ? 'var(--warning)' : 'var(--accent-color)';
         const fuelColor = v.fuel < 15 ? 'var(--danger)' : v.fuel < 30 ? 'var(--warning)' : 'var(--success)';
-        const tempPct = Math.min(100, ((v.engine_temp - 150) / 110) * 100);
-        const tempColor = v.engine_temp > 240 ? 'var(--danger)' : v.engine_temp > 210 ? 'var(--warning)' : 'var(--success)';
+        const tempPct = Math.min(100, ((v.engine_temp - 70) / 60) * 100);
+        const tempColor = v.engine_temp > 115 ? 'var(--danger)' : v.engine_temp > 100 ? 'var(--warning)' : 'var(--success)';
 
         return `
         <div class="vehicle-card">
@@ -251,7 +251,7 @@ function renderVehicleGrid(vehicles) {
             </div>
             <div class="vitals">
                 <div class="vital-item">
-                    <div class="vital-label"><span>Speed</span><span class="vital-value">${v.speed} mph</span></div>
+                    <div class="vital-label"><span>Speed</span><span class="vital-value">${v.speed} km/h</span></div>
                     <div class="progress-bar"><div class="progress-fill" style="width:${speedPct}%;background:${speedColor}"></div></div>
                 </div>
                 <div class="vital-item">
@@ -259,7 +259,7 @@ function renderVehicleGrid(vehicles) {
                     <div class="progress-bar"><div class="progress-fill" style="width:${v.fuel}%;background:${fuelColor}"></div></div>
                 </div>
                 <div class="vital-item">
-                    <div class="vital-label"><span>Engine</span><span class="vital-value">${v.engine_temp}&deg;F</span></div>
+                    <div class="vital-label"><span>Engine</span><span class="vital-value">${v.engine_temp}&deg;C</span></div>
                     <div class="progress-bar"><div class="progress-fill" style="width:${tempPct}%;background:${tempColor}"></div></div>
                 </div>
             </div>
@@ -278,7 +278,7 @@ function renderTelemetryTable(rows) {
             <td>${r.vehicle_id}</td>
             <td>${r.speed}</td>
             <td>${r.fuel}%</td>
-            <td>${r.engine_temp}&deg;F</td>
+            <td>${r.engine_temp}&deg;C</td>
         </tr>
     `).join('');
 }
