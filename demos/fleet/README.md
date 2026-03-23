@@ -69,11 +69,3 @@ open http://localhost:5173
 | `postgrest` | Auto-generated REST API from Postgres schema |
 | `simulator` | Pure MQTT client — publishes telemetry, receives commands |
 | `frontend` | Vite + Leaflet + Chart.js dashboard |
-
-## Re-recording the demo
-
-```bash
-# Prerequisites: node, ffmpeg, fonts-noto-color-emoji
-cd record && npm install && npx playwright install chromium
-cd .. && bash record/record.sh
-```
