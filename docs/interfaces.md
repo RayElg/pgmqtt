@@ -6,18 +6,19 @@ This document describes the SQL-callable interfaces and configuration tables use
 
 `pgmqtt` introduces several functions to manage how changes in PostgreSQL tables map to MQTT topics.
 
-### 1. `pgmqtt_add_mapping`
+### 1. `pgmqtt_add_outbound_mapping`
 
 Registers a new logical decoding mapping for a given table.
 
 **Signature:**
 ```sql
-pgmqtt_add_mapping(
+pgmqtt_add_outbound_mapping(
     schema_name text,
     table_name text,
     topic_template text,
     payload_template text,
-    qos integer DEFAULT 0
+    qos integer DEFAULT 0,
+    template_type text DEFAULT 'jinja2'
 ) RETURNS text
 ```
 
@@ -27,10 +28,11 @@ pgmqtt_add_mapping(
 - `topic_template`: A Jinja2-compatible template string used to determine the MQTT topic for each change.
 - `payload_template`: A Jinja2-compatible template string defining what the MQTT message body will contain.
 - `qos`: Optional. The Quality of Service level for messages generated from this mapping (0 or 1). Defaults to 0.
+- `template_type`: Optional. The template engine to use for rendering topic and payload templates. Defaults to `'jinja2'`.
 
 **Example:**
 ```sql
-SELECT pgmqtt_add_mapping(
+SELECT pgmqtt_add_outbound_mapping(
     'public',
     'events',
     'events/{{ op | lower }}',
@@ -41,13 +43,13 @@ SELECT pgmqtt_add_mapping(
 
 ---
 
-### 2. `pgmqtt_remove_mapping`
+### 2. `pgmqtt_remove_outbound_mapping`
 
 Removes an existing topic mapping. Note that any changes already in the internal ring buffer for this mapping may still be dispatched.
 
 **Signature:**
 ```sql
-pgmqtt_remove_mapping(
+pgmqtt_remove_outbound_mapping(
     schema_name text,
     table_name text
 ) RETURNS boolean
@@ -56,30 +58,30 @@ Returns `true` if the mapping was found and successfully deleted, or `false` oth
 
 **Example:**
 ```sql
-SELECT pgmqtt_remove_mapping('public', 'events');
+SELECT pgmqtt_remove_outbound_mapping('public', 'events');
 ```
 
 ---
 
-### 3. `pgmqtt_list_mappings`
+### 3. `pgmqtt_list_outbound_mappings`
 
 Lists all currently active topic mappings.
 
 **Signature:**
 ```sql
-pgmqtt_list_mappings()
+pgmqtt_list_outbound_mappings()
 ```
 Returns a set of rows detailing the mappings.
 
 **Example:**
 ```sql
-SELECT * FROM pgmqtt_list_mappings();
+SELECT * FROM pgmqtt_list_outbound_mappings();
 ```
 Output:
 ```text
-  schema_name | table_name |       topic_template      |    payload_template   | qos 
- -------------+------------+---------------------------+-----------------------+-----
-  public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1
+  schema_name | table_name |       topic_template      |    payload_template   | qos | template_type
+ -------------+------------+---------------------------+-----------------------+-----+--------------
+  public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1 | jinja2
 ```
 
 ---
@@ -108,12 +110,146 @@ Output columns:
 | `pending_session_messages` | int | Messages queued for offline or slow clients |
 | `cdc_mappings` | int | Number of registered CDC topic mappings |
 | `cdc_slot_active` | bigint | `1` if the `pgmqtt_slot` logical replication slot is active, `0` otherwise |
+| `inbound_mappings` | int | Number of registered inbound MQTT → table mappings |
+| `inbound_pending` | int | QoS 1 inbound messages awaiting table writes (virtual subscriber queue) |
+| `dead_letters` | int | Inbound messages that failed permanently and were dead-lettered |
 
 All counts are taken from a single SQL statement and reflect a consistent snapshot.
 
 ---
 
-### 5. `pgmqtt_license_status` *(enterprise)*
+### 5. `pgmqtt_add_inbound_mapping`
+
+Registers a mapping that automatically writes incoming MQTT messages to a PostgreSQL table. Topic patterns with `{variable}` segments capture values from the topic path; column maps reference those variables and JSON payload fields.
+
+**Signature:**
+```sql
+pgmqtt_add_inbound_mapping(
+    topic_pattern text,
+    target_table text,
+    column_map jsonb,
+    op text DEFAULT 'insert',
+    conflict_columns text[] DEFAULT NULL,
+    target_schema text DEFAULT 'public',
+    mapping_name text DEFAULT 'default',
+    template_type text DEFAULT 'jsonpath'
+) RETURNS text
+```
+
+**Parameters:**
+- `topic_pattern`: Pattern with `{variable}` segments to match incoming topics (e.g., `'sensor/{site_id}/temperature/{sensor_id}'`). MQTT wildcards (`+`, `#`) are not allowed.
+- `target_table`: Name of the PostgreSQL table to write to.
+- `column_map`: JSON object mapping column names to source expressions (see below).
+- `op`: Operation type — `'insert'`, `'upsert'`, or `'delete'`. Defaults to `'insert'`.
+- `conflict_columns`: Required for `upsert` (ON CONFLICT columns) and `delete` (WHERE columns). Must reference columns in the column map.
+- `target_schema`: Schema of the target table. Defaults to `'public'`.
+- `mapping_name`: Unique identifier for this mapping. Defaults to `'default'`.
+- `template_type`: Optional. The template engine to use for column map expressions. Defaults to `'jsonpath'`.
+
+**Column Map Expressions:**
+
+| Expression | Meaning | Example |
+|---|---|---|
+| `{var_name}` | Value captured from a topic pattern variable | `{site_id}` |
+| `$.path.to.field` | Value extracted from the JSON payload (dot-path) | `$.temperature` |
+| `$payload` | Entire raw payload as text | |
+| `$topic` | Raw topic string | |
+
+**Validation** (performed at creation time):
+- Target table and all column map keys must exist
+- All `{var}` references in column map must appear in the topic pattern
+- For `upsert`: conflict columns must be provided
+- For `delete`: conflict columns define the WHERE clause
+
+**Examples:**
+
+Insert sensor readings:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'sensor/{site_id}/temperature/{sensor_id}',
+    'sensor_readings',
+    '{"site_id": "{site_id}", "sensor_id": "{sensor_id}", "value": "$.temperature"}'::jsonb,
+    'insert',
+    NULL,
+    'public',
+    'temp_readings'
+);
+```
+
+Upsert device status:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'device/{device_id}/status',
+    'device_status',
+    '{"device_id": "{device_id}", "online": "$.online", "last_seen": "$.ts"}'::jsonb,
+    'upsert',
+    ARRAY['device_id'],
+    'public',
+    'device_status'
+);
+```
+
+Delete by key:
+```sql
+SELECT pgmqtt_add_inbound_mapping(
+    'device/{device_id}/deregister',
+    'devices',
+    '{"device_id": "{device_id}"}'::jsonb,
+    'delete',
+    ARRAY['device_id'],
+    'public',
+    'device_deregister'
+);
+```
+
+---
+
+### 6. `pgmqtt_remove_inbound_mapping`
+
+Removes an inbound mapping by name.
+
+**Signature:**
+```sql
+pgmqtt_remove_inbound_mapping(
+    mapping_name text DEFAULT 'default'
+) RETURNS boolean
+```
+
+Returns `true` if the mapping was found and removed, `false` otherwise.
+
+**Example:**
+```sql
+SELECT pgmqtt_remove_inbound_mapping('temp_readings');
+```
+
+---
+
+### 7. `pgmqtt_list_inbound_mappings`
+
+Lists all registered inbound mappings.
+
+**Signature:**
+```sql
+pgmqtt_list_inbound_mappings() RETURNS TABLE (
+    mapping_name text,
+    topic_pattern text,
+    target_schema text,
+    target_table text,
+    column_map jsonb,
+    op text,
+    conflict_columns text[],
+    template_type text
+)
+```
+
+**Example:**
+```sql
+SELECT * FROM pgmqtt_list_inbound_mappings();
+```
+
+---
+
+### 8. `pgmqtt_license_status` *(enterprise)*
 
 Returns the current license state. See [enterprise.md](enterprise.md#license-management) for full details.
 
@@ -147,6 +283,7 @@ Columns:
 - `topic_template`: Jinja2 template for topic.
 - `payload_template`: Jinja2 template for payload.
 - `qos`: Target QoS level for messages.
+- `template_type`: Template engine type (e.g., `'jinja2'`).
 
 ### `pgmqtt_messages`
 
@@ -197,3 +334,47 @@ Columns:
 - `client_id`: References `pgmqtt_sessions`.
 - `topic_filter`: MQTT topic filter (may include `+` and `#` wildcards).
 - `qos`: Subscribed QoS level.
+
+### `pgmqtt_inbound_mappings`
+
+Stores inbound MQTT → PostgreSQL table mapping configurations. Managed via `pgmqtt_add_inbound_mapping` / `pgmqtt_remove_inbound_mapping`.
+
+Columns:
+- `mapping_name`: Unique mapping identifier (primary key).
+- `topic_pattern`: Topic pattern with `{variable}` capture segments.
+- `target_schema`: Schema of the target table.
+- `target_table`: Target table name.
+- `column_map`: JSONB object mapping column names to source expressions.
+- `op`: Operation type (`'insert'`, `'upsert'`, or `'delete'`).
+- `conflict_columns`: Array of column names for upsert (ON CONFLICT) or delete (WHERE clause).
+- `template_type`: Template engine type (e.g., `'jsonpath'`).
+
+The background worker loads mappings from this table at startup and reloads periodically (~80ms). Changes made via the SQL functions take effect on the next reload cycle.
+
+### `pgmqtt_inbound_pending`
+
+Tracks QoS 1 messages awaiting inbound table writes. Acts as a durable queue for the "virtual subscriber" — a background process that reads pending rows, executes the table write, and deletes the row on success.
+
+Columns:
+- `message_id`: Reference to the message in `pgmqtt_messages` (part of composite PK).
+- `mapping_name`: The inbound mapping that matched (part of composite PK).
+- `retry_count`: Number of retry attempts so far.
+- `last_error`: Error message from the most recent failed attempt.
+- `next_retry_at`: When the next retry should be attempted (exponential backoff: 1s, 2s, 4s… capped at 256s).
+- `created_at`: When this pending entry was created.
+
+Rows are inserted atomically with the message in `pgmqtt_messages` during QoS 1 publish handling, ensuring the PUBACK is only sent after both are durably committed. After 10 failed retries (or a non-retryable error), the row is moved to `pgmqtt_dead_letters`.
+
+### `pgmqtt_dead_letters`
+
+Stores inbound messages that failed permanently — either after exceeding the maximum retry count (10) or due to a non-retryable error.
+
+Columns:
+- `id`: Auto-incrementing primary key.
+- `original_message_id`: The message ID from `pgmqtt_messages` (may no longer exist).
+- `topic`: MQTT topic of the original message.
+- `payload`: Original message payload (bytea).
+- `mapping_name`: The inbound mapping that was being applied.
+- `error_message`: The error that caused the dead-letter.
+- `retry_count`: How many retries were attempted before dead-lettering.
+- `dead_lettered_at`: When this entry was created.

@@ -114,7 +114,7 @@ def test_slot_mappings_lags_then_catches_up():
 
     try:
         run_sql(
-            f"SELECT pgmqtt_add_mapping('public', '{table}', "
+            f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
             f"'lag_test/{{{{ columns.id }}}}', '{{{{ columns.val }}}}')"
         )
         lsn_after_add = _get_current_wal_lsn()
@@ -141,13 +141,13 @@ def test_slot_mappings_lags_then_catches_up():
             )
 
     finally:
-        run_sql(f"SELECT pgmqtt_remove_mapping('public', '{table}')")
+        run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{table}')")
         run_sql(f"DROP TABLE IF EXISTS {table}")
 
 
 def test_slot_mappings_reflects_delete():
     """
-    After pgmqtt_remove_mapping commits, pgmqtt_slot_mappings must drop the
+    After pgmqtt_remove_outbound_mapping commits, pgmqtt_slot_mappings must drop the
     entry once the WAL slot advances past the delete.
     """
     table = "wmt_delete_test"
@@ -155,7 +155,7 @@ def test_slot_mappings_reflects_delete():
     run_sql(f"CREATE TABLE {table} (id serial primary key, val text)")
     run_sql(f"ALTER TABLE {table} REPLICA IDENTITY FULL")
     run_sql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'del_test/{{{{ columns.id }}}}', '{{{{ columns.val }}}}')"
     )
 
@@ -166,7 +166,7 @@ def test_slot_mappings_reflects_delete():
     assert _slot_mapping_count(table) == 1, "precondition: mapping must be in slot checkpoint"
 
     try:
-        run_sql(f"SELECT pgmqtt_remove_mapping('public', '{table}')")
+        run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{table}')")
         lsn_after_del = _get_current_wal_lsn()
 
         _trigger_wal_advance(table)
@@ -203,7 +203,7 @@ def test_wal_ordering_old_rows_use_old_mapping():
 
     # Initial mapping → old topic, QoS 1 so messages persist.
     run_sql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'order/v1/{{{{ columns.id }}}}', '{{{{ columns.val }}}}', 1)"
     )
 
@@ -225,7 +225,7 @@ def test_wal_ordering_old_rows_use_old_mapping():
 
         # --- Change mapping to new topic in the same WAL stream ---
         run_sql(
-            f"SELECT pgmqtt_add_mapping('public', '{table}', "
+            f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
             f"'order/v2/{{{{ columns.id }}}}', '{{{{ columns.val }}}}', 1)"
         )
 
@@ -251,13 +251,13 @@ def test_wal_ordering_old_rows_use_old_mapping():
 
     finally:
         sub.close()
-        run_sql(f"SELECT pgmqtt_remove_mapping('public', '{table}')")
+        run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{table}')")
         run_sql(f"DROP TABLE IF EXISTS {table}")
 
 
 def test_slot_mappings_survives_multiple_updates():
     """
-    Repeated calls to pgmqtt_add_mapping (same name → UPDATE) are reflected
+    Repeated calls to pgmqtt_add_outbound_mapping (same name → UPDATE) are reflected
     correctly in pgmqtt_slot_mappings: the checkpoint always holds the most
     recent committed state after WAL advance.
     """
@@ -269,7 +269,7 @@ def test_slot_mappings_survives_multiple_updates():
     try:
         for version in ("v1", "v2", "v3"):
             run_sql(
-                f"SELECT pgmqtt_add_mapping('public', '{table}', "
+                f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
                 f"'multi/{version}/{{{{ columns.id }}}}', '{{{{ columns.val }}}}')"
             )
 
@@ -287,5 +287,5 @@ def test_slot_mappings_survives_multiple_updates():
         )
 
     finally:
-        run_sql(f"SELECT pgmqtt_remove_mapping('public', '{table}')")
+        run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{table}')")
         run_sql(f"DROP TABLE IF EXISTS {table}")

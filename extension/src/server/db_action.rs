@@ -204,13 +204,17 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         ) {
                             pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
                         }
-                        // Delete the message itself if no other session is waiting for it.
+                        // Delete the message itself if no other session or
+                        // inbound-pending row is waiting for it.
                         let args2: Vec<DatumWithOid> = vec![message_id.into()];
                         if let Err(e) = client.update(
                             "DELETE FROM pgmqtt_messages \
                              WHERE id = $1 AND retain = false \
                                AND NOT EXISTS ( \
                                    SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1 \
+                               ) \
+                               AND NOT EXISTS ( \
+                                   SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1 \
                                )",
                             None,
                             &args2,

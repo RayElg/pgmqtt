@@ -209,7 +209,7 @@ def _setup_cdc_table(table, topic_template, payload_template="{{ columns.val }}"
     run_psql(f"CREATE TABLE {table} (id serial primary key, name text, val text);")
     run_psql(f"ALTER TABLE {table} REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'{topic_template}', '{payload_template}', {qos});"
     )
     time.sleep(6)

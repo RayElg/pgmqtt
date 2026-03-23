@@ -17,7 +17,7 @@ ALTER TABLE machine_vitals REPLICA IDENTITY FULL;
 -- Add mapping: publish every change to vitals/<op>/<machine_id>
 -- Topic: vitals/{{ op | lower }}/{{ columns.machine_id }}
 -- Payload: JSON of columns
-SELECT pgmqtt_add_mapping(
+SELECT pgmqtt_add_outbound_mapping(
     'public',
     'machine_vitals',
     'vitals/{{ op | lower }}/{{ columns.machine_id }}',

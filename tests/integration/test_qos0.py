@@ -32,7 +32,7 @@ def setup_test_table(table_name, topic_pattern):
     run_psql(f"CREATE TABLE {table_name} (id serial PRIMARY KEY, data text);")
     run_psql(f"ALTER TABLE {table_name} REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', '{table_name}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table_name}', "
         f"'{topic_pattern}', "
         f"'{{{{ columns | tojson }}}}');"
     )

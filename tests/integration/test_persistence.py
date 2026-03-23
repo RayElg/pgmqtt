@@ -66,7 +66,7 @@ def _setup_cdc_table(table, topic, qos=1):
     run_psql(f"CREATE TABLE {table} (id serial primary key, msg text);")
     run_psql(f"ALTER TABLE {table} REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'{topic}', '{{{{ columns.msg }}}}', {qos});"
     )
     time.sleep(6)

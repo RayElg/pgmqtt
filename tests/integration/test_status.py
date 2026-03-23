@@ -14,7 +14,7 @@ def test_status_function_exists_and_returns_row():
     assert result
     assert len(result) == 1  # Single row
     row = result[0]
-    assert len(row) == 6  # 6 columns
+    assert len(row) == 9  # 9 columns (including inbound_pending, dead_letters)
 
 
 def test_status_reports_zero_connections_on_empty_database():
@@ -143,10 +143,10 @@ def test_status_counts_cdc_mappings():
 
     # Add mappings
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'users', 'users/{{ op }}', '{{ columns | tojson }}');"
+        "SELECT pgmqtt_add_outbound_mapping('public', 'users', 'users/{{ op }}', '{{ columns | tojson }}');"
     )
     run_sql(
-        "SELECT pgmqtt_add_mapping('public', 'orders', 'orders/{{ op }}', '{{ columns | tojson }}', 1);"
+        "SELECT pgmqtt_add_outbound_mapping('public', 'orders', 'orders/{{ op }}', '{{ columns | tojson }}', 1);"
     )
 
     result = run_sql("SELECT cdc_mappings FROM pgmqtt_status();")
@@ -170,11 +170,12 @@ def test_status_returns_complete_row():
         "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) "
         "VALUES ('test_client', 'test/topic', 0);"
     )
-    run_sql("SELECT pgmqtt_add_mapping('public', 'test_table', 'test/cdc', 'payload');")
+    run_sql("SELECT pgmqtt_add_outbound_mapping('public', 'test_table', 'test/cdc', 'payload');")
 
     result = run_sql(
         "SELECT active_connections, total_subscriptions, total_retained_messages, "
-        "pending_session_messages, cdc_mappings, cdc_slot_active FROM pgmqtt_status();"
+        "pending_session_messages, cdc_mappings, cdc_slot_active, inbound_mappings, "
+        "inbound_pending, dead_letters FROM pgmqtt_status();"
     )
     assert result
     row = result[0]
@@ -184,3 +185,6 @@ def test_status_returns_complete_row():
     assert row[3] >= 0  # pending_session_messages
     assert row[4] >= 1  # cdc_mappings
     assert row[5] >= 0  # cdc_slot_active
+    assert row[6] >= 0  # inbound_mappings
+    assert row[7] >= 0  # inbound_pending
+    assert row[8] >= 0  # dead_letters

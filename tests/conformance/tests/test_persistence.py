@@ -40,7 +40,7 @@ def test_publish_persistence():
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS pgmqtt;")
-    cur.execute("SELECT pgmqtt_add_mapping('public', 'dummy_table', 'dummy/test', '{}', true);")
+    cur.execute("SELECT pgmqtt_add_outbound_mapping('public', 'dummy_table', 'dummy/test', '{}', true);")
     
     # Connect publisher
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_pub:

@@ -24,6 +24,7 @@ pub fn init_010() {
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
+            template_type text NOT NULL DEFAULT 'jinja2',
             PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create mappings table",
@@ -42,6 +43,7 @@ pub fn init_010() {
             topic_template text NOT NULL,
             payload_template text NOT NULL,
             qos int DEFAULT 0,
+            template_type text NOT NULL DEFAULT 'jinja2',
             PRIMARY KEY (schema_name, table_name, mapping_name)
         )",
         "create slot mappings table",
@@ -107,6 +109,60 @@ pub fn init_010() {
         "create subscriptions table",
     );
 
+    // Inbound MQTT → PostgreSQL table mappings.
+    // Allows MQTT devices to publish messages that are automatically written
+    // to PostgreSQL tables based on topic pattern matching and column maps.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_inbound_mappings (
+            mapping_name     text NOT NULL DEFAULT 'default',
+            topic_pattern    text NOT NULL,
+            target_schema    text NOT NULL DEFAULT 'public',
+            target_table     text NOT NULL,
+            column_map       jsonb NOT NULL,
+            op               text NOT NULL DEFAULT 'insert',
+            conflict_columns text[] DEFAULT NULL,
+            template_type    text NOT NULL DEFAULT 'jsonpath',
+            PRIMARY KEY (mapping_name)
+        )",
+        "create inbound mappings table",
+    );
+
+    // Tracks QoS 1 messages awaiting inbound table writes (virtual subscriber).
+    // One row per (message, mapping) pair. Deleted on successful write;
+    // moved to dead_letters after MAX_RETRIES or non-retryable errors.
+    //
+    // mapping_name intentionally has no FK to pgmqtt_inbound_mappings:
+    // if a mapping is removed while pending rows still reference it, the
+    // virtual subscriber detects "mapping no longer exists" and dead-letters
+    // the orphaned row rather than silently dropping it.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_inbound_pending (
+            message_id   bigint NOT NULL REFERENCES pgmqtt_messages(id) ON DELETE CASCADE,
+            mapping_name text NOT NULL,
+            retry_count  int NOT NULL DEFAULT 0,
+            last_error   text,
+            next_retry_at timestamptz NOT NULL DEFAULT now(),
+            created_at    timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (message_id, mapping_name)
+        )",
+        "create inbound pending table",
+    );
+
+    // Dead-letter table for inbound messages that failed permanently.
+    run_sql_or_error(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_dead_letters (
+            id                  bigserial PRIMARY KEY,
+            original_message_id bigint,
+            topic               text NOT NULL,
+            payload             bytea,
+            mapping_name        text NOT NULL,
+            error_message       text,
+            retry_count         int NOT NULL DEFAULT 0,
+            dead_lettered_at    timestamptz NOT NULL DEFAULT now()
+        )",
+        "create dead letters table",
+    );
+
     // Indexes for efficient queries
     let _ = Spi::run(
         "CREATE INDEX IF NOT EXISTS idx_session_messages_message_id ON pgmqtt_session_messages(message_id)",
@@ -117,5 +173,8 @@ pub fn init_010() {
     let _ = Spi::run("CREATE INDEX IF NOT EXISTS idx_subscriptions_client_id ON pgmqtt_subscriptions(client_id)");
     let _ = Spi::run(
         "CREATE INDEX IF NOT EXISTS idx_retained_message_id ON pgmqtt_retained(message_id)",
+    );
+    let _ = Spi::run(
+        "CREATE INDEX IF NOT EXISTS idx_inbound_pending_next_retry ON pgmqtt_inbound_pending(next_retry_at)",
     );
 }

@@ -49,7 +49,7 @@ def setup_table(table="flow_control_test"):
     )
     run_psql(f"ALTER TABLE {table} REPLICA IDENTITY FULL;")
     run_psql(
-        f"SELECT pgmqtt_add_mapping('public', '{table}', "
+        f"SELECT pgmqtt_add_outbound_mapping('public', '{table}', "
         f"'test/flow/{{{{ columns.id }}}}', '{{{{ columns.val }}}}', 1);"
     )
     time.sleep(6)  # Wait for server's 5s mapping cache to expire
