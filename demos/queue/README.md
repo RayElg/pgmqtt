@@ -33,8 +33,8 @@ flowchart LR
     B & G -- "POST /jobs" --> PR
     PR -- insert --> J
     J --> CDC
-    CDC -- "jobs/{type}/{slot}/pending" --> MQTT
-    MQTT --> W1 & W2 & W3 & W4
+    CDC -- "jobs/{type}/pending" --> MQTT
+    MQTT -- "$share/{type}_workers/..." --> W1 & W2 & W3 & W4
     W1 & W2 & W3 & W4 -- "jobs/{id}/started\njobs/{id}/result" --> MQTT
     MQTT --> IN
     IN -- upsert --> J
@@ -45,19 +45,19 @@ flowchart LR
     PR -- "GET /jobs\nGET /workers\nGET /queue_stats" --> B
 ```
 
-Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/{slot}/pending` — slot-based routing ensures exactly one worker per type handles each job. Workers claim the job and report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
+Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/pending`. Workers subscribe via MQTT 5.0 **shared subscriptions** (`$share/{type}_workers/jobs/{type}/pending`) — the broker automatically round-robins each job to exactly one worker per type. Workers claim the job and report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
 
 ## What it demonstrates
 
 | Feature | How it's used |
 |---|---|
-| **Outbound mapping (CDC)** | New job row → published to `jobs/{type}/{slot}/pending` with slot-based routing |
+| **Outbound mapping (CDC)** | New job row → published to `jobs/{type}/pending` |
 | **Inbound mapping (upsert)** | `jobs/{id}/started` → updates job status to running |
 | **Inbound mapping (upsert)** | `jobs/{id}/result` → updates job status to completed/failed |
 | **Inbound mapping (upsert)** | `workers/{id}/heartbeat` → device-twin in `workers` table |
 | **PostgREST** | Zero-code REST API for submitting jobs + serving dashboard data |
 | **Postgres views** | `queue_stats` computes live throughput, latency, and success rate |
-| **Hash-based routing** | `abs(hashtext(id)) % 2` assigns each job to a worker slot for fan-out |
+| **Shared subscriptions** | `$share/{type}_workers/...` — broker-native round-robin, no app-level routing |
 
 ## Running
 

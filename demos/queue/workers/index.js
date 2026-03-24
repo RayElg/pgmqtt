@@ -7,14 +7,14 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // === Worker definitions ===
 
 const workerDefs = [
-    { id: 'W-001', type: 'image_resize', slot: 0, minMs: 3000, maxMs: 6000 },
-    { id: 'W-002', type: 'image_resize', slot: 1, minMs: 3000, maxMs: 6000 },
-    { id: 'W-003', type: 'email_send',   slot: 0, minMs: 1000, maxMs: 3000 },
-    { id: 'W-004', type: 'email_send',   slot: 1, minMs: 1000, maxMs: 3000 },
-    { id: 'W-005', type: 'data_export',  slot: 0, minMs: 4000, maxMs: 8000 },
-    { id: 'W-006', type: 'data_export',  slot: 1, minMs: 4000, maxMs: 8000 },
-    { id: 'W-007', type: 'pdf_generate', slot: 0, minMs: 3000, maxMs: 7000 },
-    { id: 'W-008', type: 'pdf_generate', slot: 1, minMs: 3000, maxMs: 7000 },
+    { id: 'W-001', type: 'image_resize', minMs: 3000, maxMs: 6000 },
+    { id: 'W-002', type: 'image_resize', minMs: 3000, maxMs: 6000 },
+    { id: 'W-003', type: 'email_send',   minMs: 1000, maxMs: 3000 },
+    { id: 'W-004', type: 'email_send',   minMs: 1000, maxMs: 3000 },
+    { id: 'W-005', type: 'data_export',  minMs: 4000, maxMs: 8000 },
+    { id: 'W-006', type: 'data_export',  minMs: 4000, maxMs: 8000 },
+    { id: 'W-007', type: 'pdf_generate', minMs: 3000, maxMs: 7000 },
+    { id: 'W-008', type: 'pdf_generate', minMs: 3000, maxMs: 7000 },
 ];
 
 const state = {};
@@ -33,11 +33,18 @@ const client = mqtt.connect(BROKER_URL, {
 client.on('connect', () => {
     console.log(`Workers connected to ${BROKER_URL}`);
 
-    // Each worker subscribes to its own slot — no two workers share a topic
+    // MQTT 5.0 shared subscriptions: all workers of the same type share a
+    // subscription group.  The broker round-robins each job to exactly one
+    // idle worker — no application-level slot routing needed.
+    const subscribedTypes = new Set();
     workerDefs.forEach(w => {
-        client.subscribe(`jobs/${w.type}/${w.slot}/pending`, (err) => {
-            if (!err) console.log(`[${w.id}] subscribed to jobs/${w.type}/${w.slot}/pending`);
-        });
+        if (!subscribedTypes.has(w.type)) {
+            subscribedTypes.add(w.type);
+            const filter = `$share/${w.type}_workers/jobs/${w.type}/pending`;
+            client.subscribe(filter, (err) => {
+                if (!err) console.log(`Subscribed to shared group: ${filter}`);
+            });
+        }
     });
 
     // Heartbeats every 2 s
@@ -67,12 +74,11 @@ client.on('message', (topic, payload) => {
         const msg = JSON.parse(payload.toString());
         if (msg.status !== 'queued') return;
 
-        // topic: jobs/{type}/{slot}/pending
+        // topic: jobs/{type}/pending
         const parts = topic.split('/');
         const jobType = parts[1];
-        const slot = parseInt(parts[2]);
         const worker = Object.values(state).find(
-            w => w.type === jobType && w.slot === slot && !w.busy
+            w => w.type === jobType && !w.busy
         );
         if (!worker) return;
 
@@ -126,7 +132,7 @@ async function processJob(worker, job) {
 async function drainQueue(worker) {
     try {
         const resp = await fetch(
-            `${API_URL}/jobs?status=eq.queued&job_type=eq.${worker.type}&worker_slot=eq.${worker.slot}&order=submitted_at.asc&limit=1`
+            `${API_URL}/jobs?status=eq.queued&job_type=eq.${worker.type}&order=submitted_at.asc&limit=1`
         );
         const jobs = await resp.json();
         if (jobs.length > 0 && !worker.busy) {

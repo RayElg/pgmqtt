@@ -1372,7 +1372,7 @@ fn cdc_tick(slot_name: &str) {
                                 let topic_str = rendered.topic.clone();
 
                                 // Skip if no subscribers (CDC events are never retained).
-                                if subscriptions::match_topic(&topic_str).is_empty() {
+                                if !subscriptions::has_subscribers(&topic_str) {
                                     log!(
                                         "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
                                         topic_str
@@ -2283,11 +2283,27 @@ fn handle_mqtt_packet(
         mqtt::InboundPacket::Subscribe(sub) => {
             let mut reason_codes = Vec::with_capacity(sub.topics.len());
             for (topic_filter, requested_qos) in &sub.topics {
-                // JWT subscribe authorization
+                // Validate shared subscription syntax.
+                if topic_filter.starts_with("$share/")
+                    && subscriptions::parse_shared_filter(topic_filter).is_none()
+                {
+                    log!(
+                        "pgmqtt mqtt: '{}' malformed shared subscription '{}'",
+                        client_id,
+                        topic_filter
+                    );
+                    reason_codes.push(mqtt::reason::TOPIC_FILTER_INVALID);
+                    continue;
+                }
+
+                // JWT subscribe authorization — use the real filter for shared subs.
+                let auth_filter = subscriptions::parse_shared_filter(topic_filter)
+                    .map(|(_, f)| f)
+                    .unwrap_or(topic_filter.as_str());
                 let jwt_authorized = if client.sub_claims.is_empty() {
                     true
                 } else {
-                    client.sub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(topic_filter, claim))
+                    client.sub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(auth_filter, claim))
                 };
 
                 if !jwt_authorized {
@@ -2322,12 +2338,19 @@ fn handle_mqtt_packet(
                 return false;
             }
 
-            // Deliver retained messages for successfully subscribed filters (MQTT §3.8.4)
+            // Deliver retained messages for successfully subscribed filters (MQTT §3.8.4).
+            // Shared subscriptions are excluded per MQTT 5.0 §4.8.2.
             let subscribed_filters: Vec<&String> = sub
                 .topics
                 .iter()
                 .zip(reason_codes.iter())
-                .filter_map(|((filter, _), &rc)| if rc <= 0x02 { Some(filter) } else { None })
+                .filter_map(|((filter, _), &rc)| {
+                    if rc <= 0x02 && subscriptions::parse_shared_filter(filter).is_none() {
+                        Some(filter)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             if !subscribed_filters.is_empty() {
@@ -2483,8 +2506,8 @@ fn handle_mqtt_packet(
 
             // Optimization: skip all processing if no one is listening, not
             // retained, and no QoS 1 inbound mappings need durable tracking.
-            let subscriber_ids = subscriptions::match_topic(&pub_pkt.topic);
-            if !pub_pkt.retain && subscriber_ids.is_empty() && inbound_mapping_names.is_empty() {
+            let has_subs = subscriptions::has_subscribers(&pub_pkt.topic);
+            if !pub_pkt.retain && !has_subs && inbound_mapping_names.is_empty() {
                 if pub_pkt.qos == 1 {
                     if let Some(pid) = pub_pkt.packet_id {
                         log!(
@@ -2574,10 +2597,11 @@ fn publish_pending_messages(
 
     log!("pgmqtt: publishing {} messages to clients", messages.len());
 
+    let connected: std::collections::HashSet<String> = clients.keys().cloned().collect();
     let mut to_remove = Vec::new();
 
     for msg in &messages {
-        let subscriber_ids = subscriptions::match_topic(&msg.topic);
+        let subscriber_ids = subscriptions::match_topic(&msg.topic, &connected);
         if subscriber_ids.is_empty() {
             log!(
                 "pgmqtt: no subscribers for topic='{}' (active_filters={:?})",

@@ -12,7 +12,6 @@ CREATE EXTENSION IF NOT EXISTS pgmqtt;
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY DEFAULT 'job-' || substr(md5(random()::text), 1, 8),
     job_type TEXT NOT NULL,
-    worker_slot INT NOT NULL DEFAULT 0,
     payload JSONB DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'queued',
     result TEXT,
@@ -23,13 +22,9 @@ CREATE TABLE jobs (
 );
 ALTER TABLE jobs REPLICA IDENTITY FULL;
 
--- Assign worker slot on new job creation + auto-set timestamps on status transitions
+-- Auto-set timestamps on status transitions
 CREATE OR REPLACE FUNCTION job_timestamps() RETURNS TRIGGER AS $$
 BEGIN
-    -- Hash-based round-robin: deterministic 0/1 from the generated job ID
-    IF TG_OP = 'INSERT' AND NEW.status = 'queued' THEN
-        NEW.worker_slot = abs(hashtext(NEW.id)) % 2;
-    END IF;
     IF NEW.status = 'running' AND (OLD IS NULL OR OLD.status IS DISTINCT FROM 'running') THEN
         NEW.started_at = now();
     END IF;
@@ -123,11 +118,13 @@ SELECT pgmqtt_add_inbound_mapping(
 -- Outbound mapping (Postgres → MQTT via CDC)
 -- =============================================================================
 
--- Every change to jobs table is published; workers only act on status=queued
--- worker_slot (0 or 1) routes each job to exactly one worker per type
+-- Every change to jobs table is published; workers only act on status=queued.
+-- Workers use MQTT 5.0 shared subscriptions ($share/group/filter) for
+-- automatic round-robin — the broker delivers each job to exactly one
+-- idle worker per type, with no application-level routing needed.
 SELECT pgmqtt_add_outbound_mapping(
     'public',
     'jobs',
-    'jobs/{{ columns.job_type }}/{{ columns.worker_slot }}/pending',
+    'jobs/{{ columns.job_type }}/pending',
     '{{ columns | tojson }}'
 );

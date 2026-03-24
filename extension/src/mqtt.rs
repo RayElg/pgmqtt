@@ -780,6 +780,10 @@ pub fn build_disconnect(reason_code: u8) -> Vec<u8> {
 /// - `+` matches exactly one level
 /// - `#` matches zero or more levels (must be last)
 /// - `$`-prefixed topics don't match wildcard filters starting with `#` or `+`
+///
+/// Note: Shared subscription prefixes (`$share/{group}/`) are stripped by the
+/// subscriptions module before calling this function. This function is never
+/// invoked with a `$share/` prefix.
 pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
     // $-topics must not match filters starting with wildcard
     if topic.starts_with('$') {

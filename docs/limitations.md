@@ -61,6 +61,7 @@ Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
 | SUBSCRIBE / SUBACK | :white_check_mark: | [test_subscribe.py](tests/integration/test_subscribe.py) |
 | UNSUBSCRIBE / UNSUBACK | :white_check_mark: | [test_subscribe.py](tests/integration/test_subscribe.py) |
 | Wildcard subscriptions (`+`, `#`) | :white_check_mark: | [test_subscribe.py](tests/integration/test_subscribe.py) |
+| Shared subscriptions (`$share/`) | :white_check_mark: | [test_shared_subscriptions.py](tests/integration/test_shared_subscriptions.py) |
 | QoS downgrade (sub QoS < pub QoS) | :white_check_mark: | [test_qos0.py](tests/integration/test_qos0.py) |
 | No QoS upgrade | :white_check_mark: | [test_qos0.py](tests/integration/test_qos0.py) |
 | Packet ID wraparound | :white_check_mark: | [test_qos1.py](tests/integration/test_qos1.py) |

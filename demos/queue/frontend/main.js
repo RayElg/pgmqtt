@@ -102,9 +102,9 @@ client.on('connect', () => {
 client.on('message', (topic, payload) => {
     try {
         const data = JSON.parse(payload.toString());
-        // Dispatch: jobs/{type}/{slot}/pending  (4 segments)
-        // Started:  jobs/{job_id}/started       (3 segments)
-        // Result:   jobs/{job_id}/result         (3 segments)
+        // Dispatch: jobs/{type}/pending   (3 segments)
+        // Started:  jobs/{job_id}/started (3 segments)
+        // Result:   jobs/{job_id}/result  (3 segments)
         const parts = topic.split('/');
         const last = parts[parts.length - 1];
 
