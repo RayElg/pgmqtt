@@ -9,6 +9,7 @@
 
 use crate::mqtt;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -24,7 +25,7 @@ struct SharedGroup {
     /// Ordered member list for deterministic round-robin.
     member_order: Vec<String>,
     /// Round-robin counter (index into `member_order`).
-    rr_index: usize,
+    rr_index: Cell<usize>,
 }
 
 impl SharedGroup {
@@ -33,7 +34,7 @@ impl SharedGroup {
             filter,
             members: HashMap::new(),
             member_order: Vec::new(),
-            rr_index: 0,
+            rr_index: Cell::new(0),
         }
     }
 
@@ -47,8 +48,16 @@ impl SharedGroup {
         if self.members.remove(client_id).is_some() {
             if let Some(pos) = self.member_order.iter().position(|c| c == client_id) {
                 self.member_order.remove(pos);
-                if !self.member_order.is_empty() && self.rr_index >= self.member_order.len() {
-                    self.rr_index = 0;
+                let len = self.member_order.len();
+                if len == 0 {
+                    self.rr_index.set(0);
+                } else {
+                    let idx = self.rr_index.get();
+                    if pos < idx {
+                        self.rr_index.set(idx - 1);
+                    } else if idx >= len {
+                        self.rr_index.set(0);
+                    }
                 }
             }
             true
@@ -62,7 +71,7 @@ impl SharedGroup {
     }
 
     /// Select the next member via round-robin, preferring connected clients.
-    fn next_member<F>(&mut self, is_connected: F) -> Option<(String, u8)>
+    fn next_member<F>(&self, is_connected: F) -> Option<(String, u8)>
     where
         F: Fn(&str) -> bool,
     {
@@ -71,14 +80,14 @@ impl SharedGroup {
         }
 
         let len = self.member_order.len();
-        let start = self.rr_index % len;
+        let start = self.rr_index.get() % len;
 
         // First pass: try to find a connected client starting from rr_index.
         for i in 0..len {
             let idx = (start + i) % len;
             let cid = &self.member_order[idx];
             if is_connected(cid) {
-                self.rr_index = (idx + 1) % len;
+                self.rr_index.set((idx + 1) % len);
                 let qos = self.members[cid];
                 return Some((cid.clone(), qos));
             }
@@ -86,7 +95,7 @@ impl SharedGroup {
 
         // No connected member; fall back to any member (supports persistent sessions).
         let cid = &self.member_order[start];
-        self.rr_index = (start + 1) % len;
+        self.rr_index.set((start + 1) % len);
         let qos = self.members[cid];
         Some((cid.clone(), qos))
     }
@@ -102,7 +111,7 @@ struct SubState {
     /// client_id → set of topic_filters (reverse index for cleanup;
     /// stores the full wire string, including `$share/group/` prefix when applicable)
     client_to_filters: HashMap<String, HashSet<String>>,
-    /// group_name → SharedGroup
+    /// full wire filter (`$share/{group}/{filter}`) → SharedGroup
     shared_groups: HashMap<String, SharedGroup>,
 }
 
@@ -181,10 +190,10 @@ pub fn subscribe(client_id: &str, topic_filter: &str, requested_qos: u8) -> u8 {
 
         filters.insert(topic_filter.to_string());
 
-        if let Some((group, real_filter)) = parse_shared_filter(topic_filter) {
+        if let Some((_, real_filter)) = parse_shared_filter(topic_filter) {
             let sg = state
                 .shared_groups
-                .entry(group.to_string())
+                .entry(topic_filter.to_string())
                 .or_insert_with(|| SharedGroup::new(real_filter.to_string()));
             sg.add_member(client_id.to_string(), granted_qos);
         } else {
@@ -204,11 +213,11 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
     with_state(|state| {
         let mut removed = false;
 
-        if let Some((group, _)) = parse_shared_filter(topic_filter) {
-            if let Some(sg) = state.shared_groups.get_mut(group) {
+        if parse_shared_filter(topic_filter).is_some() {
+            if let Some(sg) = state.shared_groups.get_mut(topic_filter) {
                 removed = sg.remove_member(client_id);
                 if sg.is_empty() {
-                    state.shared_groups.remove(group);
+                    state.shared_groups.remove(topic_filter);
                 }
             }
         } else if let Some(clients) = state.filter_to_clients.get_mut(topic_filter) {
@@ -234,11 +243,11 @@ pub fn remove_client(client_id: &str) {
     with_state(|state| {
         if let Some(filters) = state.client_to_filters.remove(client_id) {
             for filter in filters {
-                if let Some((group, _)) = parse_shared_filter(&filter) {
-                    if let Some(sg) = state.shared_groups.get_mut(group) {
+                if parse_shared_filter(&filter).is_some() {
+                    if let Some(sg) = state.shared_groups.get_mut(filter.as_str()) {
                         sg.remove_member(client_id);
                         if sg.is_empty() {
-                            state.shared_groups.remove(group);
+                            state.shared_groups.remove(filter.as_str());
                         }
                     }
                 } else if let Some(clients) = state.filter_to_clients.get_mut(&filter) {
@@ -297,15 +306,8 @@ pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(Str
         }
 
         // Shared subscriptions: one client per matching group.
-        let matching_groups: Vec<String> = state
-            .shared_groups
-            .iter()
-            .filter(|(_, sg)| mqtt::topic_matches_filter(topic, &sg.filter))
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        for group_name in matching_groups {
-            if let Some(sg) = state.shared_groups.get_mut(&group_name) {
+        for sg in state.shared_groups.values() {
+            if mqtt::topic_matches_filter(topic, &sg.filter) {
                 if let Some((cid, qos)) = sg.next_member(|c| connected_clients.contains(c)) {
                     let entry = matched.entry(cid).or_insert(qos);
                     if qos > *entry {
@@ -323,9 +325,7 @@ pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(Str
 pub fn active_filters() -> Vec<String> {
     with_state(|state| {
         let mut filters: Vec<String> = state.filter_to_clients.keys().cloned().collect();
-        for (name, sg) in &state.shared_groups {
-            filters.push(format!("$share/{}/{}", name, sg.filter));
-        }
+        filters.extend(state.shared_groups.keys().cloned());
         filters
     })
 }
@@ -420,10 +420,10 @@ mod tests {
         let all = |_: &str| true;
         // Advance to b (rr_index = 1 after selecting a).
         assert_eq!(sg.next_member(&all), Some(("a".to_string(), 1)));
-        // Remove a. member_order = [b, c], rr_index should adjust.
+        // Remove a (pos 0 < rr_index 1). member_order = [b, c], rr_index decrements to 0.
         sg.remove_member("a");
         assert_eq!(sg.member_order, vec!["b", "c"]);
-        // Should continue from where we left off.
-        assert_eq!(sg.next_member(&all), Some(("c".to_string(), 1)));
+        // Should continue from the adjusted position (b, not skip to c).
+        assert_eq!(sg.next_member(&all), Some(("b".to_string(), 1)));
     }
 }
