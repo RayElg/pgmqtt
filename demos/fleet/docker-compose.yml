@@ -1,0 +1,59 @@
+services:
+  postgres:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgres
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+      - "1883:1883"
+      - "9001:9001"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "shared_preload_libraries=pgmqtt"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgrest:
+    image: postgrest/postgrest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://postgres:password@postgres:5432/postgres
+      PGRST_DB_ANON_ROLE: web_anon
+      PGRST_DB_SCHEMAS: public
+    ports:
+      - "3000:3000"
+
+  simulator:
+    build:
+      context: ./simulator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - postgrest
+      - simulator
