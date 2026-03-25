@@ -3,7 +3,9 @@ MQTT 5.0 Shared Subscription Tests ($share/{group}/{filter}).
 
 Covers round-robin delivery, mixed shared/regular subscriptions,
 QoS semantics, retained message exclusion, unsubscribe, session
-persistence, and malformed filter rejection.
+persistence, malformed filter rejection, group+filter identity (§4.8.2),
+duplicate-free delivery, topic name preservation, re-subscribe QoS update,
+mixed QoS members, and member rejoin after disconnect.
 """
 
 import socket
@@ -714,4 +716,325 @@ def test_shared_sub_qos_downgrade():
     assert p == b"downgraded"
 
     s_sub.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Same group name, different topic filters (§4.8.2: identified by group+filter)
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_same_group_different_filters():
+    """$share/g/topicA and $share/g/topicB are independent subscriptions.
+
+    MQTT 5.0 §4.8.2: a shared subscription is identified by the
+    (ShareName, TopicFilter) pair, not by the ShareName alone.
+    """
+    topic_a = "test/shared/sgdf/alpha"
+    topic_b = "test/shared/sgdf/beta"
+    filter_a = "$share/sgdf_grp/" + topic_a
+    filter_b = "$share/sgdf_grp/" + topic_b
+
+    s_a, _ = mqtt_connect("sgdf_a", clean_start=True)
+    s_b, _ = mqtt_connect("sgdf_b", clean_start=True)
+    mqtt_subscribe(s_a, 1, filter_a, qos=0)
+    mqtt_subscribe(s_b, 1, filter_b, qos=0)
+
+    s_pub, _ = mqtt_connect("sgdf_pub", clean_start=True)
+    s_pub.sendall(create_publish_packet(topic_a, b"for-a", qos=0))
+    s_pub.sendall(create_publish_packet(topic_b, b"for-b", qos=0))
+
+    msgs_a = collect_publishes(s_a, 2, timeout=3.0)
+    msgs_b = collect_publishes(s_b, 2, timeout=2.0)
+
+    # A should only get topic_a, B should only get topic_b.
+    assert len(msgs_a) == 1, f"A expected 1, got {len(msgs_a)}"
+    assert len(msgs_b) == 1, f"B expected 1, got {len(msgs_b)}"
+    assert msgs_a[0][0] == topic_a, f"A got wrong topic: {msgs_a[0][0]}"
+    assert msgs_b[0][0] == topic_b, f"B got wrong topic: {msgs_b[0][0]}"
+
+    s_a.close()
+    s_b.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# No duplicate delivery within a shared group
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_no_duplicate_payloads():
+    """Each message is delivered to exactly one group member — no duplicates.
+
+    Tracks payloads explicitly to ensure no message is delivered twice.
+    """
+    topic = "test/shared/nodup"
+    shared_filter = "$share/grp_nodup/" + topic
+    num_messages = 20
+
+    subs = []
+    for i in range(3):
+        s, _ = mqtt_connect(f"shnodup_{i}", clean_start=True)
+        mqtt_subscribe(s, 1, shared_filter, qos=0)
+        subs.append(s)
+
+    s_pub, _ = mqtt_connect("shnodup_pub", clean_start=True)
+    for i in range(num_messages):
+        s_pub.sendall(create_publish_packet(topic, f"u-{i}".encode(), qos=0))
+
+    all_payloads = []
+    for s in subs:
+        msgs = collect_publishes(s, num_messages, timeout=3.0)
+        all_payloads.extend(m[1] for m in msgs)  # m[1] = payload bytes
+
+    assert len(all_payloads) == num_messages, (
+        f"Expected {num_messages} total, got {len(all_payloads)}"
+    )
+    # Convert to set to check uniqueness.
+    unique = set(all_payloads)
+    assert len(unique) == num_messages, (
+        f"Duplicate payloads detected: {len(all_payloads)} delivered, {len(unique)} unique"
+    )
+
+    for s in subs:
+        s.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Topic name in PUBLISH is the original topic, not the $share/ filter
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_topic_name_preserved():
+    """PUBLISH delivered to shared subscriber must carry the original topic.
+
+    Per §4.8.2, the topic in the forwarded PUBLISH is the concrete
+    publish topic, not the $share/{group}/{filter} string.
+    """
+    topic = "test/shared/topicname"
+    shared_filter = "$share/grp_tn/" + topic
+
+    s_sub, _ = mqtt_connect("shtn_sub", clean_start=True)
+    mqtt_subscribe(s_sub, 1, shared_filter, qos=0)
+
+    s_pub, _ = mqtt_connect("shtn_pub", clean_start=True)
+    s_pub.sendall(create_publish_packet(topic, b"check-topic", qos=0))
+
+    msgs = collect_publishes(s_sub, 1, timeout=5.0)
+    assert len(msgs) == 1
+    received_topic = msgs[0][0]
+    assert received_topic == topic, (
+        f"Expected original topic '{topic}', got '{received_topic}'"
+    )
+    assert not received_topic.startswith("$share"), (
+        "Topic must not include the $share/ prefix"
+    )
+
+    s_sub.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Re-subscribe updates QoS without creating duplicate member
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_resubscribe_updates_qos():
+    """Re-subscribing to a shared group with a different QoS updates the grant.
+
+    The member must not be duplicated — message count must remain correct.
+    """
+    topic = "test/shared/resub"
+    shared_filter = "$share/grp_resub/" + topic
+
+    s_sub, _ = mqtt_connect("shresub_sub", clean_start=True)
+
+    # Subscribe at QoS 0, then re-subscribe at QoS 1.
+    rc0 = mqtt_subscribe(s_sub, 1, shared_filter, qos=0)
+    assert rc0 == ReasonCode.GRANTED_QOS_0
+    rc1 = mqtt_subscribe(s_sub, 2, shared_filter, qos=1)
+    assert rc1 == ReasonCode.GRANTED_QOS_1
+
+    # Publish QoS 1 — subscriber should receive at QoS 1 (upgraded grant).
+    s_pub, _ = mqtt_connect("shresub_pub", clean_start=True)
+    s_pub.sendall(create_publish_packet(topic, b"after-resub", qos=1, packet_id=1))
+    recv_packet(s_pub, timeout=5)  # PUBACK
+
+    pkt = recv_packet(s_sub, timeout=5)
+    assert pkt is not None
+    t, p, qos, dup, retain, pid, props = validate_publish(pkt)
+    assert qos == 1, f"Expected QoS 1 after re-subscribe, got {qos}"
+
+    # ACK it.
+    if pid is not None:
+        s_sub.sendall(create_puback_packet(pid))
+
+    # Verify no duplicate delivery (re-subscribe must not create a second member).
+    num_messages = 6
+    for i in range(num_messages):
+        pid = i + 10
+        s_pub.sendall(create_publish_packet(topic, f"rd-{i}".encode(), qos=1, packet_id=pid))
+        recv_packet(s_pub, timeout=5)
+
+    msgs = []
+    deadline = time.time() + 5
+    while len(msgs) < num_messages and time.time() < deadline:
+        pkt = recv_packet(s_sub, timeout=1.0)
+        if pkt is None:
+            continue
+        ptype = (pkt[0] & 0xF0) >> 4
+        if ptype == MQTTControlPacket.PUBLISH:
+            t, p, qos, dup, retain, pid, props = validate_publish(pkt)
+            msgs.append(p)
+            if qos == 1 and pid is not None:
+                s_sub.sendall(create_puback_packet(pid))
+
+    assert len(msgs) == num_messages, (
+        f"Single member should receive exactly {num_messages}, got {len(msgs)} "
+        "(duplicate member from re-subscribe?)"
+    )
+
+    s_sub.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Mixed QoS levels within a shared group
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_mixed_qos_members():
+    """Members at different QoS levels each receive at their granted QoS."""
+    topic = "test/shared/mixqos"
+    shared_filter = "$share/grp_mixqos/" + topic
+
+    s_q0, _ = mqtt_connect("shmixq_q0", clean_start=True)
+    s_q1, _ = mqtt_connect("shmixq_q1", clean_start=True)
+    rc0 = mqtt_subscribe(s_q0, 1, shared_filter, qos=0)
+    rc1 = mqtt_subscribe(s_q1, 1, shared_filter, qos=1)
+    assert rc0 == ReasonCode.GRANTED_QOS_0
+    assert rc1 == ReasonCode.GRANTED_QOS_1
+
+    # Publish several QoS 1 messages.
+    s_pub, _ = mqtt_connect("shmixq_pub", clean_start=True)
+    num_messages = 10
+    for i in range(num_messages):
+        pid = i + 1
+        s_pub.sendall(create_publish_packet(topic, f"mq-{i}".encode(), qos=1, packet_id=pid))
+        recv_packet(s_pub, timeout=5)
+
+    # Collect from both, ACKing QoS 1 messages.
+    msgs_q0 = []
+    msgs_q1 = []
+    deadline = time.time() + 10
+    while len(msgs_q0) + len(msgs_q1) < num_messages and time.time() < deadline:
+        for sock, msgs, expected_qos in [(s_q0, msgs_q0, 0), (s_q1, msgs_q1, 1)]:
+            pkt = recv_packet(sock, timeout=0.3)
+            if pkt is None:
+                continue
+            ptype = (pkt[0] & 0xF0) >> 4
+            if ptype == MQTTControlPacket.PUBLISH:
+                t, p, qos, dup, retain, pid, props = validate_publish(pkt)
+                msgs.append(qos)
+                if qos == 1 and pid is not None:
+                    sock.sendall(create_puback_packet(pid))
+
+    total = len(msgs_q0) + len(msgs_q1)
+    assert total == num_messages, (
+        f"Expected {num_messages} total, got {total}"
+    )
+
+    # Verify QoS levels: Q0 member should get QoS 0, Q1 member should get QoS 1.
+    for qos in msgs_q0:
+        assert qos == 0, f"QoS 0 member received QoS {qos}"
+    for qos in msgs_q1:
+        assert qos == 1, f"QoS 1 member received QoS {qos}"
+
+    # Both should have received at least 1 (round-robin).
+    assert len(msgs_q0) >= 1, "QoS 0 member got nothing"
+    assert len(msgs_q1) >= 1, "QoS 1 member got nothing"
+
+    s_q0.close()
+    s_q1.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Malformed: # wildcard in group name (§4.8.2)
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_malformed_hash_in_group():
+    """$share/gr#up/topic — multi-level wildcard in group name should be rejected."""
+    s, _ = mqtt_connect("shmal_hashgrp", clean_start=True)
+    s.sendall(create_subscribe_packet(1, "$share/gr#up/topic", qos=0))
+    raw = recv_packet(s, timeout=5)
+    assert raw is not None
+    rcs = validate_suback(raw, 1)
+    assert rcs[0] == ReasonCode.TOPIC_FILTER_INVALID, (
+        f"Expected TOPIC_FILTER_INVALID (0x8F), got {rcs[0]:#04x}"
+    )
+    s.close()
+
+
+# ---------------------------------------------------------------------------
+# Client with both shared and regular subscription on same topic
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_client_also_regular():
+    """A client subscribed to both $share/g/topic and topic receives the message."""
+    topic = "test/shared/dual"
+    shared_filter = "$share/grp_dual/" + topic
+
+    s_sub, _ = mqtt_connect("shdual_sub", clean_start=True)
+    mqtt_subscribe(s_sub, 1, shared_filter, qos=0)
+    mqtt_subscribe(s_sub, 2, topic, qos=0)
+
+    s_pub, _ = mqtt_connect("shdual_pub", clean_start=True)
+    s_pub.sendall(create_publish_packet(topic, b"dual-msg", qos=0))
+
+    # Client must receive at least one copy (the regular subscription guarantees it).
+    msgs = collect_publishes(s_sub, 2, timeout=3.0)
+    assert len(msgs) >= 1, "Client with regular sub must receive the message"
+    for m in msgs:
+        assert m[0] == topic
+
+    s_sub.close()
+    s_pub.close()
+
+
+# ---------------------------------------------------------------------------
+# Member rejoins after clean disconnect + clean_start reconnect
+# ---------------------------------------------------------------------------
+
+def test_shared_sub_rejoin_after_clean_disconnect():
+    """A member disconnects (session_expiry=0), reconnects, re-subscribes, and
+    participates in round-robin again."""
+    topic = "test/shared/rejoin"
+    shared_filter = "$share/grp_rejoin/" + topic
+
+    s_a, _ = mqtt_connect("shrejoin_a", clean_start=True)
+    s_b, _ = mqtt_connect("shrejoin_b", clean_start=True)
+    mqtt_subscribe(s_a, 1, shared_filter, qos=0)
+    mqtt_subscribe(s_b, 1, shared_filter, qos=0)
+
+    # Disconnect A cleanly.
+    s_a.sendall(create_disconnect_packet())
+    s_a.close()
+    time.sleep(0.5)
+
+    # Reconnect A with clean_start, re-subscribe.
+    s_a2, _ = mqtt_connect("shrejoin_a", clean_start=True)
+    mqtt_subscribe(s_a2, 1, shared_filter, qos=0)
+
+    # Publish and verify both participate.
+    s_pub, _ = mqtt_connect("shrejoin_pub", clean_start=True)
+    num_messages = 10
+    for i in range(num_messages):
+        s_pub.sendall(create_publish_packet(topic, f"rj-{i}".encode(), qos=0))
+
+    msgs_a = collect_publishes(s_a2, num_messages, timeout=5.0)
+    msgs_b = collect_publishes(s_b, num_messages, timeout=2.0)
+    total = len(msgs_a) + len(msgs_b)
+    assert total == num_messages, f"Expected {num_messages}, got {total}"
+    assert len(msgs_a) >= 1, "Rejoined A should receive messages"
+    assert len(msgs_b) >= 1, "B should still receive messages"
+
+    s_a2.close()
+    s_b.close()
     s_pub.close()
