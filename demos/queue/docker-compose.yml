@@ -40,17 +40,125 @@ services:
     ports:
       - "3000:3000"
 
-  workers:
+  # --- Job generator ---
+
+  generator:
     build:
       context: ./workers
+    command: ["node", "generator.js"]
     depends_on:
       postgres:
         condition: service_healthy
       postgrest:
         condition: service_started
     environment:
-      MQTT_URL: mqtt://postgres:1883
       API_URL: http://postgrest:3000
+
+  # --- Workers (2 per job type, each an independent MQTT client) ---
+
+  image-resize-1:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-001
+      WORKER_TYPE: image_resize
+      MIN_MS: "3000"
+      MAX_MS: "6000"
+
+  image-resize-2:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-002
+      WORKER_TYPE: image_resize
+      MIN_MS: "3000"
+      MAX_MS: "6000"
+
+  email-send-1:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-003
+      WORKER_TYPE: email_send
+      MIN_MS: "1000"
+      MAX_MS: "3000"
+
+  email-send-2:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-004
+      WORKER_TYPE: email_send
+      MIN_MS: "1000"
+      MAX_MS: "3000"
+
+  data-export-1:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-005
+      WORKER_TYPE: data_export
+      MIN_MS: "4000"
+      MAX_MS: "8000"
+
+  data-export-2:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-006
+      WORKER_TYPE: data_export
+      MIN_MS: "4000"
+      MAX_MS: "8000"
+
+  pdf-generate-1:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-007
+      WORKER_TYPE: pdf_generate
+      MIN_MS: "3000"
+      MAX_MS: "7000"
+
+  pdf-generate-2:
+    build:
+      context: ./workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://postgres:1883
+      WORKER_ID: W-008
+      WORKER_TYPE: pdf_generate
+      MIN_MS: "3000"
+      MAX_MS: "7000"
 
   frontend:
     build:
@@ -59,4 +167,4 @@ services:
       - "5173:5173"
     depends_on:
       - postgrest
-      - workers
+      - generator

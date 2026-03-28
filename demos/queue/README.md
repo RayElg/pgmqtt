@@ -33,8 +33,8 @@ flowchart LR
     B & G -- "POST /jobs" --> PR
     PR -- insert --> J
     J --> CDC
-    CDC -- "jobs/{type}/{slot}/pending" --> MQTT
-    MQTT --> W1 & W2 & W3 & W4
+    CDC -- "jobs/{type}/pending" --> MQTT
+    MQTT -- "$share/{type}_workers/..." --> W1 & W2 & W3 & W4
     W1 & W2 & W3 & W4 -- "jobs/{id}/started\njobs/{id}/result" --> MQTT
     MQTT --> IN
     IN -- upsert --> J
@@ -45,19 +45,19 @@ flowchart LR
     PR -- "GET /jobs\nGET /workers\nGET /queue_stats" --> B
 ```
 
-Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/{slot}/pending` — slot-based routing ensures exactly one worker per type handles each job. Workers claim the job and report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
+Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/pending`. Each worker is an independent process that joins a shared subscription group (`$share/{type}_workers/jobs/{type}/pending`) — the broker round-robins each job to exactly one worker per type. When a worker receives a job it immediately unsubscribes, processes the job, then resubscribes; this signals to the broker that it is unavailable, so in-flight jobs are never routed to a busy worker. Workers report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
 
 ## What it demonstrates
 
 | Feature | How it's used |
 |---|---|
-| **Outbound mapping (CDC)** | New job row → published to `jobs/{type}/{slot}/pending` with slot-based routing |
+| **Outbound mapping (CDC)** | New job row → published to `jobs/{type}/pending` |
 | **Inbound mapping (upsert)** | `jobs/{id}/started` → updates job status to running |
 | **Inbound mapping (upsert)** | `jobs/{id}/result` → updates job status to completed/failed |
 | **Inbound mapping (upsert)** | `workers/{id}/heartbeat` → device-twin in `workers` table |
 | **PostgREST** | Zero-code REST API for submitting jobs + serving dashboard data |
 | **Postgres views** | `queue_stats` computes live throughput, latency, and success rate |
-| **Hash-based routing** | `abs(hashtext(id)) % 2` assigns each job to a worker slot for fan-out |
+| **Shared subscriptions** | `$share/{type}_workers/...` — broker-native round-robin, no app-level routing |
 
 ## Running
 
@@ -72,5 +72,9 @@ open http://localhost:5173
 |---|---|
 | `postgres` | PostgreSQL + pgmqtt (embedded MQTT broker, inbound/outbound mappings) |
 | `postgrest` | Auto-generated REST API from Postgres schema |
-| `workers` | 8 MQTT workers (2 per job type), auto-generate jobs for demo |
+| `generator` | Submits jobs in a loop via PostgREST |
+| `image-resize-{1,2}` | Workers for `image_resize` jobs — each an independent MQTT client |
+| `email-send-{1,2}` | Workers for `email_send` jobs |
+| `data-export-{1,2}` | Workers for `data_export` jobs |
+| `pdf-generate-{1,2}` | Workers for `pdf_generate` jobs |
 | `frontend` | Vite + Chart.js dashboard with live MQTT feed |
