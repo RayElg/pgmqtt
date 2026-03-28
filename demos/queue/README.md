@@ -45,7 +45,7 @@ flowchart LR
     PR -- "GET /jobs\nGET /workers\nGET /queue_stats" --> B
 ```
 
-Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/pending`. Workers subscribe via MQTT 5.0 **shared subscriptions** (`$share/{type}_workers/jobs/{type}/pending`) — the broker automatically round-robins each job to exactly one worker per type. Workers claim the job and report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
+Jobs are **POST**ed via REST and stored as rows in the `jobs` table. **pgmqtt** outbound CDC publishes each new row to `jobs/{type}/pending`. Each worker is an independent process that joins a shared subscription group (`$share/{type}_workers/jobs/{type}/pending`) — the broker round-robins each job to exactly one worker per type. When a worker receives a job it immediately unsubscribes, processes the job, then resubscribes; this signals to the broker that it is unavailable, so in-flight jobs are never routed to a busy worker. Workers report results back over MQTT, and **inbound mappings** upsert the status updates back into the same row. Worker heartbeats maintain a device-twin `workers` table. No Redis, no RabbitMQ, no application server.
 
 ## What it demonstrates
 
@@ -72,5 +72,9 @@ open http://localhost:5173
 |---|---|
 | `postgres` | PostgreSQL + pgmqtt (embedded MQTT broker, inbound/outbound mappings) |
 | `postgrest` | Auto-generated REST API from Postgres schema |
-| `workers` | 8 MQTT workers (2 per job type), auto-generate jobs for demo |
+| `generator` | Submits jobs in a loop via PostgREST |
+| `image-resize-{1,2}` | Workers for `image_resize` jobs — each an independent MQTT client |
+| `email-send-{1,2}` | Workers for `email_send` jobs |
+| `data-export-{1,2}` | Workers for `data_export` jobs |
+| `pdf-generate-{1,2}` | Workers for `pdf_generate` jobs |
 | `frontend` | Vite + Chart.js dashboard with live MQTT feed |
