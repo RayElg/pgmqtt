@@ -4,13 +4,13 @@ pub mod db_action;
 pub mod session;
 pub mod transport;
 
-pub use db_action::{execute_session_db_actions, SessionDbAction};
-pub use session::{with_sessions, MqttSession};
-pub use transport::Transport;
 use crate::inbound_map;
 use crate::mqtt;
 use crate::subscriptions;
 use crate::topic_buffer;
+pub use db_action::{execute_session_db_actions, SessionDbAction};
+pub use session::{with_sessions, MqttSession};
+pub use transport::Transport;
 
 use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
@@ -283,7 +283,9 @@ fn load_inbound_mappings() {
                 .unwrap_or(0);
 
             {
-                let mut cached = INBOUND_XMIN_FINGERPRINT.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cached = INBOUND_XMIN_FINGERPRINT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(prev) = *cached {
                     if prev == current_fingerprint {
                         return Ok::<_, pgrx::spi::Error>(()); // no change
@@ -301,20 +303,53 @@ fn load_inbound_mappings() {
                 &[],
             ) {
                 for row in table {
-                    let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
-                    let tp: String = row.get_by_name("topic_pattern").ok().flatten().unwrap_or_default();
-                    let ts: String = row.get_by_name("target_schema").ok().flatten().unwrap_or_else(|| "public".to_string());
-                    let tt: String = row.get_by_name("target_table").ok().flatten().unwrap_or_default();
-                    let cm_str: String = row.get_by_name("column_map").ok().flatten().unwrap_or_else(|| "{}".to_string());
-                    let op_str: String = row.get_by_name("op").ok().flatten().unwrap_or_else(|| "insert".to_string());
-                    let cc: Option<Vec<String>> = row.get_by_name("conflict_columns").ok().flatten();
-                    let tmpl_type: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jsonpath".to_string());
+                    let mn: String = row
+                        .get_by_name("mapping_name")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let tp: String = row
+                        .get_by_name("topic_pattern")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let ts: String = row
+                        .get_by_name("target_schema")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "public".to_string());
+                    let tt: String = row
+                        .get_by_name("target_table")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let cm_str: String = row
+                        .get_by_name("column_map")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "{}".to_string());
+                    let op_str: String = row
+                        .get_by_name("op")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "insert".to_string());
+                    let cc: Option<Vec<String>> =
+                        row.get_by_name("conflict_columns").ok().flatten();
+                    let tmpl_type: String = row
+                        .get_by_name("template_type")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "jsonpath".to_string());
 
                     // Parse the mapping at load time
                     let segments = match inbound_map::parse_pattern(&tp) {
                         Ok(s) => s,
                         Err(e) => {
-                            log!("pgmqtt: skipping inbound mapping '{}': invalid pattern: {}", mn, e);
+                            log!(
+                                "pgmqtt: skipping inbound mapping '{}': invalid pattern: {}",
+                                mn,
+                                e
+                            );
                             continue;
                         }
                     };
@@ -351,7 +386,12 @@ fn load_inbound_mappings() {
                             match inbound_map::parse_column_source(expr) {
                                 Ok(s) => parsed_columns.push((col_name.clone(), s)),
                                 Err(e) => {
-                                    log!("pgmqtt: skipping inbound mapping '{}': column '{}': {}", mn, col_name, e);
+                                    log!(
+                                        "pgmqtt: skipping inbound mapping '{}': column '{}': {}",
+                                        mn,
+                                        col_name,
+                                        e
+                                    );
                                     parse_ok = false;
                                     break;
                                 }
@@ -362,7 +402,8 @@ fn load_inbound_mappings() {
                         continue;
                     }
 
-                    let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
+                    let col_names: Vec<String> =
+                        parsed_columns.iter().map(|(n, _)| n.clone()).collect();
 
                     // Look up column types for typed placeholder casts (single query via JOIN)
                     let qualified_name = format!(
@@ -461,7 +502,8 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     for write in &writes {
         let ok: bool = BackgroundWorker::transaction(|| {
             pgrx::spi::Spi::connect_mut(|client| {
-                let spi_args: Vec<pgrx::datum::DatumWithOid> = write.args
+                let spi_args: Vec<pgrx::datum::DatumWithOid> = write
+                    .args
                     .iter()
                     .map(|a| {
                         let opt: Option<&str> = a.as_deref();
@@ -525,8 +567,13 @@ fn process_inbound_pending() {
             ) {
                 for row in table {
                     let message_id: i64 = row.get_by_name("message_id").ok().flatten().unwrap_or(0);
-                    let mapping_name: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
-                    let retry_count: i32 = row.get_by_name("retry_count").ok().flatten().unwrap_or(0);
+                    let mapping_name: String = row
+                        .get_by_name("mapping_name")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let retry_count: i32 =
+                        row.get_by_name("retry_count").ok().flatten().unwrap_or(0);
                     let topic: String = row.get_by_name("topic").ok().flatten().unwrap_or_default();
                     let payload: Option<Vec<u8>> = row.get_by_name("payload").ok().flatten();
                     out.push(PendingRow {
@@ -550,7 +597,8 @@ fn process_inbound_pending() {
     // Step 2: process each row in its own transaction
     for pending in &rows {
         let matches = inbound_map::try_match(&pending.topic, &pending.payload);
-        let target_match = matches.into_iter()
+        let target_match = matches
+            .into_iter()
             .find(|(_, m)| m.mapping_name.as_ref() == pending.mapping_name);
 
         match target_match {
@@ -558,7 +606,8 @@ fn process_inbound_pending() {
                 // Attempt the table write
                 let write_ok = BackgroundWorker::transaction(|| {
                     pgrx::spi::Spi::connect_mut(|client| {
-                        let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result.values
+                        let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result
+                            .values
                             .iter()
                             .map(|a| {
                                 let opt: Option<&str> = a.as_deref();
@@ -572,7 +621,10 @@ fn process_inbound_pending() {
                             "DELETE FROM pgmqtt_inbound_pending \
                              WHERE message_id = $1 AND mapping_name = $2",
                             None,
-                            &[pending.message_id.into(), pending.mapping_name.as_str().into()],
+                            &[
+                                pending.message_id.into(),
+                                pending.mapping_name.as_str().into(),
+                            ],
                         )?;
                         client.update(
                             "DELETE FROM pgmqtt_messages \
@@ -595,9 +647,15 @@ fn process_inbound_pending() {
                         );
                     }
                     Err(e) => {
-                        handle_inbound_failure(pending.message_id, &pending.mapping_name,
-                            pending.retry_count, &e, MAX_RETRIES,
-                            &pending.topic, &pending.payload);
+                        handle_inbound_failure(
+                            pending.message_id,
+                            &pending.mapping_name,
+                            pending.retry_count,
+                            &e,
+                            MAX_RETRIES,
+                            &pending.topic,
+                            &pending.payload,
+                        );
                     }
                 }
             }
@@ -605,9 +663,12 @@ fn process_inbound_pending() {
                 // Mapping was removed since the message was published —
                 // dead-letter immediately (not retryable).
                 dead_letter_inbound(
-                    pending.message_id, &pending.mapping_name,
-                    pending.retry_count, "mapping no longer exists",
-                    &pending.topic, &pending.payload,
+                    pending.message_id,
+                    &pending.mapping_name,
+                    pending.retry_count,
+                    "mapping no longer exists",
+                    &pending.topic,
+                    &pending.payload,
                 );
             }
         }
@@ -631,12 +692,21 @@ fn handle_inbound_failure(
 
     if !retryable || retry_count >= max_retries {
         dead_letter_inbound(
-            message_id, mapping_name, retry_count, &error_msg, topic, payload,
+            message_id,
+            mapping_name,
+            retry_count,
+            &error_msg,
+            topic,
+            payload,
         );
     } else {
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
-            retry_count + 1, max_retries, message_id, mapping_name, error_msg
+            retry_count + 1,
+            max_retries,
+            message_id,
+            mapping_name,
+            error_msg
         );
         BackgroundWorker::transaction(|| {
             let _ = pgrx::spi::Spi::connect_mut(|client| {
@@ -672,11 +742,17 @@ fn dead_letter_inbound(
 ) {
     log!(
         "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
-        message_id, mapping_name, error_msg
+        message_id,
+        mapping_name,
+        error_msg
     );
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
-            let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
+            let payload_arg: Option<&[u8]> = if payload.is_empty() {
+                None
+            } else {
+                Some(payload)
+            };
             client.update(
                 "INSERT INTO pgmqtt_dead_letters \
                     (original_message_id, topic, payload, mapping_name, error_message, retry_count) \
@@ -783,7 +859,9 @@ pub fn run_http(port: u16) {
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt http: SIGHUP received");
-            unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
+            unsafe {
+                pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
+            }
         }
         drain_http_connections(&listener);
     }
@@ -1001,7 +1079,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt mqtt+cdc: SIGHUP received");
-            unsafe { pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP); }
+            unsafe {
+                pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
+            }
         }
 
         // Reload inbound mappings every tick for synchronous pickup (~80ms)
@@ -1043,11 +1123,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         cdc_tick(slot_name);
 
         // Send pending messages to clients
-        publish_pending_messages(
-            &mut clients,
-            &mut publishes,
-            &mut session_db_actions,
-        );
+        publish_pending_messages(&mut clients, &mut publishes, &mut session_db_actions);
 
         // Periodically resend unacked QoS 1 messages
         redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
@@ -1062,7 +1138,6 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
         // Execute all collected session DB actions in one transaction
         execute_session_db_actions(session_db_actions);
-
     }
 
     // Graceful shutdown: send DISCONNECT to all clients, fire will messages,
@@ -1073,9 +1148,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
-        let _ = client.transport.write_all(
-            &mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN),
-        );
+        let _ = client
+            .transport
+            .write_all(&mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN));
 
         // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
         // The client did NOT send a normal DISCONNECT, so the will fires.
@@ -1209,16 +1284,44 @@ fn cdc_tick(slot_name: &str) {
                     &[],
                 ) {
                     for row in table {
-                        let s: String = row.get_by_name("schema_name").ok().flatten().unwrap_or_default();
-                        let t: String = row.get_by_name("table_name").ok().flatten().unwrap_or_default();
-                        let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_else(|| "default".to_string());
-                        let tt: String = row.get_by_name("topic_template").ok().flatten().unwrap_or_default();
-                        let pt: String = row.get_by_name("payload_template").ok().flatten().unwrap_or_default();
+                        let s: String = row
+                            .get_by_name("schema_name")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let t: String = row
+                            .get_by_name("table_name")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let mn: String = row
+                            .get_by_name("mapping_name")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "default".to_string());
+                        let tt: String = row
+                            .get_by_name("topic_template")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let pt: String = row
+                            .get_by_name("payload_template")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                        let tmpl: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jinja2".to_string());
+                        let tmpl: String = row
+                            .get_by_name("template_type")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "jinja2".to_string());
                         rows.push(topic_map::TopicMapping {
-                            name: mn, schema: s, table: t,
-                            topic_template: tt, payload_template: pt, qos: q as u8,
+                            name: mn,
+                            schema: s,
+                            table: t,
+                            topic_template: tt,
+                            payload_template: pt,
+                            qos: q as u8,
                             template_type: tmpl,
                         });
                     }
@@ -1227,7 +1330,10 @@ fn cdc_tick(slot_name: &str) {
             }) {
                 let count = mappings.len();
                 topic_map::set_mappings(mappings);
-                log!("pgmqtt: loaded {} topic mappings from slot checkpoint", count);
+                log!(
+                    "pgmqtt: loaded {} topic mappings from slot checkpoint",
+                    count
+                );
             }
         });
     }
@@ -1242,8 +1348,8 @@ fn cdc_tick(slot_name: &str) {
     // topic_buffer::push is called ONLY after the transaction commits so that
     // messages never enter the delivery queue before they are durably persisted.
     loop {
-        let (to_publish, batch_count, batch_ok) =
-            BackgroundWorker::transaction(|| -> (Vec<topic_buffer::MqttMessage>, usize, bool) {
+        let (to_publish, batch_count, batch_ok) = BackgroundWorker::transaction(
+            || -> (Vec<topic_buffer::MqttMessage>, usize, bool) {
                 let mut to_publish: Vec<topic_buffer::MqttMessage> = Vec::new();
                 let mut batch_count: usize = 0;
 
@@ -1356,7 +1462,10 @@ fn cdc_tick(slot_name: &str) {
 
                         ring_buffer::RingEvent::Data(change) => {
                             let rendered_messages = topic_map::render(
-                                &change.schema, &change.table, change.op, &change.columns,
+                                &change.schema,
+                                &change.table,
+                                change.op,
+                                &change.columns,
                             );
 
                             if rendered_messages.is_empty() {
@@ -1464,7 +1573,8 @@ fn cdc_tick(slot_name: &str) {
                 }
 
                 (to_publish, batch_count, true)
-            });
+            },
+        );
         // ↑ COMMIT: slot LSN advances IFF all QOS ≥ 1 inserts committed.
         //   batch_ok=false means the transaction rolled back; slot unchanged.
 
@@ -1536,7 +1646,11 @@ fn accept_wss_connections(
                 let conn = match rustls::ServerConnection::new(tls_config.clone()) {
                     Ok(c) => c,
                     Err(e) => {
-                        log!("pgmqtt wss: failed to create TLS session for {}: {}", addr, e);
+                        log!(
+                            "pgmqtt wss: failed to create TLS session for {}: {}",
+                            addr,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -1546,7 +1660,12 @@ fn accept_wss_connections(
                     Ok((leftover, ws_jwt)) => {
                         log!("pgmqtt wss: WSS upgrade complete for {}", addr);
                         let ws = websocket::WsStream::new(tls_stream, leftover);
-                        handle_new_connection(Transport::Wss(ws), ws_jwt, clients, session_db_actions);
+                        handle_new_connection(
+                            Transport::Wss(ws),
+                            ws_jwt,
+                            clients,
+                            session_db_actions,
+                        );
                     }
                     Err(e) => {
                         log!("pgmqtt wss: upgrade failed for {}: {}", addr, e);
@@ -1602,7 +1721,12 @@ fn accept_ws_connections(
                     Ok((leftover, ws_jwt)) => {
                         log!("pgmqtt ws: WebSocket upgrade complete for {}", addr);
                         let ws = websocket::WsStream::new(stream, leftover);
-                        handle_new_connection(Transport::Ws(ws), ws_jwt, clients, session_db_actions);
+                        handle_new_connection(
+                            Transport::Ws(ws),
+                            ws_jwt,
+                            clients,
+                            session_db_actions,
+                        );
                     }
                     Err(e) => {
                         log!("pgmqtt ws: upgrade failed for {}: {}", addr, e);
@@ -1719,7 +1843,10 @@ fn finish_connect(
                                 jwt_cid,
                                 client_id
                             );
-                            let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                            let _ = transport.write_all(&mqtt::build_connack(
+                                false,
+                                mqtt::reason::NOT_AUTHORIZED,
+                            ));
                             return;
                         }
                     }
@@ -1728,24 +1855,34 @@ fn finish_connect(
                     log!("pgmqtt mqtt: JWT validated for '{}'", client_id);
                 }
                 Err(e) => {
-                    log!("pgmqtt mqtt: JWT validation failed for '{}': {}", client_id, e);
+                    log!(
+                        "pgmqtt mqtt: JWT validation failed for '{}': {}",
+                        client_id,
+                        e
+                    );
                     if jwt_required {
-                        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                        let _ = transport
+                            .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
                         return;
                     }
                 }
             },
             (None, _) => {
                 if jwt_required {
-                    log!("pgmqtt mqtt: JWT required but no token provided for '{}'", client_id);
-                    let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                    log!(
+                        "pgmqtt mqtt: JWT required but no token provided for '{}'",
+                        client_id
+                    );
+                    let _ = transport
+                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
                     return;
                 }
             }
             (_, None) => {
                 log!("pgmqtt mqtt: failed to parse JWT public key GUC");
                 if jwt_required {
-                    let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                    let _ = transport
+                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
                     return;
                 }
             }
@@ -1816,7 +1953,13 @@ fn finish_connect(
     // Set non-blocking for ongoing reads
     let _ = transport.set_nonblocking(true);
     log!("pgmqtt mqtt: client '{}' ready for polling", client_id);
-    let mut mqtt_client = MqttClient::new(transport, client_id.clone(), packet.will, packet.keep_alive, packet.receive_maximum);
+    let mut mqtt_client = MqttClient::new(
+        transport,
+        client_id.clone(),
+        packet.will,
+        packet.keep_alive,
+        packet.receive_maximum,
+    );
     mqtt_client.sub_claims = jwt_sub_claims;
     mqtt_client.pub_claims = jwt_pub_claims;
     clients.insert(client_id.clone(), mqtt_client);
@@ -1837,7 +1980,8 @@ fn finish_connect(
                     *sent_at = std::time::Instant::now();
                 }
                 // 2. Drain the pending queue into inflight and add to send list.
-                let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
+                let inflight_limit =
+                    std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
                 while session.inflight.len() < inflight_limit {
                     if let Some(queued) = session.queue.pop_front() {
                         let pid = session.next_packet_id;
@@ -2009,7 +2153,13 @@ fn poll_mqtt_clients(
 
             match mqtt::parse_packet(&pkt_data) {
                 Ok((packet, _)) => {
-                    if !handle_mqtt_packet(client, packet, pending_publishes, session_db_actions, pending_inbound_writes) {
+                    if !handle_mqtt_packet(
+                        client,
+                        packet,
+                        pending_publishes,
+                        session_db_actions,
+                        pending_inbound_writes,
+                    ) {
                         to_remove.push(client_id.clone());
                         break;
                     }
@@ -2230,7 +2380,8 @@ fn handle_mqtt_packet(
             // Slot freed — promote next queued message into inflight (if within receive_maximum).
             let (next_pkt, db_action) = with_sessions(|sessions| {
                 if let Some(session) = sessions.get_mut(&client_id) {
-                    let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
+                    let inflight_limit =
+                        std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
                     // Only promote if there's space and a queued message
                     if session.inflight.len() < inflight_limit && !session.queue.is_empty() {
                         if let Some(queued) = session.queue.pop_front() {
@@ -2283,10 +2434,8 @@ fn handle_mqtt_packet(
         mqtt::InboundPacket::Subscribe(sub) => {
             let mut reason_codes = Vec::with_capacity(sub.topics.len());
             for (topic_filter, requested_qos) in &sub.topics {
-                // Validate shared subscription syntax.
-                if topic_filter.starts_with("$share/")
-                    && subscriptions::parse_shared_filter(topic_filter).is_none()
-                {
+                let shared = subscriptions::parse_shared_filter(topic_filter);
+                if topic_filter.starts_with("$share/") && shared.is_none() {
                     log!(
                         "pgmqtt mqtt: '{}' malformed shared subscription '{}'",
                         client_id,
@@ -2297,13 +2446,14 @@ fn handle_mqtt_packet(
                 }
 
                 // JWT subscribe authorization — use the real filter for shared subs.
-                let auth_filter = subscriptions::parse_shared_filter(topic_filter)
-                    .map(|(_, f)| f)
-                    .unwrap_or(topic_filter.as_str());
+                let auth_filter = shared.map(|(_, f)| f).unwrap_or(topic_filter.as_str());
                 let jwt_authorized = if client.sub_claims.is_empty() {
                     true
                 } else {
-                    client.sub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(auth_filter, claim))
+                    client
+                        .sub_claims
+                        .iter()
+                        .any(|claim| crate::mqtt::topic_matches_filter(auth_filter, claim))
                 };
 
                 if !jwt_authorized {
@@ -2449,7 +2599,10 @@ fn handle_mqtt_packet(
         mqtt::InboundPacket::Publish(pub_pkt) => {
             // JWT publish authorization
             if !client.pub_claims.is_empty() {
-                let authorized = client.pub_claims.iter().any(|claim| crate::mqtt::topic_matches_filter(&pub_pkt.topic, claim));
+                let authorized = client
+                    .pub_claims
+                    .iter()
+                    .any(|claim| crate::mqtt::topic_matches_filter(&pub_pkt.topic, claim));
                 if !authorized {
                     log!(
                         "pgmqtt mqtt: '{}' not authorized to publish to '{}'",
@@ -2476,13 +2629,17 @@ fn handle_mqtt_packet(
             }
 
             // Validate topic name: MQTT §4.7.3 prohibits wildcards in PUBLISH; §1.5.3 prohibits null chars
-            if pub_pkt.topic.contains('\0') || pub_pkt.topic.contains('+') || pub_pkt.topic.contains('#') {
+            if pub_pkt.topic.contains('\0')
+                || pub_pkt.topic.contains('+')
+                || pub_pkt.topic.contains('#')
+            {
                 log!(
                     "pgmqtt mqtt: '{}' published to invalid topic '{}' — disconnecting",
                     client_id,
                     pub_pkt.topic
                 );
-                let _ = transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID));
+                let _ =
+                    transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID));
                 return false;
             }
 
@@ -2614,7 +2771,10 @@ fn publish_pending_messages(
         let mut batch_entries: Vec<(String, Option<u16>)> = Vec::new();
 
         for (sub_id, granted_qos) in &subscriber_ids {
-            let receive_maximum = clients.get(sub_id).map(|c| c.receive_maximum).unwrap_or(65535);
+            let receive_maximum = clients
+                .get(sub_id)
+                .map(|c| c.receive_maximum)
+                .unwrap_or(65535);
             let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, receive_maximum as usize);
 
             enum DbAction {
@@ -2819,7 +2979,9 @@ fn parse_jwt_public_key(key_str: &str) -> Option<[u8; 32]> {
             .filter(|l| !l.starts_with("-----"))
             .collect::<Vec<_>>()
             .join("");
-        let der = base64::engine::general_purpose::STANDARD.decode(&body).ok()?;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .ok()?;
         // Ed25519 SubjectPublicKeyInfo: last 32 bytes are the raw key
         if der.len() < 32 {
             return None;
@@ -2851,7 +3013,7 @@ struct JwtClaims {
 /// Validate a JWT token using an Ed25519 public key.
 /// Returns Ok(JwtClaims) on success, Err on failure.
 fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, String> {
-    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() != 3 {
@@ -2866,33 +3028,37 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
         .map_err(|_| "bad payload base64".to_string())?;
 
     // Decode signature
-    let sig_bytes = crate::license::base64_url_decode(sig_b64)
-        .map_err(|_| "bad sig base64".to_string())?;
+    let sig_bytes =
+        crate::license::base64_url_decode(sig_b64).map_err(|_| "bad sig base64".to_string())?;
 
     if sig_bytes.len() != 64 {
         return Err("signature must be 64 bytes".into());
     }
-    let sig_arr: [u8; 64] = sig_bytes.try_into()
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
         .expect("unreachable: length already checked to be exactly 64");
     let signature = Signature::from_bytes(&sig_arr);
 
     // Verify signature over "header.payload" (slice the original token to avoid allocation)
-    let last_dot = token.rfind('.')
+    let last_dot = token
+        .rfind('.')
         .expect("unreachable: token already confirmed to have 3 dot-separated parts");
     let signed_data = &token[..last_dot];
-    let verifying_key = VerifyingKey::from_bytes(pubkey_bytes)
-        .map_err(|e| format!("bad public key: {}", e))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(pubkey_bytes).map_err(|e| format!("bad public key: {}", e))?;
     verifying_key
         .verify(signed_data.as_bytes(), &signature)
         .map_err(|_| "signature verification failed".to_string())?;
 
     // Parse payload JSON
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("bad payload JSON: {}", e))?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|e| format!("bad payload JSON: {}", e))?;
 
     // Check exp claim (mandatory)
     let now = crate::license::now_secs();
-    let exp = payload.get("exp").and_then(|v| v.as_i64())
+    let exp = payload
+        .get("exp")
+        .and_then(|v| v.as_i64())
         .ok_or_else(|| "missing or invalid exp claim".to_string())?;
     if now > exp {
         return Err("token expired".into());
@@ -2925,7 +3091,11 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
         })
         .unwrap_or_default();
 
-    Ok(JwtClaims { client_id, sub_claims, pub_claims })
+    Ok(JwtClaims {
+        client_id,
+        sub_claims,
+        pub_claims,
+    })
 }
 #[cfg(test)]
 mod tests {
