@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [15, 16, 17]
+        pg: [15, 16, 17, 18]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [15, 16, 17]
+        pg: [15, 16, 17, 18]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -203,6 +203,8 @@ jobs:
           | `pgmqtt-pg16-arm64.tar.gz` | 16.x | aarch64 |
           | `pgmqtt-pg17-amd64.tar.gz` | 17.x | x86_64 |
           | `pgmqtt-pg17-arm64.tar.gz` | 17.x | aarch64 |
+          | `pgmqtt-pg18-amd64.tar.gz` | 18.x | x86_64 |
+          | `pgmqtt-pg18-arm64.tar.gz` | 18.x | aarch64 |
 
           All artifacts have been tested via CI before release.
           NOTES
