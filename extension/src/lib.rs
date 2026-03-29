@@ -1083,7 +1083,10 @@ unsafe fn extract_columns(
     let heap_tuple = &heap_tuple_data;
 
     for i in 0..natts {
+        #[cfg(feature = "pg18")]
         let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        #[cfg(not(feature = "pg18"))]
+        let attr = &(*tupdesc).attrs.as_slice(natts)[i];
 
         // Skip dropped columns
         if attr.attisdropped {
