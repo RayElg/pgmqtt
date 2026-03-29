@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'          # e.g. 0.1.0, 1.2.3
+      - '[0-9]+.[0-9]+.[0-9]+-*'        # e.g. 0.1.0-rc1
+
+permissions:
+  contents: write     # needed to create releases
+
+jobs:
+  # ─── Stage 1: Build tarballs ───────────────────────────────────────────
+  build:
+    name: Build PG ${{ matrix.pg }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build extension for PG ${{ matrix.pg }} / ${{ matrix.arch }}
+        run: |
+          ARCH=${{ matrix.arch }} ./scripts/build_package.sh ${{ matrix.pg }}
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgmqtt-pg${{ matrix.pg }}-${{ matrix.arch }}
+          path: scripts/dist/pgmqtt-pg${{ matrix.pg }}-${{ matrix.arch }}.tar.gz
+          retention-days: 5
+
+  # ─── Stage 2: Test each tarball ────────────────────────────────────────
+  test:
+    name: Test PG ${{ matrix.pg }} / ${{ matrix.arch }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: pgmqtt-pg${{ matrix.pg }}-${{ matrix.arch }}
+          path: artifacts/
+
+      - name: Extract tarball into install-artifacts
+        run: |
+          mkdir -p docker/install-artifacts
+          tar xzf artifacts/pgmqtt-pg${{ matrix.pg }}-${{ matrix.arch }}.tar.gz -C docker/install-artifacts
+
+      - name: Build install-test image
+        run: |
+          docker build \
+            --build-arg PG_MAJOR=${{ matrix.pg }} \
+            --build-arg ARCH=${{ matrix.arch }} \
+            -f docker/Dockerfile.install-test \
+            -t pgmqtt-install-test-pg${{ matrix.pg }} \
+            docker/
+
+      - name: Start Postgres from tarball
+        run: |
+          docker run -d --name pgmqtt-test \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 -p 1883:1883 -p 8080:8080 \
+            pgmqtt-install-test-pg${{ matrix.pg }}
+
+      - name: Wait for Postgres to be ready
+        run: |
+          timeout 120 bash -c '
+            until docker exec pgmqtt-test pg_isready -U postgres 2>/dev/null; do
+              echo "Waiting for Postgres..."
+              sleep 2
+            done
+          '
+
+      - name: Smoke test — extension is loaded
+        run: |
+          docker exec pgmqtt-test \
+            psql -U postgres -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pgmqtt';" \
+            | tee /dev/stderr | grep -q pgmqtt
+
+      - name: Smoke test — MQTT listener is up
+        run: |
+          timeout 30 bash -c '
+            until nc -z localhost 1883; do
+              echo "Waiting for MQTT port 1883..."
+              sleep 1
+            done
+          '
+          echo "✓ MQTT port 1883 is accepting connections"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-timeout paho-mqtt psycopg2-binary
+
+      - name: Run integration tests against tarball install
+        timeout-minutes: 15
+        run: |
+          python -m pytest tests/integration/ -m "not slow" --timeout=60 -v
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs pgmqtt-test
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgmqtt-test || true
+
+  # ─── Stage 3: Create GitHub Release ────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+          merge-multiple: false
+
+      - name: Collect tarballs
+        run: |
+          mkdir -p release-files
+          find release-artifacts -name '*.tar.gz' -exec cp {} release-files/ \;
+          echo "## Release files:"
+          ls -lh release-files/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cat > release-notes.md << 'NOTES'
+          ## pgmqtt $TAG
+
+          ### Installation
+
+          1. Download the tarball for your PostgreSQL version and architecture
+          2. Extract it:
+             ```bash
+             tar xzf pgmqtt-pg16-amd64.tar.gz
+             ```
+          3. Copy the files into your PostgreSQL installation:
+             ```bash
+             cp pgmqtt-pg16-amd64/lib/pgmqtt.so   $(pg_config --pkglibdir)/
+             cp pgmqtt-pg16-amd64/extension/*       $(pg_config --sharedir)/extension/
+             ```
+          4. Add to `postgresql.conf`:
+             ```
+             shared_preload_libraries = 'pgmqtt'
+             wal_level = logical
+             ```
+          5. Restart PostgreSQL and create the extension:
+             ```sql
+             CREATE EXTENSION pgmqtt;
+             ```
+
+          ### Included artifacts
+
+          | File | PostgreSQL | Architecture |
+          |------|-----------|--------------|
+          | `pgmqtt-pg15-amd64.tar.gz` | 15.x | x86_64 |
+          | `pgmqtt-pg15-arm64.tar.gz` | 15.x | aarch64 |
+          | `pgmqtt-pg16-amd64.tar.gz` | 16.x | x86_64 |
+          | `pgmqtt-pg16-arm64.tar.gz` | 16.x | aarch64 |
+          | `pgmqtt-pg17-amd64.tar.gz` | 17.x | x86_64 |
+          | `pgmqtt-pg17-arm64.tar.gz` | 17.x | aarch64 |
+
+          All artifacts have been tested via CI before release.
+          NOTES
+          # Substitute the tag into the notes
+          sed -i "s/\$TAG/${TAG}/g" release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: pgmqtt ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-files/*.tar.gz
+          fail_on_unmatched_files: true
