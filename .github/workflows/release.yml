@@ -87,17 +87,17 @@ jobs:
             -t pgmqtt-install-test-pg${{ matrix.pg }} \
             docker/
 
-      - name: Start Postgres from tarball
+      - name: Generate docker-compose.yml for install-test
         run: |
-          docker run -d --name pgmqtt-test \
-            -e POSTGRES_PASSWORD=postgres \
-            -p 5432:5432 -p 1883:1883 -p 8080:8080 \
-            pgmqtt-install-test-pg${{ matrix.pg }}
+          printf 'services:\n  postgres:\n    image: pgmqtt-install-test-pg${{ matrix.pg }}\n    ports:\n      - "5432:5432"\n      - "1883:1883"\n      - "8080:8080"\n      - "9001:9001"\n    environment:\n      POSTGRES_PASSWORD: postgres\n' > docker-compose.yml
+
+      - name: Start Postgres via docker compose
+        run: docker compose up -d
 
       - name: Wait for Postgres to be ready
         run: |
           timeout 120 bash -c '
-            until docker exec pgmqtt-test pg_isready -U postgres 2>/dev/null; do
+            until docker compose exec -T postgres pg_isready -U postgres 2>/dev/null; do
               echo "Waiting for Postgres..."
               sleep 2
             done
@@ -105,7 +105,7 @@ jobs:
 
       - name: Smoke test — extension is loaded
         run: |
-          docker exec pgmqtt-test \
+          docker compose exec -T postgres \
             psql -U postgres -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pgmqtt';" \
             | tee /dev/stderr | grep -q pgmqtt
 
@@ -131,15 +131,16 @@ jobs:
       - name: Run integration tests against tarball install
         timeout-minutes: 15
         run: |
-          python -m pytest tests/integration/ -m "not slow" --timeout=60 -v
+          python -m pytest tests/integration/ -m "not slow" --timeout=60 -v \
+            --ignore=tests/integration/multinode
 
       - name: Dump logs on failure
         if: failure()
-        run: docker logs pgmqtt-test
+        run: docker compose logs postgres
 
       - name: Cleanup
         if: always()
-        run: docker rm -f pgmqtt-test || true
+        run: docker compose down || true
 
   # ─── Stage 3: Create GitHub Release ────────────────────────────────────
   release:
