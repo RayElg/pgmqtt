@@ -17,10 +17,11 @@ pub enum Transport {
     Wss(websocket::WsStream<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
 }
 
-pub use tungstenite;
-
 impl Transport {
-    pub fn new_tls(stream: TcpStream, config: Arc<rustls::ServerConfig>) -> Result<Self, rustls::Error> {
+    pub fn new_tls(
+        stream: TcpStream,
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<Self, rustls::Error> {
         let conn = rustls::ServerConnection::new(config)?;
         Ok(Transport::Tls(rustls::StreamOwned::new(conn, stream)))
     }

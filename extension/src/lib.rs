@@ -1068,12 +1068,25 @@ unsafe fn extract_columns(
         return columns;
     }
 
-    // ReorderBufferTupleBuf contains a HeapTupleData
-    let heap_tuple = &(*tuple).tuple;
+    // ReorderBufferTupleBuf layout changed in PG 17: the `tuple` field was removed
+    // and the HeapTupleData fields are now directly on the struct.
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    let heap_tuple_data = pg_sys::HeapTupleData {
+        t_len: (*tuple).t_len,
+        t_self: (*tuple).t_self,
+        t_tableOid: (*tuple).t_tableOid,
+        t_data: (*tuple).t_data,
+    };
+    #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+    let heap_tuple_data = (*tuple).tuple;
+
+    let heap_tuple = &heap_tuple_data;
 
     for i in 0..natts {
-        let attrs = (*tupdesc).attrs.as_slice(natts);
-        let attr = &attrs[i];
+        #[cfg(feature = "pg18")]
+        let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        #[cfg(not(feature = "pg18"))]
+        let attr = &(*tupdesc).attrs.as_slice(natts)[i];
 
         // Skip dropped columns
         if attr.attisdropped {
