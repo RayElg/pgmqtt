@@ -1090,25 +1090,24 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
         let mut session_db_actions = Vec::new();
         let mut pending_inbound_writes: Vec<inbound_map::PendingInboundWrite> = Vec::new();
+        let mut publishes = Vec::new();
 
         if let Some(ref listener) = mqtt_listener {
-            accept_mqtt_connections(listener, &mut clients, &mut session_db_actions);
+            accept_mqtt_connections(listener, &mut clients, &mut session_db_actions, &mut publishes);
         }
         if let Some(ref listener) = ws_listener {
-            accept_ws_connections(listener, &mut clients, &mut session_db_actions);
+            accept_ws_connections(listener, &mut clients, &mut session_db_actions, &mut publishes);
         }
         if let Some(ref listener) = mqtts_listener {
             if let Some(ref cfg) = tls_config {
-                accept_mqtts_connections(listener, cfg, &mut clients, &mut session_db_actions);
+                accept_mqtts_connections(listener, cfg, &mut clients, &mut session_db_actions, &mut publishes);
             }
         }
         if let Some(ref listener) = wss_listener {
             if let Some(ref cfg) = tls_config {
-                accept_wss_connections(listener, cfg, &mut clients, &mut session_db_actions);
+                accept_wss_connections(listener, cfg, &mut clients, &mut session_db_actions, &mut publishes);
             }
         }
-
-        let mut publishes = Vec::new();
         poll_mqtt_clients(
             &mut clients,
             &mut publishes,
@@ -1310,11 +1309,6 @@ fn cdc_tick(slot_name: &str) {
                             .flatten()
                             .unwrap_or_default();
                         let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                        let tmpl: String = row
-                            .get_by_name("template_type")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "jinja2".to_string());
                         rows.push(topic_map::TopicMapping {
                             name: mn,
                             schema: s,
@@ -1322,7 +1316,6 @@ fn cdc_tick(slot_name: &str) {
                             topic_template: tt,
                             payload_template: pt,
                             qos: q as u8,
-                            template_type: tmpl,
                         });
                     }
                 }
@@ -1364,6 +1357,16 @@ fn cdc_tick(slot_name: &str) {
                     slot_name, CDC_BATCH_SIZE
                 );
                 match Spi::connect(|client| {
+                    // Suppress PostgreSQL's "starting logical decoding" LOG messages
+                    // that fire on every slot read (every 80ms).  These are informational
+                    // and extremely noisy in production.  In PostgreSQL's log_min_messages
+                    // hierarchy, LOG sits above ERROR, so we need 'fatal' to suppress it.
+                    // The 'true' flag makes this local to the current transaction only.
+                    let _ = client.select(
+                        "SELECT set_config('log_min_messages', 'fatal', true)",
+                        None,
+                        &[],
+                    );
                     let mut n = 0usize;
                     if let Ok(table) = client.select(&advance_query, None, &[]) {
                         for _ in table {
@@ -1429,7 +1432,6 @@ fn cdc_tick(slot_name: &str) {
                                     topic_template: topic_template.clone(),
                                     payload_template: payload_template.clone(),
                                     qos,
-                                    template_type: col("template_type"),
                                 };
                                 topic_map::wal_upsert(mapping);
                                 let tmpl_type = col("template_type");
@@ -1603,6 +1605,7 @@ fn accept_mqtts_connections(
     tls_config: &Arc<rustls::ServerConfig>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     loop {
         match listener.accept() {
@@ -1610,7 +1613,7 @@ fn accept_mqtts_connections(
                 log!("pgmqtt mqtts: new MQTTS connection from {}", addr);
                 match Transport::new_tls(stream, tls_config.clone()) {
                     Ok(transport) => {
-                        handle_new_connection(transport, None, clients, session_db_actions);
+                        handle_new_connection(transport, None, clients, session_db_actions, pending_publishes);
                     }
                     Err(e) => {
                         log!("pgmqtt mqtts: TLS handshake failed for {}: {}", addr, e);
@@ -1631,6 +1634,7 @@ fn accept_wss_connections(
     tls_config: &Arc<rustls::ServerConfig>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     loop {
         match listener.accept() {
@@ -1665,6 +1669,7 @@ fn accept_wss_connections(
                             ws_jwt,
                             clients,
                             session_db_actions,
+                            pending_publishes,
                         );
                     }
                     Err(e) => {
@@ -1685,12 +1690,13 @@ fn accept_mqtt_connections(
     listener: &TcpListener,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     loop {
         match listener.accept() {
             Ok((stream, addr)) => {
                 log!("pgmqtt mqtt: new TCP connection from {}", addr);
-                handle_new_connection(Transport::Raw(stream), None, clients, session_db_actions);
+                handle_new_connection(Transport::Raw(stream), None, clients, session_db_actions, pending_publishes);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -1707,6 +1713,7 @@ fn accept_ws_connections(
     listener: &TcpListener,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     loop {
         match listener.accept() {
@@ -1726,6 +1733,7 @@ fn accept_ws_connections(
                             ws_jwt,
                             clients,
                             session_db_actions,
+                            pending_publishes,
                         );
                     }
                     Err(e) => {
@@ -1749,6 +1757,7 @@ fn handle_new_connection(
     ws_jwt: Option<String>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     let _ = transport.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = transport.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1771,7 +1780,7 @@ fn handle_new_connection(
         match mqtt::parse_packet(&connect_buf) {
             Ok((mqtt::InboundPacket::Connect(connect), _consumed)) => {
                 // Success! Proceed to register the client.
-                finish_connect(transport, connect, ws_jwt, clients, session_db_actions);
+                finish_connect(transport, connect, ws_jwt, clients, session_db_actions, pending_publishes);
                 return;
             }
             Ok(_) => {
@@ -1802,6 +1811,7 @@ fn finish_connect(
     ws_jwt: Option<String>,
     clients: &mut HashMap<String, MqttClient>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    pending_publishes: &mut Vec<PendingPublish>,
 ) {
     let client_id = if packet.client_id.is_empty() {
         let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -1889,10 +1899,37 @@ fn finish_connect(
         }
     }
 
+    // ── Session takeover (MQTT 5.0 §4.9) ──────────────────────────────────────
+    // If the ClientID represents a Client already connected, send DISCONNECT
+    // with reason code 0x8E (Session taken over), fire its Will, then close
+    // the old connection before proceeding.
+    if let Some(mut old_client) = clients.remove(&client_id) {
+        log!(
+            "pgmqtt mqtt: session takeover for '{}', disconnecting old connection",
+            client_id
+        );
+        let _ = old_client
+            .transport
+            .write_all(&mqtt::build_disconnect(mqtt::reason::SESSION_TAKEN_OVER));
+        // Fire the old client's Will (MQTT 5.0 §3.1.3.3: Will is published
+        // when the server closes the connection for any reason other than a
+        // normal DISCONNECT from the client).
+        if let Some(will) = old_client.will.take() {
+            pending_publishes.push(PendingPublish {
+                topic: will.topic,
+                payload: will.payload,
+                qos: will.qos,
+                retain: will.retain,
+                log_sender: format!("{} (Will/takeover)", client_id),
+                packet_id: None,
+                inbound_mappings: Vec::new(),
+            });
+        }
+    }
+
     // ── Connection limit enforcement ──────────────────────────────────────────
-    // Session takeover (same client_id reconnecting) replaces an existing slot
-    // and is always allowed.  A genuinely new client is rejected when the limit
-    // is reached so operators can control memory usage.
+    // A genuinely new client is rejected when the limit is reached so operators
+    // can control memory usage.  Session takeovers (handled above) always proceed.
     let limit = crate::license::max_connections();
     if !clients.contains_key(&client_id) && clients.len() >= limit {
         log!(
@@ -2192,7 +2229,9 @@ fn poll_mqtt_clients(
         }
     }
 
-    // Clean up disconnected clients
+    // Clean up disconnected clients (deduplicate to avoid double Will firing)
+    to_remove.sort_unstable();
+    to_remove.dedup();
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
     }
@@ -2490,13 +2529,14 @@ fn handle_mqtt_packet(
 
             // Deliver retained messages for successfully subscribed filters (MQTT §3.8.4).
             // Shared subscriptions are excluded per MQTT 5.0 §4.8.2.
-            let subscribed_filters: Vec<&String> = sub
+            // Each entry is (filter, granted_qos).
+            let subscribed_filters: Vec<(&String, u8)> = sub
                 .topics
                 .iter()
                 .zip(reason_codes.iter())
                 .filter_map(|((filter, _), &rc)| {
                     if rc <= 0x02 && subscriptions::parse_shared_filter(filter).is_none() {
-                        Some(filter)
+                        Some((filter, rc))
                     } else {
                         None
                     }
@@ -2504,11 +2544,12 @@ fn handle_mqtt_packet(
                 .collect();
 
             if !subscribed_filters.is_empty() {
-                let retained_msgs: Vec<(String, Vec<u8>)> = BackgroundWorker::transaction(|| {
+                // Fetch retained messages with their stored QoS.
+                let retained_msgs: Vec<(String, Vec<u8>, u8)> = BackgroundWorker::transaction(|| {
                     let mut results = Vec::new();
                     let _ = pgrx::spi::Spi::connect(|spi| {
                         if let Ok(table) = spi.select(
-                            "SELECT r.topic, m.payload \
+                            "SELECT r.topic, m.payload, m.qos \
                              FROM pgmqtt_retained r \
                              JOIN pgmqtt_messages m ON r.message_id = m.id",
                             None,
@@ -2519,22 +2560,46 @@ fn handle_mqtt_packet(
                                     row.get_by_name("topic").ok().flatten().unwrap_or_default();
                                 let payload: Option<Vec<u8>> =
                                     row.get_by_name("payload").ok().flatten();
+                                let qos: i32 =
+                                    row.get_by_name("qos").ok().flatten().unwrap_or(0);
                                 if !topic.is_empty() {
-                                    results.push((topic, payload.unwrap_or_default()));
+                                    results.push((topic, payload.unwrap_or_default(), qos as u8));
                                 }
                             }
                         }
                         Ok::<_, pgrx::spi::Error>(())
                     });
-                    Ok::<Vec<(String, Vec<u8>)>, pgrx::spi::Error>(results)
+                    Ok::<Vec<(String, Vec<u8>, u8)>, pgrx::spi::Error>(results)
                 })
                 .unwrap_or_default();
 
-                for (topic, payload) in &retained_msgs {
-                    for filter in &subscribed_filters {
+                // MQTT 5.0 §3.3.1.2: retained messages are delivered at
+                // min(message_qos, subscription_granted_qos).
+                for (topic, payload, msg_qos) in &retained_msgs {
+                    for (filter, sub_qos) in &subscribed_filters {
                         if mqtt::topic_matches_filter(topic, filter) {
-                            let pkt = mqtt::build_publish_qos0_retain(topic, payload);
-                            let _ = transport.write_all(&pkt);
+                            let effective_qos = (*msg_qos).min(*sub_qos);
+                            if effective_qos >= 1 {
+                                // QoS 1 retained delivery — assign a packet ID from the session.
+                                let pid = with_sessions(|sessions| {
+                                    if let Some(sess) = sessions.get_mut(&client_id) {
+                                        let pid = sess.next_packet_id;
+                                        sess.next_packet_id = sess.next_packet_id.wrapping_add(1);
+                                        if sess.next_packet_id == 0 {
+                                            sess.next_packet_id = 1;
+                                        }
+                                        pid
+                                    } else {
+                                        1
+                                    }
+                                });
+                                // Build QoS 1 PUBLISH with RETAIN flag (0x02 QoS1 | 0x01 RETAIN = 0x03)
+                                let pkt = mqtt::build_publish_qos1_retain(topic, payload, pid);
+                                let _ = transport.write_all(&pkt);
+                            } else {
+                                let pkt = mqtt::build_publish_qos0_retain(topic, payload);
+                                let _ = transport.write_all(&pkt);
+                            }
                             break; // deliver each retained message at most once per SUBSCRIBE
                         }
                     }
@@ -2581,18 +2646,36 @@ fn handle_mqtt_packet(
             if reason_code == mqtt::reason::NORMAL_DISCONNECT {
                 client.will = None;
             }
-            // MQTT 5.0 §3.14.2.2.2: client may override Session Expiry Interval at DISCONNECT
+            // MQTT 5.0 §3.14.2.2.2: client may override Session Expiry Interval at DISCONNECT.
+            // However, §3.14.2.2.2 also says: "If the Session Expiry Interval in the CONNECT
+            // packet was zero, then it is a Protocol Error to set a non-zero Session Expiry
+            // Interval in the DISCONNECT packet."
             if let Some(new_expiry) = expiry_override {
-                with_sessions(|sessions| {
-                    if let Some(sess) = sessions.get_mut(&client_id) {
-                        sess.expiry_interval = new_expiry;
-                    }
+                let (original_expiry, current_pid) = with_sessions(|sessions| {
+                    sessions
+                        .get(&client_id)
+                        .map(|sess| (sess.expiry_interval, sess.next_packet_id))
+                        .unwrap_or((0, 1))
                 });
-                session_db_actions.push(SessionDbAction::UpsertSession {
-                    client_id: client_id.clone(),
-                    next_packet_id: 0, // will be overwritten by the MarkDisconnected path
-                    expiry_interval: new_expiry,
-                });
+                if original_expiry == 0 && new_expiry != 0 {
+                    log!(
+                        "pgmqtt mqtt: '{}' protocol error: cannot set non-zero session expiry at DISCONNECT when CONNECT had expiry=0",
+                        client_id
+                    );
+                    let _ = transport
+                        .write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR));
+                } else {
+                    with_sessions(|sessions| {
+                        if let Some(sess) = sessions.get_mut(&client_id) {
+                            sess.expiry_interval = new_expiry;
+                        }
+                    });
+                    session_db_actions.push(SessionDbAction::UpsertSession {
+                        client_id: client_id.clone(),
+                        next_packet_id: current_pid,
+                        expiry_interval: new_expiry,
+                    });
+                }
             }
             false // signal removal
         }

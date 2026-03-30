@@ -18,9 +18,11 @@ from proto_utils import (
     create_disconnect_packet,
     recv_packet,
     validate_connack,
+    validate_disconnect,
     validate_suback,
     validate_publish,
     MQTTControlPacket,
+    ReasonCode,
     MQTT_HOST,
     MQTT_PORT,
     run_psql,
@@ -165,6 +167,62 @@ def test_session_expiry_loss():
     assert not sp, "Session should have expired"
     pkt = recv_packet(s2, timeout=1.0)
     assert pkt is None, "Should not receive message after session expired"
+    s2.close()
+
+
+def test_disconnect_expiry_override_rejected_when_connect_zero():
+    """DISCONNECT with non-zero Session Expiry is Protocol Error if CONNECT had expiry=0.
+
+    MQTT 5.0 §3.14.2.2.2: If the Session Expiry Interval in the CONNECT packet
+    was zero, then it is a Protocol Error to set a non-zero Session Expiry
+    Interval in the DISCONNECT packet sent by the Client.
+    """
+    client_id = "se_override_reject"
+
+    # Connect with session_expiry=0 (default)
+    s, _ = _connect(client_id, clean_start=True, session_expiry=0)
+
+    # Send DISCONNECT with non-zero Session Expiry Interval (property 0x11)
+    s.sendall(create_disconnect_packet(reason_code=0, properties={0x11: 300}))
+
+    # Broker should respond with DISCONNECT + Protocol Error, or close connection
+    resp = recv_packet(s, timeout=3)
+    if resp is not None:
+        ptype = (resp[0] >> 4)
+        assert ptype == MQTTControlPacket.DISCONNECT, \
+            f"Expected DISCONNECT, got packet type {ptype}"
+        rc = validate_disconnect(resp)
+        assert rc == ReasonCode.PROTOCOL_ERROR, \
+            f"Expected Protocol Error (0x82), got 0x{rc:02x}"
+        print("  Received DISCONNECT with Protocol Error")
+    else:
+        print("  Connection closed by broker (acceptable)")
+
+    s.close()
+
+
+def test_disconnect_expiry_override_accepted_when_connect_nonzero():
+    """DISCONNECT with different Session Expiry is accepted if CONNECT had non-zero expiry.
+
+    MQTT 5.0 §3.14.2.2.2: The client is allowed to change the expiry on
+    DISCONNECT as long as the CONNECT session expiry was non-zero.
+    """
+    client_id = "se_override_accept"
+
+    # Connect with session_expiry=300
+    s, _ = _connect(client_id, clean_start=True, session_expiry=300)
+    s.sendall(create_subscribe_packet(1, "test/session/override", qos=1))
+    validate_suback(recv_packet(s), 1)
+
+    # Send DISCONNECT with different Session Expiry — should be accepted
+    s.sendall(create_disconnect_packet(reason_code=0, properties={0x11: 60}))
+    s.close()
+
+    time.sleep(1)
+
+    # Reconnect — session should still be present (within 60s expiry)
+    s2, sp = _connect(client_id, clean_start=False, session_expiry=300)
+    assert sp, "Session should be present (override to 60s, reconnected within 1s)"
     s2.close()
 
 

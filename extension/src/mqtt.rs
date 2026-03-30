@@ -27,8 +27,6 @@ pub mod property {
     pub const AUTH_METHOD: u8 = 0x15;
     /// Reason String (UTF-8 string) — DISCONNECT/others
     pub const REASON_STRING: u8 = 0x1F;
-    /// Payload Format Indicator (1-byte) — PUBLISH
-    pub const PAYLOAD_FORMAT: u8 = 0x01;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,17 +85,14 @@ impl PacketType {
 pub mod reason {
     pub const SUCCESS: u8 = 0x00;
     pub const NORMAL_DISCONNECT: u8 = 0x00;
-    pub const GRANTED_QOS_0: u8 = 0x00;
-    pub const GRANTED_QOS_1: u8 = 0x01;
-    pub const GRANTED_QOS_2: u8 = 0x02;
     pub const UNSPECIFIED_ERROR: u8 = 0x80;
     pub const MALFORMED_PACKET: u8 = 0x81;
     pub const PROTOCOL_ERROR: u8 = 0x82;
     pub const NOT_AUTHORIZED: u8 = 0x87;
     pub const TOPIC_FILTER_INVALID: u8 = 0x8F;
-    pub const PACKET_ID_IN_USE: u8 = 0x91;
     pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
     pub const SERVER_SHUTTING_DOWN: u8 = 0x8B;
+    pub const SESSION_TAKEN_OVER: u8 = 0x8E;
     pub const TOPIC_NAME_INVALID: u8 = 0x90;
     pub const QUOTA_EXCEEDED: u8 = 0x97;
 }
@@ -740,6 +735,15 @@ pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8
     vh.extend_from_slice(&encode_empty_properties());
     vh.extend_from_slice(payload);
     build_packet(PacketType::Publish, 0x02, &vh) // flags: DUP=0 QoS=01 RETAIN=0
+}
+
+pub fn build_publish_qos1_retain(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&encode_utf8(topic));
+    vh.extend_from_slice(&packet_id.to_be_bytes());
+    vh.extend_from_slice(&encode_empty_properties());
+    vh.extend_from_slice(payload);
+    build_packet(PacketType::Publish, 0x03, &vh) // flags: DUP=0 QoS=01 RETAIN=1
 }
 
 pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {

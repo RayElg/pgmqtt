@@ -225,11 +225,6 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-fn base64_url_encode(b: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

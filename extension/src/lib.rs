@@ -138,15 +138,6 @@ pub fn get_tls_key_file_guc() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Execute SQL, logging and ignoring errors (for DDL operations).
-fn run_sql_or_error(sql: &str, operation: &str) {
-    Spi::run(sql).unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to {}: {}", operation, e));
-}
-
-// ---------------------------------------------------------------------------
 // SQL-callable functions
 // ---------------------------------------------------------------------------
 
