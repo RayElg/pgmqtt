@@ -82,6 +82,37 @@ def mqtt_connect(client_id: str, *, clean_start: bool = True, **kwargs) -> socke
     return s
 
 
+def wait_for_session(client_id: str, timeout: float = 5.0) -> bool:
+    """Poll until a session row exists in pgmqtt_sessions with disconnected_at IS NULL.
+
+    The background worker writes session rows asynchronously; there is a brief
+    window after CONNACK where the row may not yet be committed.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = run_sql(
+            f"SELECT disconnected_at FROM pgmqtt_sessions WHERE client_id = '{client_id}'"
+        )
+        if result and result[0][0] is None:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def wait_for_active_connections(minimum: int, timeout: float = 5.0) -> int:
+    """Poll until pgmqtt_status() reports at least `minimum` active connections."""
+    deadline = time.time() + timeout
+    count = 0
+    while time.time() < deadline:
+        result = run_sql("SELECT active_connections FROM pgmqtt_status()")
+        if result:
+            count = int(result[0][0])
+            if count >= minimum:
+                return count
+        time.sleep(0.1)
+    return count
+
+
 # ---------------------------------------------------------------------------
 # SIGTERM tests (docker compose stop → PostgreSQL graceful shutdown)
 # ---------------------------------------------------------------------------
@@ -126,10 +157,7 @@ def test_sigterm_marks_sessions_disconnected_in_db():
     # session_expiry_interval=3600 → session persists across disconnects
     s = mqtt_connect("sigterm_disc_b", properties={0x11: 3600})
 
-    result = run_sql(
-        "SELECT disconnected_at FROM pgmqtt_sessions WHERE client_id = 'sigterm_disc_b'"
-    )
-    assert result and result[0][0] is None, "Session should be active before shutdown"
+    assert wait_for_session("sigterm_disc_b"), "Session should be active before shutdown"
 
     s.close()
     compose_stop()
@@ -188,8 +216,8 @@ def test_sigterm_status_shows_zero_after_restart():
 
     clients = [mqtt_connect(f"sigterm_stat_{i}") for i in range(3)]
 
-    result = run_sql("SELECT active_connections FROM pgmqtt_status()")
-    assert result and int(result[0][0]) >= 3, "Expected 3 active sessions before shutdown"
+    active = wait_for_active_connections(3)
+    assert active >= 3, f"Expected 3 active sessions before shutdown, got {active}"
 
     for c in clients:
         c.close()
@@ -242,10 +270,7 @@ def test_sigkill_startup_marks_stale_sessions_disconnected():
     # Closing cleanly would trigger the disconnect path and set disconnected_at first.
     s = mqtt_connect("sigkill_stale", properties={0x11: 3600})
 
-    result = run_sql(
-        "SELECT disconnected_at FROM pgmqtt_sessions WHERE client_id = 'sigkill_stale'"
-    )
-    assert result and result[0][0] is None, "Session should be active before SIGKILL"
+    assert wait_for_session("sigkill_stale"), "Session should be active before SIGKILL"
 
     compose_kill()
     s.close()  # socket dies with the container; close to release the fd
@@ -270,8 +295,8 @@ def test_sigkill_status_shows_zero_after_restart():
 
     clients = [mqtt_connect(f"sigkill_stat_{i}") for i in range(3)]
 
-    result = run_sql("SELECT active_connections FROM pgmqtt_status()")
-    assert result and int(result[0][0]) >= 3
+    active = wait_for_active_connections(3)
+    assert active >= 3, f"Expected 3 active sessions before SIGKILL, got {active}"
 
     for c in clients:
         c.close()
