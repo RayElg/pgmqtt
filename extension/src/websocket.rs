@@ -324,6 +324,18 @@ impl<S: Read + Write> WsStream<S> {
                 }
                 OP_CONT => {
                     // Continuation frame — append to the reassembly buffer.
+                    if self.frag_buf.len() + payload.len() > MAX_WS_FRAME_SIZE {
+                        self.frag_buf.clear();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "ws reassembled message too large: {} + {} bytes (max {})",
+                                self.frag_buf.len(),
+                                payload.len(),
+                                MAX_WS_FRAME_SIZE,
+                            ),
+                        ));
+                    }
                     self.frag_buf.extend_from_slice(&payload);
                     if fin {
                         let assembled = std::mem::take(&mut self.frag_buf);
