@@ -211,7 +211,7 @@ def test_session_takeover_expiry_zero_clean_state():
     s_b.close()
 
 
-
+def test_disconnect_expiry_override_rejected_when_connect_zero():
     """DISCONNECT with non-zero Session Expiry is Protocol Error if CONNECT had expiry=0.
 
     MQTT 5.0 §3.14.2.2.2: If the Session Expiry Interval in the CONNECT packet
