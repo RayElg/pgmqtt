@@ -1925,6 +1925,25 @@ fn finish_connect(
                 inbound_mappings: Vec::new(),
             });
         }
+
+        // Session takeover acts as a disconnect for the old connection.
+        // If the old session had expiry_interval == 0 (end at disconnect),
+        // clean it up now so that the session_present check below is correct
+        // (MQTT 5.0 §3.2.2.1.1).
+        let should_remove_old = with_sessions(|s| {
+            s.get(&client_id)
+                .map(|sess| sess.expiry_interval == 0)
+                .unwrap_or(false)
+        });
+        if should_remove_old {
+            subscriptions::remove_client(&client_id);
+            with_sessions(|s| {
+                s.remove(&client_id);
+            });
+            session_db_actions.push(SessionDbAction::DeleteSession {
+                client_id: client_id.clone(),
+            });
+        }
     }
 
     // ── Connection limit enforcement ──────────────────────────────────────────
@@ -1952,17 +1971,7 @@ fn finish_connect(
         });
     }
 
-    let session_present = with_sessions(|s| {
-        // Treat a session as "not present" if it had already expired
-        if let Some(sess) = s.get(&client_id) {
-            if sess.expiry_interval == 0 {
-                return false; // zero = session ended at disconnect
-            }
-            true
-        } else {
-            false
-        }
-    });
+    let session_present = with_sessions(|s| s.contains_key(&client_id));
 
     let (next_pid, expiry) = with_sessions(|s| {
         let sess = s.entry(client_id.clone()).or_insert_with(MqttSession::new);
@@ -2485,6 +2494,9 @@ fn handle_mqtt_packet(
                 }
 
                 // JWT subscribe authorization — use the real filter for shared subs.
+                // We need filter_covers_filter (not topic_matches_filter) because
+                // auth_filter may contain wildcards.  The check is: "is the set of
+                // topics matched by auth_filter a subset of some claim?"
                 let auth_filter = shared.map(|(_, f)| f).unwrap_or(topic_filter.as_str());
                 let jwt_authorized = if client.sub_claims.is_empty() {
                     true
@@ -2492,7 +2504,7 @@ fn handle_mqtt_packet(
                     client
                         .sub_claims
                         .iter()
-                        .any(|claim| crate::mqtt::topic_matches_filter(auth_filter, claim))
+                        .any(|claim| crate::mqtt::filter_covers_filter(auth_filter, claim))
                 };
 
                 if !jwt_authorized {
@@ -2544,12 +2556,13 @@ fn handle_mqtt_packet(
                 .collect();
 
             if !subscribed_filters.is_empty() {
-                // Fetch retained messages with their stored QoS.
-                let retained_msgs: Vec<(String, Vec<u8>, u8)> = BackgroundWorker::transaction(|| {
+                // Fetch retained messages with their stored QoS and message_id
+                // (needed to track QoS 1 inflight state).
+                let retained_msgs: Vec<(String, Vec<u8>, u8, i64)> = BackgroundWorker::transaction(|| {
                     let mut results = Vec::new();
                     let _ = pgrx::spi::Spi::connect(|spi| {
                         if let Ok(table) = spi.select(
-                            "SELECT r.topic, m.payload, m.qos \
+                            "SELECT r.topic, m.payload, m.qos, m.id \
                              FROM pgmqtt_retained r \
                              JOIN pgmqtt_messages m ON r.message_id = m.id",
                             None,
@@ -2562,25 +2575,29 @@ fn handle_mqtt_packet(
                                     row.get_by_name("payload").ok().flatten();
                                 let qos: i32 =
                                     row.get_by_name("qos").ok().flatten().unwrap_or(0);
+                                let msg_id: i64 =
+                                    row.get_by_name("id").ok().flatten().unwrap_or(0);
                                 if !topic.is_empty() {
-                                    results.push((topic, payload.unwrap_or_default(), qos as u8));
+                                    results.push((topic, payload.unwrap_or_default(), qos as u8, msg_id));
                                 }
                             }
                         }
                         Ok::<_, pgrx::spi::Error>(())
                     });
-                    Ok::<Vec<(String, Vec<u8>, u8)>, pgrx::spi::Error>(results)
+                    Ok::<Vec<(String, Vec<u8>, u8, i64)>, pgrx::spi::Error>(results)
                 })
                 .unwrap_or_default();
 
                 // MQTT 5.0 §3.3.1.2: retained messages are delivered at
                 // min(message_qos, subscription_granted_qos).
-                for (topic, payload, msg_qos) in &retained_msgs {
+                for (topic, payload, msg_qos, msg_id) in &retained_msgs {
                     for (filter, sub_qos) in &subscribed_filters {
                         if mqtt::topic_matches_filter(topic, filter) {
                             let effective_qos = (*msg_qos).min(*sub_qos);
                             if effective_qos >= 1 {
-                                // QoS 1 retained delivery — assign a packet ID from the session.
+                                // QoS 1 retained delivery — assign a packet ID and
+                                // track in session inflight so PUBACKs are handled
+                                // and redelivery works on reconnect.
                                 let pid = with_sessions(|sessions| {
                                     if let Some(sess) = sessions.get_mut(&client_id) {
                                         let pid = sess.next_packet_id;
@@ -2588,12 +2605,24 @@ fn handle_mqtt_packet(
                                         if sess.next_packet_id == 0 {
                                             sess.next_packet_id = 1;
                                         }
+                                        sess.inflight.insert(
+                                            pid,
+                                            (
+                                                topic.clone(),
+                                                payload.clone(),
+                                                Some(*msg_id),
+                                                std::time::Instant::now(),
+                                            ),
+                                        );
                                         pid
                                     } else {
                                         1
                                     }
                                 });
-                                // Build QoS 1 PUBLISH with RETAIN flag (0x02 QoS1 | 0x01 RETAIN = 0x03)
+                                session_db_actions.push(SessionDbAction::InsertMessageBatch {
+                                    message_id: *msg_id,
+                                    entries: vec![(client_id.clone(), Some(pid))],
+                                });
                                 let pkt = mqtt::build_publish_qos1_retain(topic, payload, pid);
                                 let _ = transport.write_all(&pkt);
                             } else {

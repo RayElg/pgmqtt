@@ -202,7 +202,6 @@ def test_invalid_reserved_bits():
     s.close()
 
 
-@pytest.mark.xfail(reason="Malformed varint not detected")
 def test_malformed_varint():
     """Malformed variable byte integer (5 bytes) should cause disconnect."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -211,6 +210,26 @@ def test_malformed_varint():
     recv_packet(s)
 
     malformed_len = b'\x80\x80\x80\x80\x81'
+    pkt = bytes([(MQTTControlPacket.PINGREQ << 4)]) + malformed_len
+    s.sendall(pkt)
+    assert _expect_disconnect_or_close(s, expected_reason=ReasonCode.MALFORMED_PACKET)
+    s.close()
+
+
+def test_malformed_varint_exact_4_bytes():
+    """Exactly 4 continuation bytes with no terminator should cause disconnect.
+
+    This is the edge case where the buffer has exactly 4 bytes, all with the
+    continuation bit set — it must be detected as malformed, not treated as
+    incomplete.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet("adv_varint4"))
+    recv_packet(s)
+
+    # 4 bytes, all with continuation bit set — no 5th byte follows
+    malformed_len = b'\x80\x80\x80\x80'
     pkt = bytes([(MQTTControlPacket.PINGREQ << 4)]) + malformed_len
     s.sendall(pkt)
     assert _expect_disconnect_or_close(s, expected_reason=ReasonCode.MALFORMED_PACKET)

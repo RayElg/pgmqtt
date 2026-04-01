@@ -170,7 +170,48 @@ def test_session_expiry_loss():
     s2.close()
 
 
-def test_disconnect_expiry_override_rejected_when_connect_zero():
+def test_session_takeover_expiry_zero_clean_state():
+    """Session takeover with expiry=0 reports session_present=false.
+
+    Regression test: when client A connects with session_expiry=0 and then
+    client B connects with the same client_id and clean_start=false, the old
+    session (expiry=0) must be discarded before evaluating session_present.
+    The CONNACK must have session_present=false, and no stale subscriptions
+    from client A should remain.
+    """
+    client_id = "se_takeover_zero"
+    topic = "test/session/takeover_zero"
+
+    # Client A: connect with expiry=0, subscribe, then leave connected
+    s_a, _ = _connect(client_id, clean_start=True, session_expiry=0)
+    s_a.sendall(create_subscribe_packet(1, topic, qos=1))
+    validate_suback(recv_packet(s_a), 1)
+
+    # Client B: same client_id, clean_start=false — triggers session takeover
+    s_b, sp = _connect(client_id, clean_start=False, session_expiry=0)
+    assert not sp, "session_present should be false (old session had expiry=0)"
+
+    # Client A should receive DISCONNECT with SESSION_TAKEN_OVER or be closed
+    data = recv_packet(s_a, timeout=2.0)
+    s_a.close()
+
+    # Publish to the topic — client B should NOT receive it since old
+    # session's subscriptions should have been cleaned up, and client B
+    # did not subscribe itself
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("se_takeover_pub"))
+    recv_packet(s_pub)
+    s_pub.sendall(create_publish_packet(topic, b"stale?", qos=1, packet_id=1))
+    recv_packet(s_pub)  # PUBACK
+    s_pub.close()
+
+    stale = recv_packet(s_b, timeout=2.0)
+    assert stale is None, "Should NOT receive message from stale subscription"
+    s_b.close()
+
+
+
     """DISCONNECT with non-zero Session Expiry is Protocol Error if CONNECT had expiry=0.
 
     MQTT 5.0 §3.14.2.2.2: If the Session Expiry Interval in the CONNECT packet

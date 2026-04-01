@@ -8,11 +8,14 @@ from proto_utils import (
     create_connect_packet,
     create_subscribe_packet,
     create_publish_packet,
+    create_puback_packet,
+    create_pingreq_packet,
     create_disconnect_packet,
     recv_packet,
     validate_connack,
     validate_suback,
     validate_publish,
+    validate_pingresp,
     ReasonCode,
     MQTT_HOST,
     MQTT_PORT,
@@ -178,3 +181,58 @@ def test_retain_flag_zero_on_live_publish():
     assert p == payload
     assert not retain, "RETAIN should be 0 for live message"
     s_cons.close()
+
+
+def test_retained_qos1_puback_accepted():
+    """PUBACK for QoS 1 retained message is accepted and connection stays healthy.
+
+    Regression test: retained QoS 1 messages must be tracked in the session
+    inflight map so the server recognises the PUBACK. Previously the PUBACK
+    would hit 'unknown packet_id' and be silently discarded.
+    """
+    topic = "test/retain/qos1puback"
+    payload = b"retained qos1 puback test"
+
+    # Publish retained message at QoS 1
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("ret_q1pa_pub"))
+    validate_connack(recv_packet(s_pub))
+    s_pub.sendall(create_publish_packet(topic, payload, qos=1, packet_id=1, retain=True))
+    recv_packet(s_pub)  # PUBACK
+    s_pub.sendall(create_disconnect_packet())
+    s_pub.close()
+
+    # Subscribe at QoS 1 and receive the retained message
+    s_cons = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_cons.connect((MQTT_HOST, MQTT_PORT))
+    s_cons.sendall(create_connect_packet("ret_q1pa_cons", clean_start=True))
+    validate_connack(recv_packet(s_cons))
+    s_cons.sendall(create_subscribe_packet(10, topic, qos=1))
+    validate_suback(recv_packet(s_cons), 10)
+
+    pub = recv_packet(s_cons)
+    assert pub is not None, "Should receive retained message"
+    t, p, qos, dup, retain, packet_id, props = validate_publish(pub)
+    assert qos == 1, f"Expected QoS 1, got {qos}"
+    assert packet_id is not None, "QoS 1 retained must have packet ID"
+
+    # Send PUBACK — this is the core of the test
+    s_cons.sendall(create_puback_packet(packet_id))
+
+    # Verify connection is still healthy via PINGREQ/PINGRESP
+    s_cons.sendall(create_pingreq_packet())
+    resp = recv_packet(s_cons, timeout=3.0)
+    assert resp is not None, "Connection should still be alive after PUBACK"
+    validate_pingresp(resp)
+
+    s_cons.sendall(create_disconnect_packet())
+    s_cons.close()
+
+    # Cleanup retained
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet("ret_q1pa_cleaner"))
+    recv_packet(s)
+    s.sendall(create_publish_packet(topic, b"", qos=0, retain=True))
+    s.close()
