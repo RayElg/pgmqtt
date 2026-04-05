@@ -4,12 +4,13 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "5432:5432"
-      - "8080:8080"
-      - "1883:1883"
-      - "9001:9001"
-      - "8883:8883"
-      - "9002:9002"
+      # Defaults to localhost if DOCKER_BIND_IP isn't set
+      - "${DOCKER_BIND_IP:-127.0.0.1}:5432:5432"
+      - "${DOCKER_BIND_IP:-127.0.0.1}:8080:8080"
+      - "${DOCKER_BIND_IP:-127.0.0.1}:1883:1883"
+      - "${DOCKER_BIND_IP:-127.0.0.1}:9001:9001"
+      - "${DOCKER_BIND_IP:-127.0.0.1}:8883:8883"
+      - "${DOCKER_BIND_IP:-127.0.0.1}:9002:9002"
     environment:
       POSTGRES_PASSWORD: postgres
     # Mount a volume for persistence if we wanted, but not for now.

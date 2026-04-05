@@ -73,6 +73,8 @@ pub struct InboundMapping {
     pub sql: Arc<str>,
     /// Original topic_pattern string (for diagnostics / reload)
     pub topic_pattern: String,
+    /// Persisted for future extensibility; not read at runtime (always jsonpath).
+    #[allow(dead_code)]
     pub template_type: String,
 }
 
@@ -94,12 +96,6 @@ static INBOUND_MAPPINGS: Mutex<Option<Vec<InboundMapping>>> = Mutex::new(None);
 pub fn set_mappings(mappings: Vec<InboundMapping>) {
     let mut lock = INBOUND_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     *lock = Some(mappings);
-}
-
-/// Check if mappings have been loaded.
-pub fn is_loaded() -> bool {
-    let lock = INBOUND_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
-    lock.is_some()
 }
 
 /// Try to match a topic against all inbound mappings and extract values.

@@ -27,8 +27,6 @@ pub mod property {
     pub const AUTH_METHOD: u8 = 0x15;
     /// Reason String (UTF-8 string) — DISCONNECT/others
     pub const REASON_STRING: u8 = 0x1F;
-    /// Payload Format Indicator (1-byte) — PUBLISH
-    pub const PAYLOAD_FORMAT: u8 = 0x01;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,17 +85,14 @@ impl PacketType {
 pub mod reason {
     pub const SUCCESS: u8 = 0x00;
     pub const NORMAL_DISCONNECT: u8 = 0x00;
-    pub const GRANTED_QOS_0: u8 = 0x00;
-    pub const GRANTED_QOS_1: u8 = 0x01;
-    pub const GRANTED_QOS_2: u8 = 0x02;
     pub const UNSPECIFIED_ERROR: u8 = 0x80;
     pub const MALFORMED_PACKET: u8 = 0x81;
     pub const PROTOCOL_ERROR: u8 = 0x82;
     pub const NOT_AUTHORIZED: u8 = 0x87;
     pub const TOPIC_FILTER_INVALID: u8 = 0x8F;
-    pub const PACKET_ID_IN_USE: u8 = 0x91;
     pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
     pub const SERVER_SHUTTING_DOWN: u8 = 0x8B;
+    pub const SESSION_TAKEN_OVER: u8 = 0x8E;
     pub const TOPIC_NAME_INVALID: u8 = 0x90;
     pub const QUOTA_EXCEEDED: u8 = 0x97;
 }
@@ -157,7 +152,16 @@ pub fn decode_variable_byte_int(buf: &[u8]) -> Result<(usize, usize)> {
         }
         multiplier *= 128;
     }
-    Err(MqttError::Incomplete)
+    // If we consumed 4 bytes and all had the continuation bit set, the
+    // encoding is invalid (MQTT §1.5.5).  Only return Incomplete when the
+    // buffer simply didn't have enough bytes to decide.
+    if buf.len() >= 4 {
+        Err(MqttError::MalformedPacket(
+            "variable byte integer exceeds 4-byte maximum".into(),
+        ))
+    } else {
+        Err(MqttError::Incomplete)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +746,15 @@ pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8
     build_packet(PacketType::Publish, 0x02, &vh) // flags: DUP=0 QoS=01 RETAIN=0
 }
 
+pub fn build_publish_qos1_retain(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&encode_utf8(topic));
+    vh.extend_from_slice(&packet_id.to_be_bytes());
+    vh.extend_from_slice(&encode_empty_properties());
+    vh.extend_from_slice(payload);
+    build_packet(PacketType::Publish, 0x03, &vh) // flags: DUP=0 QoS=01 RETAIN=1
+}
+
 pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
@@ -820,6 +833,67 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
     ti == topic_levels.len()
 }
 
+/// Check whether `claim` (an authorization filter) covers every topic that
+/// `subscription` could match.  Used for JWT subscribe authorization.
+///
+/// This is *not* the same as `topic_matches_filter`: that checks whether a
+/// concrete topic matches a filter.  Here both arguments may contain wildcards
+/// and we need to decide "is the set of topics matched by `subscription` a
+/// subset of the set matched by `claim`?"
+///
+/// Rules (evaluated level-by-level):
+///   - Claim `#` at any point covers everything remaining → true
+///   - Subscription `#` is only covered if claim is also `#` at that level
+///   - Claim `+` covers subscription `+` or any literal at that level
+///   - Subscription `+` is only covered by claim `+` or `#`
+///   - Literals must match exactly
+pub fn filter_covers_filter(subscription: &str, claim: &str) -> bool {
+    let sub_levels: Vec<&str> = subscription.split('/').collect();
+    let claim_levels: Vec<&str> = claim.split('/').collect();
+
+    let mut si = 0;
+    let mut ci = 0;
+
+    while si < sub_levels.len() && ci < claim_levels.len() {
+        match claim_levels[ci] {
+            "#" => return true, // claim covers everything from here
+            "+" => {
+                // Claim + covers one level — but subscription # is broader
+                if sub_levels[si] == "#" {
+                    return false;
+                }
+                si += 1;
+                ci += 1;
+            }
+            exact => {
+                match sub_levels[si] {
+                    "#" => return false, // sub is broader than a literal claim
+                    "+" => return false, // sub + is broader than a literal claim
+                    sub_exact => {
+                        if sub_exact != exact {
+                            return false;
+                        }
+                        si += 1;
+                        ci += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Both exhausted at the same time: exact structural match
+    if si == sub_levels.len() && ci == claim_levels.len() {
+        return true;
+    }
+
+    // Claim has remaining levels starting with # → covers the rest
+    if ci < claim_levels.len() && claim_levels[ci] == "#" {
+        return true;
+    }
+
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -874,5 +948,57 @@ mod tests {
     fn test_build_pingresp() {
         let pkt = build_pingresp();
         assert_eq!(pkt, vec![0xD0, 0x00]);
+    }
+
+    #[test]
+    fn test_variable_byte_int_malformed_4_bytes() {
+        // All 4 bytes have continuation bit set → malformed, not incomplete
+        let buf = [0x80, 0x80, 0x80, 0x80];
+        match decode_variable_byte_int(&buf) {
+            Err(MqttError::MalformedPacket(_)) => {} // expected
+            other => panic!("expected MalformedPacket, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_variable_byte_int_incomplete_short_buffer() {
+        // Only 2 bytes, both with continuation bit → genuinely incomplete
+        let buf = [0x80, 0x80];
+        match decode_variable_byte_int(&buf) {
+            Err(MqttError::Incomplete) => {} // expected
+            other => panic!("expected Incomplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_filter_covers_filter() {
+        // Exact match
+        assert!(filter_covers_filter("a/b/c", "a/b/c"));
+        // Claim # covers everything
+        assert!(filter_covers_filter("a/b/c", "#"));
+        assert!(filter_covers_filter("a/+/c", "#"));
+        assert!(filter_covers_filter("#", "#"));
+        // Claim a/# covers anything under a/
+        assert!(filter_covers_filter("a/b", "a/#"));
+        assert!(filter_covers_filter("a/+", "a/#"));
+        assert!(filter_covers_filter("a/b/c", "a/#"));
+        // Claim + covers literal at that level
+        assert!(filter_covers_filter("a/b/c", "+/b/c"));
+        assert!(filter_covers_filter("a/b/c", "a/+/c"));
+        // Claim + covers subscription + at same level
+        assert!(filter_covers_filter("+/b", "+/b"));
+        assert!(filter_covers_filter("a/+", "a/+"));
+        // Sub # NOT covered by a single-level claim
+        assert!(!filter_covers_filter("sensor/#", "sensor/+"));
+        assert!(!filter_covers_filter("#", "sensor/+"));
+        assert!(!filter_covers_filter("#", "+"));
+        // Sub + NOT covered by literal claim
+        assert!(!filter_covers_filter("a/+", "a/b"));
+        assert!(!filter_covers_filter("+/b", "a/b"));
+        // Different literals
+        assert!(!filter_covers_filter("a/b", "a/c"));
+        // Different lengths
+        assert!(!filter_covers_filter("a/b/c", "a/b"));
+        assert!(!filter_covers_filter("a/b", "a/b/c"));
     }
 }

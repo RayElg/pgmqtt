@@ -22,8 +22,10 @@ pub struct TopicMapping {
     pub topic_template: String,
     pub payload_template: String,
     pub qos: u8,
-    pub template_type: String,
 }
+
+// NOTE: template_type is persisted in the DB for future extensibility (e.g. jsonpath)
+// but is not read at runtime — the engine is always minijinja for outbound mappings.
 
 /// A rendered MQTT message ready for the per-topic buffer.
 #[derive(Debug, Clone)]
@@ -39,12 +41,6 @@ pub struct RenderedMessage {
 
 static MAPPINGS: Mutex<Option<Vec<TopicMapping>>> = Mutex::new(None);
 
-#[allow(dead_code)]
-fn with_mappings<R>(f: impl FnOnce(&Vec<TopicMapping>) -> R) -> Option<R> {
-    let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
-    lock.as_ref().map(f)
-}
-
 /// Replace the in-process cache with a fresh set of mappings.
 /// Called by the consumer worker after loading from the DB via SPI.
 pub fn set_mappings(mappings: Vec<TopicMapping>) {
@@ -52,14 +48,7 @@ pub fn set_mappings(mappings: Vec<TopicMapping>) {
     *lock = Some(mappings);
 }
 
-/// Get the current in-process mapping count (for diagnostics).
-#[allow(dead_code)]
-pub fn mapping_count() -> usize {
-    with_mappings(|m| m.len()).unwrap_or(0)
-}
-
-/// Get a clone of the current mappings (for diagnostics).
-#[allow(dead_code)]
+/// Get a clone of the current mappings.
 pub fn get() -> Option<Vec<TopicMapping>> {
     let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     lock.clone()
@@ -119,10 +108,8 @@ pub fn render(
     let env = ENV.get_or_init(Environment::new);
 
     let mut results = Vec::new();
-    let mut matched = false;
 
     for mapping in mappings.iter().filter(|m| m.schema == schema && m.table == table) {
-        matched = true;
 
         let topic = match env.render_str(
             &mapping.topic_template,
@@ -169,18 +156,6 @@ pub fn render(
             payload: payload.into_bytes(),
             qos: mapping.qos,
         });
-    }
-
-    if !matched {
-        pgrx::log!(
-            "WARNING: pgmqtt.topic_map no mapping match for {}.{}. Active mappings: {:?}",
-            schema,
-            table,
-            mappings
-                .iter()
-                .map(|m| format!("{}.{} ({})", m.schema, m.table, m.name))
-                .collect::<Vec<_>>()
-        );
     }
 
     results

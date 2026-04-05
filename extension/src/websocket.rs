@@ -78,6 +78,7 @@ pub fn handshake<S: Read + Write>(stream: &mut S) -> io::Result<(Vec<u8>, Option
     // Also extract JWT token from query param or Authorization header.
     let mut ws_key: Option<String> = None;
     let mut jwt_token: Option<String> = None;
+    let mut has_mqtt_protocol = false;
     let mut lines = request.lines();
 
     // Parse request line for ?jwt= query param: e.g. "GET /?jwt=<token> HTTP/1.1"
@@ -103,6 +104,17 @@ pub fn handshake<S: Read + Write>(stream: &mut S) -> io::Result<(Vec<u8>, Option
             if let Some(idx) = line.find(':') {
                 ws_key = Some(line[idx + 1..].trim().to_string());
             }
+        } else if lower.starts_with("sec-websocket-protocol:") {
+            // Check if the client offered "mqtt" as a subprotocol
+            if let Some(idx) = line.find(':') {
+                let val = line[idx + 1..].trim();
+                for proto in val.split(',') {
+                    if proto.trim().eq_ignore_ascii_case("mqtt") {
+                        has_mqtt_protocol = true;
+                        break;
+                    }
+                }
+            }
         } else if jwt_token.is_none() && lower.starts_with("authorization:") {
             if let Some(idx) = line.find(':') {
                 let val = line[idx + 1..].trim();
@@ -125,15 +137,22 @@ pub fn handshake<S: Read + Write>(stream: &mut S) -> io::Result<(Vec<u8>, Option
     // Compute Sec-WebSocket-Accept = base64(SHA-1(key + magic))
     let accept = compute_accept(&key);
 
+    // RFC 6455 §4.2.2: only include Sec-WebSocket-Protocol if the client offered it.
+    let protocol_line = if has_mqtt_protocol {
+        "Sec-WebSocket-Protocol: mqtt\r\n"
+    } else {
+        ""
+    };
+
     // Send 101 response
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {}\r\n\
-         Sec-WebSocket-Protocol: mqtt\r\n\
+         {}\
          \r\n",
-        accept
+        accept, protocol_line
     );
     stream.write_all(response.as_bytes())?;
     Ok((leftover, jwt_token))
@@ -158,8 +177,15 @@ fn compute_accept(key: &str) -> String {
 /// `Write` wraps the supplied bytes as a single unmasked Binary data frame.
 pub struct WsStream<S: Read + Write> {
     inner: S,
-    /// Leftover unprocessed payload from a previous `read` call.
+    /// Raw wire bytes from the handshake that have not yet been decoded as
+    /// WebSocket frames.  `read_exact_inner` drains this before reading from
+    /// the underlying stream.
+    wire_buf: Vec<u8>,
+    /// Decoded payload bytes left over from a previous `read` call (i.e. frame
+    /// payload that did not fit in the caller's buffer).
     read_buf: Vec<u8>,
+    /// Reassembly buffer for fragmented messages (RFC 6455 §5.4).
+    frag_buf: Vec<u8>,
     /// True once a Close frame has been sent or received.
     closed: bool,
 }
@@ -168,7 +194,9 @@ impl<S: Read + Write> WsStream<S> {
     pub fn new(stream: S, initial_data: Vec<u8>) -> Self {
         Self {
             inner: stream,
-            read_buf: initial_data,
+            wire_buf: initial_data,
+            read_buf: Vec::new(),
+            frag_buf: Vec::new(),
             closed: false,
         }
     }
@@ -178,16 +206,21 @@ impl<S: Read + Write> WsStream<S> {
         &self.inner
     }
 
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self) -> &mut S {
-        &mut self.inner
-    }
-
     // ── Frame reader ──────────────────────────────────────────────────────────
 
-    /// Read exactly `n` bytes from the inner stream into `dst`.
+    /// Read exactly `n` bytes into `dst`, first draining `wire_buf` then
+    /// falling through to the underlying stream.
     fn read_exact_inner(&mut self, dst: &mut [u8]) -> io::Result<()> {
         let mut pos = 0;
+
+        // Drain wire_buf first
+        if !self.wire_buf.is_empty() {
+            let n = dst.len().min(self.wire_buf.len());
+            dst[..n].copy_from_slice(&self.wire_buf[..n]);
+            self.wire_buf.drain(..n);
+            pos = n;
+        }
+
         while pos < dst.len() {
             match self.inner.read(&mut dst[pos..]) {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ws eof")),
@@ -208,17 +241,35 @@ impl<S: Read + Write> WsStream<S> {
 
     /// Read one complete WebSocket frame and return `(opcode, payload)`.
     /// Control frames (Ping/Pong/Close) are handled inline; data frames are
-    /// returned to the caller.
+    /// returned to the caller.  Fragmented messages are reassembled per
+    /// RFC 6455 §5.4.
     fn read_frame(&mut self) -> io::Result<(u8, Vec<u8>)> {
         loop {
             // ── Fixed 2-byte header ───────────────────────────────────────────
             let mut hdr = [0u8; 2];
             self.read_exact_inner(&mut hdr)?;
 
-            let _fin = (hdr[0] & 0x80) != 0;
+            let fin = (hdr[0] & 0x80) != 0;
+            let rsv = hdr[0] & 0x70;
             let opcode = hdr[0] & 0x0F;
             let masked = (hdr[1] & 0x80) != 0;
             let len7 = (hdr[1] & 0x7F) as usize;
+
+            // RFC 6455 §5.2: RSV bits MUST be 0 unless an extension is negotiated.
+            if rsv != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ws non-zero RSV bits: 0x{:02x}", rsv),
+                ));
+            }
+
+            // RFC 6455 §5.1: client frames MUST be masked.
+            if !masked {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ws client frame not masked",
+                ));
+            }
 
             // ── Extended payload length ───────────────────────────────────────
             let payload_len: usize = match len7 {
@@ -236,13 +287,8 @@ impl<S: Read + Write> WsStream<S> {
             };
 
             // ── Masking key ───────────────────────────────────────────────────
-            let mask = if masked {
-                let mut m = [0u8; 4];
-                self.read_exact_inner(&mut m)?;
-                Some(m)
-            } else {
-                None
-            };
+            let mut mask = [0u8; 4];
+            self.read_exact_inner(&mut mask)?;
 
             // ── Payload ───────────────────────────────────────────────────────
             if payload_len > MAX_WS_FRAME_SIZE {
@@ -258,16 +304,43 @@ impl<S: Read + Write> WsStream<S> {
             if payload_len > 0 {
                 self.read_exact_inner(&mut payload)?;
             }
-            if let Some(mask) = mask {
-                for (i, byte) in payload.iter_mut().enumerate() {
-                    *byte ^= mask[i % 4];
-                }
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
             }
 
             // ── Dispatch by opcode ────────────────────────────────────────────
             match opcode {
-                OP_TEXT | OP_BIN | OP_CONT => {
-                    return Ok((opcode, payload));
+                OP_TEXT | OP_BIN => {
+                    if fin {
+                        // Unfragmented message — return immediately.
+                        // If there was an abandoned fragment in progress, discard it
+                        // (the spec says interleaving is not allowed).
+                        self.frag_buf.clear();
+                        return Ok((opcode, payload));
+                    }
+                    // Start of a fragmented message.
+                    self.frag_buf.clear();
+                    self.frag_buf.extend_from_slice(&payload);
+                }
+                OP_CONT => {
+                    // Continuation frame — append to the reassembly buffer.
+                    if self.frag_buf.len() + payload.len() > MAX_WS_FRAME_SIZE {
+                        self.frag_buf.clear();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "ws reassembled message too large: {} + {} bytes (max {})",
+                                self.frag_buf.len(),
+                                payload.len(),
+                                MAX_WS_FRAME_SIZE,
+                            ),
+                        ));
+                    }
+                    self.frag_buf.extend_from_slice(&payload);
+                    if fin {
+                        let assembled = std::mem::take(&mut self.frag_buf);
+                        return Ok((OP_BIN, assembled));
+                    }
                 }
                 OP_PING => {
                     // Respond with Pong carrying the same payload
@@ -325,7 +398,7 @@ impl<S: Read + Write> WsStream<S> {
 
 impl<S: Read + Write> Read for WsStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // If we have leftover bytes from a previous frame, drain them first.
+        // If we have leftover decoded payload from a previous frame, drain it first.
         if !self.read_buf.is_empty() {
             let n = buf.len().min(self.read_buf.len());
             buf[..n].copy_from_slice(&self.read_buf[..n]);

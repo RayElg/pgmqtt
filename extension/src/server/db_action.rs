@@ -24,12 +24,6 @@ pub enum SessionDbAction {
     DeleteSession {
         client_id: String,
     },
-    /// Insert a message row (QoS ≥ 1 only).
-    InsertMessage {
-        client_id: String,
-        message_id: i64,
-        packet_id: Option<u16>,
-    },
     /// Batch insert multiple session_messages rows for the same message_id (one per client).
     InsertMessageBatch {
         message_id: i64,
@@ -119,24 +113,6 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         // rows. Messages that now have no remaining session_messages are cleaned up
                         // by the DeleteMessage action when each subscriber ACKs. A global sweep
                         // here would race with InsertMessageBatch in the same transaction.
-                    }
-                    SessionDbAction::InsertMessage {
-                        client_id,
-                        message_id,
-                        packet_id,
-                    } => {
-                        let pid_arg = packet_id.map(|p| p as i32);
-                        let args: Vec<DatumWithOid> =
-                            vec![client_id.as_str().into(), message_id.into(), pid_arg.into()];
-                        if let Err(e) = client.update(
-                            "INSERT INTO pgmqtt_session_messages (client_id, message_id, packet_id, sent_at) \
-                             VALUES ($1, $2, $3, CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
-                             ON CONFLICT (client_id, message_id) DO NOTHING",
-                            None,
-                            &args,
-                        ) {
-                            pgrx::log!("pgmqtt: failed to insert message for session '{}': {}", client_id, e);
-                        }
                     }
                     SessionDbAction::InsertMessageBatch {
                         message_id,

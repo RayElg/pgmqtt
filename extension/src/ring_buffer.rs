@@ -66,10 +66,6 @@ impl RingBuffer {
         self.buf.drain(..).collect()
     }
 
-    #[allow(dead_code)]
-    fn dropped_count(&self) -> u64 {
-        self.dropped
-    }
 }
 
 static RING: Mutex<Option<RingBuffer>> = Mutex::new(None);
@@ -95,9 +91,3 @@ pub fn drain() -> Vec<RingEvent> {
     lock.as_mut().unwrap().drain()
 }
 
-/// Return the number of events that were dropped due to overflow.
-#[allow(dead_code)]
-pub fn dropped_count() -> u64 {
-    let lock = RING.lock().expect("ring_buffer: poisoned mutex");
-    lock.as_ref().map_or(0, |rb| rb.dropped_count())
-}

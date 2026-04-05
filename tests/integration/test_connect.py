@@ -15,6 +15,8 @@ from proto_utils import (
     create_disconnect_packet,
     recv_packet,
     validate_connack,
+    validate_disconnect,
+    validate_publish,
     validate_suback,
     validate_pingresp,
     MQTTControlPacket,
@@ -254,7 +256,7 @@ def test_concurrent_connections():
 
 
 def test_session_takeover():
-    """Second connection with same client_id disconnects the first."""
+    """Second connection with same client_id disconnects the first with 0x8E."""
     client_id = "takeover_client"
 
     # First connection
@@ -275,19 +277,66 @@ def test_session_takeover():
     assert resp2 is not None, "Second CONNACK not received"
     validate_connack(resp2)
 
-    # First connection should be disconnected — either DISCONNECT packet or closed
+    # First connection should receive DISCONNECT with Session Taken Over (0x8E)
     resp1 = recv_packet(s1, timeout=3)
     if resp1 is not None:
         ptype = (resp1[0] >> 4)
         assert ptype == MQTTControlPacket.DISCONNECT, \
             f"Expected DISCONNECT on first connection, got packet type {ptype}"
-        print("  First connection received DISCONNECT")
+        rc = validate_disconnect(resp1)
+        assert rc == ReasonCode.SESSION_TAKEN_OVER, \
+            f"Expected reason code 0x8E (Session Taken Over), got 0x{rc:02x}"
+        print("  First connection received DISCONNECT 0x8E")
     else:
         # Connection was closed (recv returned None)
         print("  First connection closed by broker")
 
     s1.close()
     s2.close()
+
+
+def test_session_takeover_fires_will():
+    """Session takeover fires the old client's Will message (MQTT 5.0 §3.1.2.5)."""
+    client_id = "takeover_will_client"
+    will_topic = "test/takeover/will"
+    will_payload = b"old client will"
+
+    # Subscriber for Will topic
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.settimeout(5)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet("takeover_will_sub", clean_start=True))
+    validate_connack(recv_packet(s_sub))
+    s_sub.sendall(create_subscribe_packet(1, will_topic, qos=0))
+    recv_packet(s_sub)  # SUBACK
+
+    # First connection with Will
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s1.settimeout(5)
+    s1.connect((MQTT_HOST, MQTT_PORT))
+    s1.sendall(create_connect_packet(
+        client_id, will_topic=will_topic, will_payload=will_payload, will_qos=0,
+    ))
+    validate_connack(recv_packet(s1))
+
+    # Second connection takes over session
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.settimeout(5)
+    s2.connect((MQTT_HOST, MQTT_PORT))
+    s2.sendall(create_connect_packet(client_id))
+    validate_connack(recv_packet(s2))
+
+    # Subscriber should receive the Will message
+    pub = recv_packet(s_sub, timeout=5)
+    assert pub is not None, "Will message should be published on session takeover"
+    t, p, *_ = validate_publish(pub)
+    assert t == will_topic
+    assert p == will_payload
+    print("  Will message received on session takeover")
+
+    s1.close()
+    s2.close()
+    s_sub.close()
 
 
 def test_duplicate_connect():

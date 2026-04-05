@@ -25,7 +25,8 @@ struct TopicBufferState {
     /// topic → unbounded buffer of QoS > 0 messages
     buffers_qos1: HashMap<String, VecDeque<MqttMessage>>,
     capacity: usize,
-    dropped: u64,
+    /// Per-topic drop counters for overflow diagnostics.
+    dropped: HashMap<String, u64>,
 }
 
 impl TopicBufferState {
@@ -34,40 +35,43 @@ impl TopicBufferState {
             buffers_qos0: HashMap::new(),
             buffers_qos1: HashMap::new(),
             capacity,
-            dropped: 0,
+            dropped: HashMap::new(),
         }
     }
 
     fn push(&mut self, msg: MqttMessage) {
         if msg.qos == 0 {
+            let topic_key = msg.topic.clone();
             let buf = self
                 .buffers_qos0
-                .entry(msg.topic.clone())
+                .entry(topic_key.clone())
                 .or_insert_with(|| VecDeque::with_capacity(self.capacity));
 
             if buf.len() >= self.capacity {
                 buf.pop_front();
-                self.dropped += 1;
-                if self.dropped % 100 == 1 {
+                let count = self.dropped.entry(topic_key.clone()).or_insert(0);
+                *count += 1;
+                if *count % 100 == 1 {
                     pgrx::log!(
-                        "WARNING: pgmqtt topic buffer overflow (QoS 0) for topic='{}'! Dropped {} messages so far.",
-                        msg.topic,
-                        self.dropped
+                        "WARNING: pgmqtt topic buffer overflow (QoS 0) for topic='{}'. Dropped {} messages for this topic.",
+                        topic_key,
+                        count
                     );
                 }
             }
-            buf.push_back(msg.clone());
+            buf.push_back(msg);
         } else {
+            let topic_key = msg.topic.clone();
             let buf = self
                 .buffers_qos1
-                .entry(msg.topic.clone())
+                .entry(topic_key.clone())
                 .or_insert_with(VecDeque::new);
 
-            buf.push_back(msg.clone());
+            buf.push_back(msg);
             if buf.len() % 1000 == 0 {
                 pgrx::log!(
                     "WARNING: pgmqtt topic buffer (QoS 1+) for topic='{}' is growing large (buf_qos1_len={}).",
-                    msg.topic,
+                    topic_key,
                     buf.len()
                 );
             }
@@ -76,18 +80,17 @@ impl TopicBufferState {
 
     fn drain_all(&mut self) -> Vec<MqttMessage> {
         let mut out = Vec::new();
-        for (_topic, buf) in &mut self.buffers_qos0 {
+        // Drain and remove empty entries to prevent unbounded HashMap growth
+        // from dynamic topics.
+        self.buffers_qos0.retain(|_topic, buf| {
             out.extend(buf.drain(..));
-        }
-        for (_topic, buf) in &mut self.buffers_qos1 {
+            false // remove all entries; they'll be re-created on next push
+        });
+        self.buffers_qos1.retain(|_topic, buf| {
             out.extend(buf.drain(..));
-        }
+            false
+        });
         out
-    }
-
-    #[allow(dead_code)]
-    fn dropped_count(&self) -> u64 {
-        self.dropped
     }
 }
 
@@ -112,10 +115,4 @@ pub fn push(msg: MqttMessage) {
 /// Drain all pending messages across all topics.
 pub fn drain_all() -> Vec<MqttMessage> {
     with_state(|state| state.drain_all())
-}
-
-/// Number of messages dropped due to per-topic overflow.
-#[allow(dead_code)]
-pub fn dropped_count() -> u64 {
-    with_state(|state| state.dropped_count())
 }

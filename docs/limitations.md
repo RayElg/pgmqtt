@@ -140,3 +140,46 @@ Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
 | CDC QoS 1 throughput (200 msgs) | [test_perf.py](tests/integration/test_perf.py) |
 | Long-lived connection (40s) | [test_perf.py](tests/integration/test_perf.py) |
 | High concurrency (50 clients x 1000 msgs) | [test_perf.py](tests/integration/test_perf.py) |
+
+---
+
+# Hard-Coded Limits
+
+The following limits are compiled into the extension binary and cannot be changed at runtime.
+
+## Connection & Client Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Max concurrent connections (community) | **1,000** | Enterprise licenses can raise this via the license payload. |
+| Max subscriptions per client | **100** | Additional SUBSCRIBE requests beyond this are rejected with an error reason code. |
+| Client receive maximum (default) | **65,535** | MQTT 5.0 default; clients may negotiate a lower value via the CONNECT `Receive Maximum` property. |
+
+## Message & Packet Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Max MQTT packet size | **64 KB** (65,536 bytes) | Maximum bytes the broker will read from a single client request. Clients exceeding this are disconnected with `Malformed Packet`. |
+| Max WebSocket frame payload | **64 KB** (65,536 bytes) | WebSocket frames larger than this are rejected and the connection is closed. |
+| Max inflight QoS 1 messages per client | **800** | Unacknowledged QoS 1 PUBLISH packets queued for delivery. Additional messages are queued until the client ACKs. |
+| Per-client pending queue warning | **10,000** messages | A warning is logged when a client's pending message queue exceeds this threshold. |
+| Per-client pending queue hard cap | **50,000** messages | Clients exceeding this are disconnected to prevent unbounded memory growth. |
+
+## Buffer & Throughput Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| CDC ring buffer capacity | **8,192** events | Fixed-capacity ring buffer for CDC change events. Oldest events are dropped on overflow (logged every 100 drops). |
+| Per-topic QoS 0 buffer capacity | **4,096** messages | Bounded ring buffer per topic for QoS 0 CDC messages. Oldest messages are dropped on overflow. |
+| Per-topic QoS 1+ buffer | **unbounded** | QoS 1+ messages are queued without a hard cap (a warning is logged every 1,000 messages). |
+| CDC batch size | **256** rows | Maximum number of WAL changes consumed per poll cycle via `pg_logical_slot_get_changes`. |
+| Inbound pending batch size | **50** rows | Maximum number of pending inbound writes processed per cycle. |
+
+## Timing
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Poll interval (latch) | **80 ms** | How often the background worker wakes to accept connections, poll clients, and drain CDC. |
+| Client read/write timeout | **2 seconds** | Timeout for individual client I/O operations. |
+| CONNECT handshake timeout | **5 seconds** | Maximum time to wait for the initial MQTT CONNECT packet from a new connection. |
+| Keep-alive enforcement | **1.5 &times; keep_alive** | Clients are disconnected if no packet is received within 1.5&times; their negotiated keep-alive interval (per MQTT 5.0 §3.1.2.10). A keep-alive of 0 disables the timeout. |
