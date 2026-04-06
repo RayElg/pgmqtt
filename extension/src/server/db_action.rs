@@ -6,6 +6,58 @@
 
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::datum::DatumWithOid;
+use pgrx::spi;
+
+/// Persist a message to `pgmqtt_messages`, returning the generated ID.
+///
+/// Used by both the CDC path and the client PUBLISH path.
+pub fn persist_message(
+    client: &mut spi::SpiClient<'_>,
+    topic: &str,
+    payload: &[u8],
+    qos: u8,
+    retain: bool,
+) -> Result<i64, spi::Error> {
+    let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
+    let spi_args: Vec<DatumWithOid> = vec![
+        topic.into(),
+        payload_arg.into(),
+        (qos as i32).into(),
+        retain.into(),
+    ];
+    let table = client.update(
+        "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+        None,
+        &spi_args,
+    )?;
+    for row in table {
+        if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+            return Ok(id);
+        }
+    }
+    Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
+}
+
+/// Delete a message from `pgmqtt_messages` if it has no remaining references
+/// (no session_messages, no inbound_pending) and is not retained.
+///
+/// Safe to call unconditionally — does nothing if references still exist.
+pub fn cleanup_orphaned_message(
+    client: &mut spi::SpiClient<'_>,
+    message_id: i64,
+) -> Result<(), spi::Error> {
+    let args: Vec<DatumWithOid> = vec![message_id.into()];
+    client.update(
+        "DELETE FROM pgmqtt_messages \
+         WHERE id = $1 AND retain = false \
+           AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+           AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+        None,
+        &args,
+    )?;
+    Ok(())
+}
 
 /// Batched database operation: insert/update/delete session, message, or subscription.
 #[derive(Debug)]
@@ -180,21 +232,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         ) {
                             pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
                         }
-                        // Delete the message itself if no other session or
-                        // inbound-pending row is waiting for it.
-                        let args2: Vec<DatumWithOid> = vec![message_id.into()];
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_messages \
-                             WHERE id = $1 AND retain = false \
-                               AND NOT EXISTS ( \
-                                   SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1 \
-                               ) \
-                               AND NOT EXISTS ( \
-                                   SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1 \
-                               )",
-                            None,
-                            &args2,
-                        ) {
+                        if let Err(e) = cleanup_orphaned_message(client, message_id) {
                             pgrx::log!("pgmqtt: failed to delete orphaned message {}: {}", message_id, e);
                         }
                     }

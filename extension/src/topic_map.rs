@@ -8,7 +8,7 @@
 
 use minijinja::{context, Environment};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,8 +30,8 @@ pub struct TopicMapping {
 /// A rendered MQTT message ready for the per-topic buffer.
 #[derive(Debug, Clone)]
 pub struct RenderedMessage {
-    pub topic: String,
-    pub payload: Vec<u8>,
+    pub topic: Arc<str>,
+    pub payload: Arc<[u8]>,
     pub qos: u8,
 }
 
@@ -152,8 +152,8 @@ pub fn render(
         };
 
         results.push(RenderedMessage {
-            topic,
-            payload: payload.into_bytes(),
+            topic: Arc::from(topic.as_str()),
+            payload: Arc::from(payload.into_bytes()),
             qos: mapping.qos,
         });
     }

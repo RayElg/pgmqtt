@@ -102,12 +102,174 @@ impl SharedGroup {
 }
 
 // ---------------------------------------------------------------------------
+// Subscription trie — O(topic_depth) matching instead of O(num_filters)
+// ---------------------------------------------------------------------------
+
+/// A trie node for MQTT topic filter matching.
+///
+/// Each level corresponds to one `/`-separated segment of a filter.
+/// Wildcards `+` and `#` are handled via dedicated child/subscriber slots.
+struct TrieNode {
+    /// Exact segment → child node.
+    children: HashMap<String, TrieNode>,
+    /// Child for the `+` single-level wildcard.
+    plus_child: Option<Box<TrieNode>>,
+    /// Subscribers who registered `#` at this level (always terminal).
+    hash_subscribers: HashMap<String, u8>,
+    /// Subscribers whose filter ends exactly at this level.
+    subscribers: HashMap<String, u8>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            children: HashMap::new(),
+            plus_child: None,
+            hash_subscribers: HashMap::new(),
+            subscribers: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, segments: &[&str], client_id: &str, qos: u8) {
+        if segments.is_empty() {
+            self.subscribers.insert(client_id.to_string(), qos);
+            return;
+        }
+        match segments[0] {
+            "#" => {
+                self.hash_subscribers.insert(client_id.to_string(), qos);
+            }
+            "+" => {
+                let child = self.plus_child.get_or_insert_with(|| Box::new(TrieNode::new()));
+                child.insert(&segments[1..], client_id, qos);
+            }
+            seg => {
+                let child = self.children.entry(seg.to_string()).or_insert_with(TrieNode::new);
+                child.insert(&segments[1..], client_id, qos);
+            }
+        }
+    }
+
+    fn remove(&mut self, segments: &[&str], client_id: &str) -> bool {
+        if segments.is_empty() {
+            return self.subscribers.remove(client_id).is_some();
+        }
+        match segments[0] {
+            "#" => self.hash_subscribers.remove(client_id).is_some(),
+            "+" => {
+                if let Some(child) = &mut self.plus_child {
+                    let removed = child.remove(&segments[1..], client_id);
+                    if child.is_empty() {
+                        self.plus_child = None;
+                    }
+                    removed
+                } else {
+                    false
+                }
+            }
+            seg => {
+                if let Some(child) = self.children.get_mut(seg) {
+                    let removed = child.remove(&segments[1..], client_id);
+                    if child.is_empty() {
+                        self.children.remove(seg);
+                    }
+                    removed
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.children.is_empty()
+            && self.plus_child.is_none()
+            && self.hash_subscribers.is_empty()
+            && self.subscribers.is_empty()
+    }
+
+    /// Collect all (client_id, qos) pairs matching a concrete topic.
+    fn match_topic(&self, segments: &[&str], is_dollar: bool, results: &mut HashMap<String, u8>) {
+        // '#' at this level matches any remaining segments.
+        // Exception: $-topics must not match leading wildcards (MQTT §4.7.2).
+        if !is_dollar {
+            for (cid, qos) in &self.hash_subscribers {
+                let e = results.entry(cid.clone()).or_insert(*qos);
+                if *qos > *e { *e = *qos; }
+            }
+        }
+
+        if segments.is_empty() {
+            for (cid, qos) in &self.subscribers {
+                let e = results.entry(cid.clone()).or_insert(*qos);
+                if *qos > *e { *e = *qos; }
+            }
+            return;
+        }
+
+        let seg = segments[0];
+        let rest = &segments[1..];
+
+        // Exact match child
+        if let Some(child) = self.children.get(seg) {
+            child.match_topic(rest, false, results);
+        }
+
+        // '+' wildcard (matches any single segment, but not $-leading topics at root)
+        if !is_dollar {
+            if let Some(child) = &self.plus_child {
+                child.match_topic(rest, false, results);
+            }
+        }
+    }
+
+    /// Check if any subscriber matches a concrete topic (early exit).
+    fn has_match(&self, segments: &[&str], is_dollar: bool) -> bool {
+        if !is_dollar && !self.hash_subscribers.is_empty() {
+            return true;
+        }
+        if segments.is_empty() {
+            return !self.subscribers.is_empty();
+        }
+        let seg = segments[0];
+        let rest = &segments[1..];
+        if let Some(child) = self.children.get(seg) {
+            if child.has_match(rest, false) { return true; }
+        }
+        if !is_dollar {
+            if let Some(child) = &self.plus_child {
+                if child.has_match(rest, false) { return true; }
+            }
+        }
+        false
+    }
+
+    /// Collect all active filter strings (for diagnostics).
+    fn collect_filters(&self, prefix: &str, out: &mut Vec<String>) {
+        if !self.subscribers.is_empty() {
+            out.push(if prefix.is_empty() { String::new() } else { prefix.to_string() });
+        }
+        if !self.hash_subscribers.is_empty() {
+            out.push(if prefix.is_empty() { "#".to_string() } else { format!("{prefix}/#") });
+        }
+        for (seg, child) in &self.children {
+            let next = if prefix.is_empty() { seg.clone() } else { format!("{prefix}/{seg}") };
+            child.collect_filters(&next, out);
+        }
+        if let Some(child) = &self.plus_child {
+            let next = if prefix.is_empty() { "+".to_string() } else { format!("{prefix}/+") };
+            child.collect_filters(&next, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
 struct SubState {
-    /// topic_filter → client_id → granted_qos (regular subscriptions)
-    filter_to_clients: HashMap<String, HashMap<String, u8>>,
+    /// Trie for O(depth) topic matching of regular subscriptions.
+    trie: TrieNode,
     /// client_id → set of topic_filters (reverse index for cleanup;
     /// stores the full wire string, including `$share/group/` prefix when applicable)
     client_to_filters: HashMap<String, HashSet<String>>,
@@ -118,7 +280,7 @@ struct SubState {
 impl SubState {
     fn new() -> Self {
         Self {
-            filter_to_clients: HashMap::new(),
+            trie: TrieNode::new(),
             client_to_filters: HashMap::new(),
             shared_groups: HashMap::new(),
         }
@@ -197,11 +359,8 @@ pub fn subscribe(client_id: &str, topic_filter: &str, requested_qos: u8) -> u8 {
                 .or_insert_with(|| SharedGroup::new(real_filter.to_string()));
             sg.add_member(client_id.to_string(), granted_qos);
         } else {
-            state
-                .filter_to_clients
-                .entry(topic_filter.to_string())
-                .or_default()
-                .insert(client_id.to_string(), granted_qos);
+            let segments: Vec<&str> = topic_filter.split('/').collect();
+            state.trie.insert(&segments, client_id, granted_qos);
         }
 
         granted_qos
@@ -220,11 +379,9 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
                     state.shared_groups.remove(topic_filter);
                 }
             }
-        } else if let Some(clients) = state.filter_to_clients.get_mut(topic_filter) {
-            removed = clients.remove(client_id).is_some();
-            if clients.is_empty() {
-                state.filter_to_clients.remove(topic_filter);
-            }
+        } else {
+            let segments: Vec<&str> = topic_filter.split('/').collect();
+            removed = state.trie.remove(&segments, client_id);
         }
 
         if let Some(filters) = state.client_to_filters.get_mut(client_id) {
@@ -250,11 +407,9 @@ pub fn remove_client(client_id: &str) {
                             state.shared_groups.remove(filter.as_str());
                         }
                     }
-                } else if let Some(clients) = state.filter_to_clients.get_mut(&filter) {
-                    clients.remove(client_id);
-                    if clients.is_empty() {
-                        state.filter_to_clients.remove(&filter);
-                    }
+                } else {
+                    let segments: Vec<&str> = filter.split('/').collect();
+                    state.trie.remove(&segments, client_id);
                 }
             }
         }
@@ -267,10 +422,10 @@ pub fn remove_client(client_id: &str) {
 /// from optimization-check paths that only need a yes/no answer.
 pub fn has_subscribers(topic: &str) -> bool {
     with_state(|state| {
-        for filter in state.filter_to_clients.keys() {
-            if mqtt::topic_matches_filter(topic, filter) {
-                return true;
-            }
+        let segments: Vec<&str> = topic.split('/').collect();
+        let is_dollar = topic.starts_with('$');
+        if state.trie.has_match(&segments, is_dollar) {
+            return true;
         }
         for sg in state.shared_groups.values() {
             if mqtt::topic_matches_filter(topic, &sg.filter) {
@@ -293,19 +448,13 @@ pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(Str
     with_state(|state| {
         let mut matched: HashMap<String, u8> = HashMap::new();
 
-        // Regular subscriptions.
-        for (filter, clients) in &state.filter_to_clients {
-            if mqtt::topic_matches_filter(topic, filter) {
-                for (client, qos) in clients {
-                    let entry = matched.entry(client.clone()).or_insert(*qos);
-                    if *qos > *entry {
-                        *entry = *qos;
-                    }
-                }
-            }
-        }
+        // Regular subscriptions via trie.
+        let segments: Vec<&str> = topic.split('/').collect();
+        let is_dollar = topic.starts_with('$');
+        state.trie.match_topic(&segments, is_dollar, &mut matched);
 
-        // Shared subscriptions: one client per matching group.
+        // Shared subscriptions: one client per matching group (linear scan
+        // is fine — shared groups are typically few).
         for sg in state.shared_groups.values() {
             if mqtt::topic_matches_filter(topic, &sg.filter) {
                 if let Some((cid, qos)) = sg.next_member(|c| connected_clients.contains(c)) {
@@ -324,7 +473,8 @@ pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(Str
 /// Helper for diagnostics: return all active topic filters.
 pub fn active_filters() -> Vec<String> {
     with_state(|state| {
-        let mut filters: Vec<String> = state.filter_to_clients.keys().cloned().collect();
+        let mut filters = Vec::new();
+        state.trie.collect_filters("", &mut filters);
         filters.extend(state.shared_groups.keys().cloned());
         filters
     })
