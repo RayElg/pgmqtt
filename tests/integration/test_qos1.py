@@ -103,6 +103,40 @@ def test_qos_downgrade_2_to_1():
     pub.close()
 
 
+def test_qos1_client_publish_direct_delivery():
+    """QoS 1 client publish delivers to subscriber and sends PUBACK."""
+    # Subscribe
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet("q1_direct_sub", clean_start=True))
+    validate_connack(recv_packet(s_sub))
+    s_sub.sendall(create_subscribe_packet(1, "test/qos1/direct", qos=1))
+    validate_suback(recv_packet(s_sub), 1)
+
+    # Publish QoS 1
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("q1_direct_pub", clean_start=True))
+    validate_connack(recv_packet(s_pub))
+    s_pub.sendall(create_publish_packet("test/qos1/direct", b"qos1-direct", qos=1, packet_id=1))
+
+    # Publisher should get PUBACK
+    puback = recv_packet(s_pub, timeout=5)
+    assert puback is not None, "Publisher should receive PUBACK"
+    assert (puback[0] >> 4) == 4  # PUBACK packet type
+
+    # Subscriber should receive the message
+    pkt = recv_packet(s_sub, timeout=3)
+    assert pkt is not None, "Subscriber should receive QoS 1 message"
+    topic, payload, qos, dup, retain, pid, props = validate_publish(pkt)
+    assert topic == "test/qos1/direct"
+    assert payload == b"qos1-direct"
+    assert qos == 1
+
+    s_pub.close()
+    s_sub.close()
+
+
 def test_packet_id_wraparound():
     """Test Handling of Packet ID wraparound."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

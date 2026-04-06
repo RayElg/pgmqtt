@@ -3,9 +3,17 @@
 //! Tracks MQTT sessions (queued messages, inflight messages, subscriptions, expiry).
 //! All session state is lazily initialized and protected by a Mutex.
 
-use crate::topic_buffer;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// An MQTT message ready to publish or queue.
+#[derive(Debug, Clone)]
+pub struct MqttMessage {
+    pub id: Option<i64>,
+    pub topic: Arc<str>,
+    pub payload: Arc<[u8]>,
+    pub qos: u8,
+}
 
 /// An MQTT session: tracks queued/inflight messages, subscriptions, and expiry.
 #[derive(Clone)]
@@ -13,9 +21,9 @@ pub struct MqttSession {
     /// Next packet ID to assign (wraps at 65536).
     pub next_packet_id: u16,
     /// Outgoing packet_id → (topic, payload, msg_id, sent_at)
-    pub inflight: HashMap<u16, (String, Vec<u8>, Option<i64>, std::time::Instant)>,
+    pub inflight: HashMap<u16, (Arc<str>, Arc<[u8]>, Option<i64>, std::time::Instant)>,
     /// Messages waiting to be promoted into inflight once a slot opens up.
-    pub queue: VecDeque<topic_buffer::MqttMessage>,
+    pub queue: VecDeque<MqttMessage>,
     /// MQTT 5.0 Session Expiry Interval in seconds. 0 = end at disconnect.
     /// 0xFFFFFFFF means never expire.
     pub expiry_interval: u32,

@@ -10,7 +10,6 @@ mod mqtt;
 mod ring_buffer;
 mod server;
 mod subscriptions;
-mod topic_buffer;
 mod topic_map;
 mod websocket;
 

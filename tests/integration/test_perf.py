@@ -232,6 +232,7 @@ def test_long_lived_connection():
     received = 0
     start = time.time()
     last_send = 0
+    last_ping = 0
 
     while time.time() - start < duration:
         now = time.time()
@@ -248,8 +249,10 @@ def test_long_lived_connection():
                 if topic == "system/heartbeat":
                     received += 1
 
-        if count % 3 == 0 and count > 0:
+        # Send a PINGREQ every 15 seconds to keep the connection alive.
+        if now - last_ping >= 15:
             s.sendall(bytes([0xC0, 0x00]))  # PINGREQ
+            last_ping = now
 
         time.sleep(0.1)
 

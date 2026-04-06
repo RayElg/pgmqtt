@@ -137,6 +137,48 @@ def test_keepalive_timeout_triggers_lwt():
     s_sub.close()
 
 
+def test_session_takeover_fires_will():
+    """Session takeover disconnects old client and fires its Will message."""
+    will_topic = "test/will/takeover"
+
+    # Subscriber
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet("lwt_takeover_sub", clean_start=True))
+    validate_connack(recv_packet(s_sub))
+    s_sub.sendall(create_subscribe_packet(1, will_topic, qos=1))
+    validate_suback(recv_packet(s_sub), 1)
+
+    # Client with Will message
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s1.connect((MQTT_HOST, MQTT_PORT))
+    s1.sendall(create_connect_packet(
+        "lwt_takeover_client",
+        will_topic=will_topic,
+        will_payload=b"taken-over",
+        will_qos=0,
+    ))
+    recv_packet(s1)
+
+    time.sleep(0.5)
+
+    # Takeover: new connection with same client_id
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((MQTT_HOST, MQTT_PORT))
+    s2.sendall(create_connect_packet("lwt_takeover_client", clean_start=True))
+    validate_connack(recv_packet(s2))
+
+    # Subscriber should receive the Will message from takeover
+    pkt = recv_packet(s_sub, timeout=5)
+    assert pkt is not None, "Should receive Will message from session takeover"
+    topic, payload, *_ = validate_publish(pkt)
+    assert topic == will_topic
+    assert payload == b"taken-over"
+
+    s2.close()
+    s_sub.close()
+
+
 @pytest.mark.xfail(reason="Will Delay Interval not yet implemented")
 def test_will_delay_cancelled_on_reconnect():
     """Will with delay cancelled by reconnect within delay period."""

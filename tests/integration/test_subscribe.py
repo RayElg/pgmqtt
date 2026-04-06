@@ -215,6 +215,41 @@ def _setup_cdc_table(table, topic_template, payload_template="{{ columns.val }}"
     time.sleep(6)
 
 
+def test_overlapping_subscriptions_dedup():
+    """Multiple overlapping filters deliver exactly one message with highest QoS."""
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet("overlap_dedup_sub", clean_start=True))
+    validate_connack(recv_packet(s_sub))
+
+    # Subscribe with two overlapping filters at different QoS
+    s_sub.sendall(create_subscribe_packet(1, "test/overlap/+", qos=0))
+    validate_suback(recv_packet(s_sub), 1)
+    s_sub.sendall(create_subscribe_packet(2, "test/overlap/exact", qos=1))
+    validate_suback(recv_packet(s_sub), 2)
+
+    # Publish QoS 1 to a topic that matches both filters
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("overlap_dedup_pub", clean_start=True))
+    validate_connack(recv_packet(s_pub))
+    s_pub.sendall(create_publish_packet("test/overlap/exact", b"overlap", qos=1, packet_id=1))
+    recv_packet(s_pub, timeout=3)  # PUBACK
+
+    # Should receive exactly one message (deduped, highest QoS)
+    pkt = recv_packet(s_sub, timeout=3)
+    assert pkt is not None, "Should receive overlapping message"
+    topic, payload, *_ = validate_publish(pkt)
+    assert payload == b"overlap"
+
+    # Should NOT receive a duplicate
+    dup = recv_packet(s_sub, timeout=1)
+    assert dup is None, "Overlapping filters should not cause duplicate delivery"
+
+    s_pub.close()
+    s_sub.close()
+
+
 def test_cdc_wildcard_single_level():
     """CDC topic cdc/{name}/data matched by subscription cdc/+/data."""
     table = "cdc_wc_single"
