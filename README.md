@@ -1,6 +1,6 @@
 # pgmqtt: PostgreSQL CDC-to-MQTT Broker
 
-`pgmqtt` is a Postgres extension built with `pgrx` that introduces an embedded MQTT 5.0 broker powered directly by Change Data Capture (CDC).
+`pgmqtt` is a Postgres extension built with `pgrx` that introduces an embedded MQTT broker powered directly by Change Data Capture (CDC).
 
 With `pgmqtt`, your database changes (`INSERT`, `UPDATE`, `DELETE`) are automatically transformed into MQTT messages and published to connected clients, using pure SQL-configured topic mappings. MQTT clients can also publish messages that are automatically written to PostgreSQL tables via inbound mappings.
 

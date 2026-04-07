@@ -1,4 +1,4 @@
-//! MQTT 5.0 packet codec – Subset for current impl
+//! MQTT packet codec – supports MQTT 5.0 and MQTT 3.1.1 (protocol versions 5 and 4)
 //!
 //! Covers:
 //!   Parsing  : CONNECT, SUBSCRIBE, UNSUBSCRIBE, PINGREQ, DISCONNECT, PUBLISH
@@ -94,7 +94,39 @@ pub mod reason {
     pub const SERVER_SHUTTING_DOWN: u8 = 0x8B;
     pub const SESSION_TAKEN_OVER: u8 = 0x8E;
     pub const TOPIC_NAME_INVALID: u8 = 0x90;
+    pub const BAD_USERNAME_PASSWORD: u8 = 0x86;
     pub const QUOTA_EXCEEDED: u8 = 0x97;
+}
+
+/// MQTT 3.1.1 CONNACK return codes.
+#[allow(dead_code)]
+pub mod v3_return {
+    pub const ACCEPTED: u8 = 0x00;
+    pub const UNACCEPTABLE_PROTOCOL: u8 = 0x01;
+    pub const IDENTIFIER_REJECTED: u8 = 0x02;
+    pub const SERVER_UNAVAILABLE: u8 = 0x03;
+    pub const BAD_CREDENTIALS: u8 = 0x04;
+    pub const NOT_AUTHORIZED: u8 = 0x05;
+}
+
+/// Map a v5 reason code to a v3.1.1 CONNACK return code.
+pub fn v5_to_v3_connack(reason: u8) -> u8 {
+    match reason {
+        reason::SUCCESS => v3_return::ACCEPTED,
+        reason::NOT_AUTHORIZED => v3_return::NOT_AUTHORIZED,
+        reason::BAD_USERNAME_PASSWORD => v3_return::BAD_CREDENTIALS,
+        reason::PROTOCOL_ERROR | reason::MALFORMED_PACKET => v3_return::UNACCEPTABLE_PROTOCOL,
+        reason::QUOTA_EXCEEDED | reason::UNSPECIFIED_ERROR | reason::SERVER_SHUTTING_DOWN => {
+            v3_return::SERVER_UNAVAILABLE
+        }
+        _ => v3_return::SERVER_UNAVAILABLE,
+    }
+}
+
+/// Returns true if the protocol version is MQTT 5.0.
+#[inline]
+pub fn is_v5(protocol_version: u8) -> bool {
+    protocol_version == 5
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +452,10 @@ pub enum InboundPacket {
 // Inbound packet parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse_packet(buf: &[u8]) -> Result<(InboundPacket, usize)> {
+/// Parse a packet. `protocol_version` is used for post-CONNECT packets
+/// to decide whether properties sections exist (v5) or not (v3.1.1).
+/// Pass 5 when parsing the initial CONNECT (CONNECT self-detects its version).
+pub fn parse_packet(buf: &[u8], protocol_version: u8) -> Result<(InboundPacket, usize)> {
     let (ptype, flags, remaining, hdr_size) = parse_fixed_header(buf)?;
     let total = hdr_size + remaining;
     if buf.len() < total {
@@ -428,16 +463,17 @@ pub fn parse_packet(buf: &[u8]) -> Result<(InboundPacket, usize)> {
     }
 
     let payload = &buf[hdr_size..total];
+    let v5 = is_v5(protocol_version);
 
     let pkt = match ptype {
         PacketType::Connect => InboundPacket::Connect(parse_connect(payload)?),
-        PacketType::Publish => InboundPacket::Publish(parse_publish(payload, flags)?),
+        PacketType::Publish => InboundPacket::Publish(parse_publish(payload, flags, v5)?),
         PacketType::Puback => InboundPacket::Puback(parse_puback(payload)?),
-        PacketType::Subscribe => InboundPacket::Subscribe(parse_subscribe(payload)?),
-        PacketType::Unsubscribe => InboundPacket::Unsubscribe(parse_unsubscribe(payload)?),
+        PacketType::Subscribe => InboundPacket::Subscribe(parse_subscribe(payload, v5)?),
+        PacketType::Unsubscribe => InboundPacket::Unsubscribe(parse_unsubscribe(payload, v5)?),
         PacketType::Pingreq => InboundPacket::Pingreq,
         PacketType::Disconnect => {
-            let (rc, expiry) = parse_disconnect(payload)?;
+            let (rc, expiry) = parse_disconnect(payload, v5)?;
             InboundPacket::Disconnect(rc, expiry)
         }
         other => return Err(MqttError::UnsupportedPacket(other as u8)),
@@ -461,10 +497,9 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
     }
 
     let protocol_version = buf[off];
-    if protocol_version != 5 {
+    if protocol_version != 5 && protocol_version != 4 {
         return Err(MqttError::ProtocolError(format!(
-            "only MQTT 5.0 supported, got version {}",
-            protocol_version
+            "unsupported MQTT version {}", protocol_version
         )));
     }
 
@@ -478,10 +513,15 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
 
     let keep_alive = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
 
-    // Parse CONNECT properties (extract Session Expiry Interval and Receive Maximum)
-    let (session_expiry_interval, receive_maximum, new_off) =
-        parse_connect_properties(buf, off + 4)?;
-    let mut off = new_off;
+    // MQTT 5.0: parse CONNECT properties. MQTT 3.1.1: no properties section.
+    // For v3.1.1, clean_session=0 means "persist session indefinitely" (u32::MAX),
+    // clean_session=1 means "discard session at disconnect" (0).
+    let (session_expiry_interval, receive_maximum, mut off) = if protocol_version == 5 {
+        parse_connect_properties(buf, off + 4)?
+    } else {
+        let expiry = if clean_start { 0u32 } else { u32::MAX };
+        (expiry, 65535u16, off + 4)
+    };
 
     // Client ID
     let (client_id, new_off) = decode_utf8(buf, off)?;
@@ -489,8 +529,10 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
 
     let mut will = None;
     if has_will {
-        // Will Properties
-        off = skip_properties(buf, off)?;
+        // MQTT 5.0: Will Properties section before topic/payload. v3.1.1: none.
+        if protocol_version == 5 {
+            off = skip_properties(buf, off)?;
+        }
         // Will Topic
         let (will_topic, new_off) = decode_utf8(buf, off)?;
         off = new_off;
@@ -529,7 +571,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
     })
 }
 
-fn parse_publish(buf: &[u8], flags: u8) -> Result<PublishPacket> {
+fn parse_publish(buf: &[u8], flags: u8, v5: bool) -> Result<PublishPacket> {
     let dup = (flags & 0x08) != 0;
     let qos = (flags >> 1) & 0x03;
     let retain = (flags & 0x01) != 0;
@@ -547,8 +589,10 @@ fn parse_publish(buf: &[u8], flags: u8) -> Result<PublishPacket> {
         None
     };
 
-    // Skip properties
-    off = skip_properties(buf, off)?;
+    // MQTT 5.0 only: skip properties section
+    if v5 {
+        off = skip_properties(buf, off)?;
+    }
 
     let payload = buf[off..].to_vec();
 
@@ -562,15 +606,17 @@ fn parse_publish(buf: &[u8], flags: u8) -> Result<PublishPacket> {
     })
 }
 
-fn parse_subscribe(buf: &[u8]) -> Result<SubscribeRequest> {
+fn parse_subscribe(buf: &[u8], v5: bool) -> Result<SubscribeRequest> {
     if buf.len() < 2 {
         return Err(MqttError::Incomplete);
     }
     let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
     let mut off = 2;
 
-    // Skip properties
-    off = skip_properties(buf, off)?;
+    // MQTT 5.0 only: skip properties section
+    if v5 {
+        off = skip_properties(buf, off)?;
+    }
 
     let mut topics = Vec::new();
     while off < buf.len() {
@@ -594,15 +640,17 @@ fn parse_subscribe(buf: &[u8]) -> Result<SubscribeRequest> {
     Ok(SubscribeRequest { packet_id, topics })
 }
 
-fn parse_unsubscribe(buf: &[u8]) -> Result<UnsubscribeRequest> {
+fn parse_unsubscribe(buf: &[u8], v5: bool) -> Result<UnsubscribeRequest> {
     if buf.len() < 2 {
         return Err(MqttError::Incomplete);
     }
     let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
     let mut off = 2;
 
-    // Skip properties
-    off = skip_properties(buf, off)?;
+    // MQTT 5.0 only: skip properties section
+    if v5 {
+        off = skip_properties(buf, off)?;
+    }
 
     let mut topics = Vec::new();
     while off < buf.len() {
@@ -631,10 +679,12 @@ fn parse_puback(buf: &[u8]) -> Result<u16> {
 
 /// Parse DISCONNECT packet.
 /// Returns `(reason_code, optional Session Expiry Interval override)`.
-/// Per MQTT 5.0 §3.14.2.2.2, the client may include a Session Expiry Interval
-/// property to override the value set at CONNECT (e.g. 0 to end the session).
-fn parse_disconnect(buf: &[u8]) -> Result<(u8, Option<u32>)> {
-    if buf.is_empty() {
+/// MQTT 3.1.1: DISCONNECT has no variable header (empty body).
+/// MQTT 5.0 §3.14.2.2.2: the client may include a Session Expiry Interval
+/// property to override the value set at CONNECT.
+fn parse_disconnect(buf: &[u8], v5: bool) -> Result<(u8, Option<u32>)> {
+    // v3.1.1 DISCONNECT has no variable header at all
+    if !v5 || buf.is_empty() {
         return Ok((reason::NORMAL_DISCONNECT, None));
     }
     let reason_code = buf[0];
@@ -696,79 +746,90 @@ fn build_packet(ptype: PacketType, flags: u8, variable_header_and_payload: &[u8]
     pkt
 }
 
-pub fn build_connack(session_present: bool, reason_code: u8) -> Vec<u8> {
+pub fn build_connack(session_present: bool, reason_code: u8, v5: bool) -> Vec<u8> {
     let mut vh = Vec::with_capacity(3);
     vh.push(if session_present { 0x01 } else { 0x00 }); // connect ack flags
-    vh.push(reason_code);
-    vh.extend_from_slice(&encode_empty_properties());
+    vh.push(if v5 { reason_code } else { v5_to_v3_connack(reason_code) });
+    if v5 {
+        vh.extend_from_slice(&encode_empty_properties());
+    }
     build_packet(PacketType::Connack, 0x00, &vh)
 }
 
-pub fn build_suback(packet_id: u16, reason_codes: &[u8]) -> Vec<u8> {
+pub fn build_suback(packet_id: u16, reason_codes: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::with_capacity(2 + 1 + reason_codes.len());
     vh.extend_from_slice(&packet_id.to_be_bytes());
-    vh.extend_from_slice(&encode_empty_properties());
-    vh.extend_from_slice(reason_codes);
+    if v5 {
+        vh.extend_from_slice(&encode_empty_properties());
+    }
+    // v3.1.1 SUBACK return codes: 0x00/0x01/0x02 = granted QoS, 0x80 = failure.
+    // v5 reason codes 0x00-0x02 are identical; remap any v5 error to 0x80.
+    for &rc in reason_codes {
+        vh.push(if !v5 && rc > 0x02 { 0x80 } else { rc });
+    }
     build_packet(PacketType::Suback, 0x00, &vh)
 }
 
-pub fn build_unsuback(packet_id: u16, reason_codes: &[u8]) -> Vec<u8> {
+pub fn build_unsuback(packet_id: u16, reason_codes: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::with_capacity(2 + 1 + reason_codes.len());
     vh.extend_from_slice(&packet_id.to_be_bytes());
-    vh.extend_from_slice(&encode_empty_properties());
-    vh.extend_from_slice(reason_codes);
+    if v5 {
+        // v5: properties + per-topic reason codes
+        vh.extend_from_slice(&encode_empty_properties());
+        vh.extend_from_slice(reason_codes);
+    }
+    // v3.1.1 UNSUBACK: just the packet ID, no reason codes
     build_packet(PacketType::Unsuback, 0x00, &vh)
 }
 
-pub fn build_publish_qos0(topic: &str, payload: &[u8]) -> Vec<u8> {
+pub fn build_publish_qos0(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
-    // No packet ID for QoS 0
-    vh.extend_from_slice(&encode_empty_properties());
+    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
     vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x00, &vh) // flags: DUP=0 QoS=00 RETAIN=0
+    build_packet(PacketType::Publish, 0x00, &vh)
 }
 
-pub fn build_publish_qos0_retain(topic: &str, payload: &[u8]) -> Vec<u8> {
+pub fn build_publish_qos0_retain(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
-    vh.extend_from_slice(&encode_empty_properties());
+    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
     vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x01, &vh) // flags: DUP=0 QoS=00 RETAIN=1
+    build_packet(PacketType::Publish, 0x01, &vh)
 }
 
-pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
-    let mut vh = Vec::new();
-    vh.extend_from_slice(&encode_utf8(topic));
-    vh.extend_from_slice(&packet_id.to_be_bytes());
-    vh.extend_from_slice(&encode_empty_properties());
-    vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x02, &vh) // flags: DUP=0 QoS=01 RETAIN=0
-}
-
-pub fn build_publish_qos1_retain(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
     vh.extend_from_slice(&packet_id.to_be_bytes());
-    vh.extend_from_slice(&encode_empty_properties());
+    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
     vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x03, &vh) // flags: DUP=0 QoS=01 RETAIN=1
+    build_packet(PacketType::Publish, 0x02, &vh)
 }
 
-pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+pub fn build_publish_qos1_retain(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
     vh.extend_from_slice(&packet_id.to_be_bytes());
-    vh.extend_from_slice(&encode_empty_properties());
+    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
     vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x0A, &vh) // flags: DUP=1 QoS=01 RETAIN=0 (0x08 | 0x02)
+    build_packet(PacketType::Publish, 0x03, &vh)
 }
 
+pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&encode_utf8(topic));
+    vh.extend_from_slice(&packet_id.to_be_bytes());
+    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
+    vh.extend_from_slice(payload);
+    build_packet(PacketType::Publish, 0x0A, &vh)
+}
+
+/// Build a PUBACK. Both v3.1.1 and v5 (with omitted reason code) are identical:
+/// just the packet ID (2 bytes). No version parameter needed.
 pub fn build_puback(packet_id: u16) -> Vec<u8> {
-    let mut vh = Vec::with_capacity(3); // packet_id (2) + reason code (0) or props
+    let mut vh = Vec::with_capacity(2);
     vh.extend_from_slice(&packet_id.to_be_bytes());
-    // In MQTT 5.0, if Reason Code is Success (0x00) and no properties, we can omit them.
-    // Table 3-5: The Reason Code and Property Length can be omitted if the Reason Code is 0x00 and there are no Properties.
     build_packet(PacketType::Puback, 0x00, &vh)
 }
 
@@ -776,7 +837,15 @@ pub fn build_pingresp() -> Vec<u8> {
     build_packet(PacketType::Pingresp, 0x00, &[])
 }
 
-pub fn build_disconnect(reason_code: u8) -> Vec<u8> {
+/// Build a DISCONNECT packet.
+/// v3.1.1: empty body (no reason code, no properties).
+/// v5: reason code + empty properties.
+pub fn build_disconnect(reason_code: u8, v5: bool) -> Vec<u8> {
+    if !v5 {
+        // v3.1.1 server-sent DISCONNECT is not standard (server just closes),
+        // but sending an empty DISCONNECT is harmless and some clients handle it.
+        return build_packet(PacketType::Disconnect, 0x00, &[]);
+    }
     let mut vh = Vec::with_capacity(2);
     vh.push(reason_code);
     vh.extend_from_slice(&encode_empty_properties());
@@ -929,19 +998,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_connack_roundtrip() {
-        let pkt = build_connack(false, reason::SUCCESS);
+    fn test_build_connack_roundtrip_v5() {
+        let pkt = build_connack(false, reason::SUCCESS, true);
         let (ptype, _flags, remaining, hdr_size) = parse_fixed_header(&pkt).unwrap();
         assert_eq!(ptype, PacketType::Connack);
         assert_eq!(remaining + hdr_size, pkt.len());
     }
 
     #[test]
-    fn test_build_publish_qos0() {
-        let pkt = build_publish_qos0("test/topic", b"hello");
+    fn test_build_connack_roundtrip_v311() {
+        let pkt = build_connack(false, reason::SUCCESS, false);
+        let (ptype, _flags, remaining, hdr_size) = parse_fixed_header(&pkt).unwrap();
+        assert_eq!(ptype, PacketType::Connack);
+        assert_eq!(remaining + hdr_size, pkt.len());
+        // v3.1.1 CONNACK: 4 bytes total (fixed header 2 + ack_flags 1 + return_code 1), no properties
+        assert_eq!(pkt.len(), 4);
+    }
+
+    #[test]
+    fn test_build_publish_qos0_v5() {
+        let pkt = build_publish_qos0("test/topic", b"hello", true);
         let (ptype, flags, _remaining, _hdr_size) = parse_fixed_header(&pkt).unwrap();
         assert_eq!(ptype, PacketType::Publish);
         assert_eq!(flags, 0x00); // QoS 0, no DUP, no RETAIN
+    }
+
+    #[test]
+    fn test_build_publish_qos0_v311() {
+        let pkt = build_publish_qos0("test/topic", b"hello", false);
+        let (ptype, flags, _remaining, _hdr_size) = parse_fixed_header(&pkt).unwrap();
+        assert_eq!(ptype, PacketType::Publish);
+        assert_eq!(flags, 0x00);
     }
 
     #[test]
