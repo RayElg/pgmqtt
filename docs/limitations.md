@@ -115,9 +115,6 @@ packet and adapts all subsequent packets accordingly:
   Sensible defaults are applied (expiry governed by Clean Session flag,
   Receive Maximum = 65535).
 
-All features listed in the v5 tables above are supported for v3.1.1 clients
-except where marked as v5-only.
-
 | Feature | Status | Test |
 |---------|--------|------|
 | CONNECT / CONNACK (return codes) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
