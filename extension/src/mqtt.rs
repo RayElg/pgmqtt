@@ -95,6 +95,7 @@ pub mod reason {
     pub const SESSION_TAKEN_OVER: u8 = 0x8E;
     pub const TOPIC_NAME_INVALID: u8 = 0x90;
     pub const BAD_USERNAME_PASSWORD: u8 = 0x86;
+    pub const CLIENT_IDENTIFIER_NOT_VALID: u8 = 0x85;
     pub const QUOTA_EXCEEDED: u8 = 0x97;
 }
 
@@ -116,6 +117,7 @@ pub fn v5_to_v3_connack(reason: u8) -> u8 {
         reason::NOT_AUTHORIZED => v3_return::NOT_AUTHORIZED,
         reason::BAD_USERNAME_PASSWORD => v3_return::BAD_CREDENTIALS,
         reason::PROTOCOL_ERROR | reason::MALFORMED_PACKET => v3_return::UNACCEPTABLE_PROTOCOL,
+        reason::CLIENT_IDENTIFIER_NOT_VALID => v3_return::IDENTIFIER_REJECTED,
         reason::QUOTA_EXCEEDED | reason::UNSPECIFIED_ERROR | reason::SERVER_SHUTTING_DOWN => {
             v3_return::SERVER_UNAVAILABLE
         }
@@ -341,9 +343,7 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, usiz
     Ok((session_expiry_interval, receive_maximum, props_end))
 }
 
-fn encode_empty_properties() -> Vec<u8> {
-    vec![0x00] // property length = 0
-}
+const EMPTY_PROPERTIES: [u8; 1] = [0x00]; // property length = 0
 
 // ---------------------------------------------------------------------------
 // Fixed header parsing
@@ -751,7 +751,7 @@ pub fn build_connack(session_present: bool, reason_code: u8, v5: bool) -> Vec<u8
     vh.push(if session_present { 0x01 } else { 0x00 }); // connect ack flags
     vh.push(if v5 { reason_code } else { v5_to_v3_connack(reason_code) });
     if v5 {
-        vh.extend_from_slice(&encode_empty_properties());
+        vh.extend_from_slice(&EMPTY_PROPERTIES);
     }
     build_packet(PacketType::Connack, 0x00, &vh)
 }
@@ -760,7 +760,7 @@ pub fn build_suback(packet_id: u16, reason_codes: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::with_capacity(2 + 1 + reason_codes.len());
     vh.extend_from_slice(&packet_id.to_be_bytes());
     if v5 {
-        vh.extend_from_slice(&encode_empty_properties());
+        vh.extend_from_slice(&EMPTY_PROPERTIES);
     }
     // v3.1.1 SUBACK return codes: 0x00/0x01/0x02 = granted QoS, 0x80 = failure.
     // v5 reason codes 0x00-0x02 are identical; remap any v5 error to 0x80.
@@ -775,54 +775,37 @@ pub fn build_unsuback(packet_id: u16, reason_codes: &[u8], v5: bool) -> Vec<u8> 
     vh.extend_from_slice(&packet_id.to_be_bytes());
     if v5 {
         // v5: properties + per-topic reason codes
-        vh.extend_from_slice(&encode_empty_properties());
+        vh.extend_from_slice(&EMPTY_PROPERTIES);
         vh.extend_from_slice(reason_codes);
     }
     // v3.1.1 UNSUBACK: just the packet ID, no reason codes
     build_packet(PacketType::Unsuback, 0x00, &vh)
 }
 
-pub fn build_publish_qos0(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
-    let mut vh = Vec::new();
-    vh.extend_from_slice(&encode_utf8(topic));
-    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
-    vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x00, &vh)
-}
+/// Build a PUBLISH packet.
+/// `qos`: 0 or 1. `packet_id`: required for QoS 1, ignored for QoS 0.
+/// `dup`: set DUP flag (redelivery). `retain`: set RETAIN flag.
+pub fn build_publish(
+    topic: &str,
+    payload: &[u8],
+    qos: u8,
+    packet_id: Option<u16>,
+    dup: bool,
+    retain: bool,
+    v5: bool,
+) -> Vec<u8> {
+    let mut flags: u8 = (qos & 0x03) << 1;
+    if dup { flags |= 0x08; }
+    if retain { flags |= 0x01; }
 
-pub fn build_publish_qos0_retain(topic: &str, payload: &[u8], v5: bool) -> Vec<u8> {
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
-    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
+    if let Some(pid) = packet_id {
+        vh.extend_from_slice(&pid.to_be_bytes());
+    }
+    if v5 { vh.extend_from_slice(&EMPTY_PROPERTIES); }
     vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x01, &vh)
-}
-
-pub fn build_publish_qos1(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
-    let mut vh = Vec::new();
-    vh.extend_from_slice(&encode_utf8(topic));
-    vh.extend_from_slice(&packet_id.to_be_bytes());
-    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
-    vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x02, &vh)
-}
-
-pub fn build_publish_qos1_retain(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
-    let mut vh = Vec::new();
-    vh.extend_from_slice(&encode_utf8(topic));
-    vh.extend_from_slice(&packet_id.to_be_bytes());
-    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
-    vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x03, &vh)
-}
-
-pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16, v5: bool) -> Vec<u8> {
-    let mut vh = Vec::new();
-    vh.extend_from_slice(&encode_utf8(topic));
-    vh.extend_from_slice(&packet_id.to_be_bytes());
-    if v5 { vh.extend_from_slice(&encode_empty_properties()); }
-    vh.extend_from_slice(payload);
-    build_packet(PacketType::Publish, 0x0A, &vh)
+    build_packet(PacketType::Publish, flags, &vh)
 }
 
 /// Build a PUBACK. Both v3.1.1 and v5 (with omitted reason code) are identical:
@@ -830,6 +813,15 @@ pub fn build_publish_qos1_dup(topic: &str, payload: &[u8], packet_id: u16, v5: b
 pub fn build_puback(packet_id: u16) -> Vec<u8> {
     let mut vh = Vec::with_capacity(2);
     vh.extend_from_slice(&packet_id.to_be_bytes());
+    build_packet(PacketType::Puback, 0x00, &vh)
+}
+
+/// Build a v5 PUBACK with an explicit reason code and empty properties.
+pub fn build_puback_with_reason(packet_id: u16, reason_code: u8) -> Vec<u8> {
+    let mut vh = Vec::with_capacity(4);
+    vh.extend_from_slice(&packet_id.to_be_bytes());
+    vh.push(reason_code);
+    vh.extend_from_slice(&EMPTY_PROPERTIES);
     build_packet(PacketType::Puback, 0x00, &vh)
 }
 
@@ -842,13 +834,14 @@ pub fn build_pingresp() -> Vec<u8> {
 /// v5: reason code + empty properties.
 pub fn build_disconnect(reason_code: u8, v5: bool) -> Vec<u8> {
     if !v5 {
-        // v3.1.1 server-sent DISCONNECT is not standard (server just closes),
-        // but sending an empty DISCONNECT is harmless and some clients handle it.
+        // MQTT 3.1.1 §3.14: the server MUST NOT send DISCONNECT. We intentionally
+        // send an empty packet anyway because most clients handle it gracefully and
+        // it gives a cleaner signal than a bare TCP close. Strictly non-compliant.
         return build_packet(PacketType::Disconnect, 0x00, &[]);
     }
     let mut vh = Vec::with_capacity(2);
     vh.push(reason_code);
-    vh.extend_from_slice(&encode_empty_properties());
+    vh.extend_from_slice(&EMPTY_PROPERTIES);
     build_packet(PacketType::Disconnect, 0x00, &vh)
 }
 
@@ -1017,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_build_publish_qos0_v5() {
-        let pkt = build_publish_qos0("test/topic", b"hello", true);
+        let pkt = build_publish("test/topic", b"hello", 0, None, false, false, true);
         let (ptype, flags, _remaining, _hdr_size) = parse_fixed_header(&pkt).unwrap();
         assert_eq!(ptype, PacketType::Publish);
         assert_eq!(flags, 0x00); // QoS 0, no DUP, no RETAIN
@@ -1025,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_build_publish_qos0_v311() {
-        let pkt = build_publish_qos0("test/topic", b"hello", false);
+        let pkt = build_publish("test/topic", b"hello", 0, None, false, false, false);
         let (ptype, flags, _remaining, _hdr_size) = parse_fixed_header(&pkt).unwrap();
         assert_eq!(ptype, PacketType::Publish);
         assert_eq!(flags, 0x00);

@@ -1776,9 +1776,12 @@ fn handle_new_connection(
             }
             Err(e) => {
                 log!("pgmqtt mqtt: CONNECT parse error: {}", e);
-                // We don't know the client's version yet — try to extract it from raw buf
-                // to send a version-appropriate CONNACK error.
-                let err_v5 = connect_buf.len() > 8 && connect_buf.get(8).copied() == Some(5);
+                // We don't know the client's version yet — try to extract it from the raw
+                // buffer. A well-formed CONNECT has: 2-byte fixed header + "MQTT" (2-byte
+                // len + 4 bytes) = 8 bytes before the protocol version byte at offset 8.
+                // For a malformed packet this may be wrong, so we default to false (v3.1.1)
+                // rather than risk sending a v5-format CONNACK to a v3 client.
+                let err_v5 = connect_buf.get(8).copied() == Some(5);
                 let _ = transport
                     .write_all(&mqtt::build_connack(false, mqtt::reason::MALFORMED_PACKET, err_v5));
                 return;
@@ -1795,14 +1798,26 @@ fn finish_connect(
     session_db_actions: &mut Vec<SessionDbAction>,
     pending_publishes: &mut Vec<PendingPublish>,
 ) {
+    let v5 = mqtt::is_v5(packet.protocol_version);
+
+    // MQTT 3.1.1 §3.1.3.1: an empty client ID with clean_session=0 MUST be rejected.
+    // (v5 permits empty client IDs with auto-assignment regardless of clean_start.)
+    if !v5 && packet.client_id.is_empty() && !packet.clean_start {
+        log!("pgmqtt mqtt: MQTT 3.1.1 client sent empty client ID with clean_session=0 — rejecting");
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::CLIENT_IDENTIFIER_NOT_VALID,
+            false,
+        ));
+        return;
+    }
+
     let client_id = if packet.client_id.is_empty() {
         let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
         format!("pgmqtt-auto-{}", id)
     } else {
         packet.client_id.clone()
     };
-
-    let v5 = mqtt::is_v5(packet.protocol_version);
     log!(
         "pgmqtt mqtt: CONNECT from client '{}' (MQTT {})",
         client_id,
@@ -2002,7 +2017,7 @@ fn finish_connect(
     if session_present {
         // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
         for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
-            to_send.push(mqtt::build_publish_qos1_dup(topic, payload, *pid, v5));
+            to_send.push(mqtt::build_publish(topic, payload, 1, Some(*pid), true, false, v5));
             // Reset the timer so redeliver_unacked_messages doesn't fire immediately.
             *sent_at = std::time::Instant::now();
         }
@@ -2025,10 +2040,13 @@ fn finish_connect(
                         std::time::Instant::now(),
                     ),
                 );
-                to_send.push(mqtt::build_publish_qos1(
+                to_send.push(mqtt::build_publish(
                     &queued.topic,
                     &queued.payload,
-                    pid,
+                    1,
+                    Some(pid),
+                    false,
+                    false,
                     v5,
                 ));
             } else {
@@ -2439,10 +2457,13 @@ fn handle_mqtt_packet(
                         ),
                     );
                     (
-                        Some(mqtt::build_publish_qos1(
+                        Some(mqtt::build_publish(
                             &queued.topic,
                             &queued.payload,
-                            pid,
+                            1,
+                            Some(pid),
+                            false,
+                            false,
                             client.v5(),
                         )),
                         queued.id.map(|id| (id, pid)),
@@ -2474,7 +2495,7 @@ fn handle_mqtt_packet(
                 // Reject $share/ filters from v3.1.1 clients.
                 if topic_filter.starts_with("$share/") && !client.v5() {
                     log!(
-                        "pgmqtt mqtt: '{}' shared subscriptions not supported for MQTT 3.1.1 '{}'",
+                        "pgmqtt mqtt: MQTT 3.1.1 client '{}' attempted shared subscription '{}' (v5 only)",
                         client_id,
                         topic_filter
                     );
@@ -2618,10 +2639,10 @@ fn handle_mqtt_packet(
                                     message_id: *msg_id,
                                     entries: vec![(client_id.clone(), Some(pid))],
                                 });
-                                let pkt = mqtt::build_publish_qos1_retain(topic, payload, pid, client.v5());
+                                let pkt = mqtt::build_publish(topic, payload, 1, Some(pid), false, true, client.v5());
                                 let _ = client.transport.write_all(&pkt);
                             } else {
-                                let pkt = mqtt::build_publish_qos0_retain(topic, payload, client.v5());
+                                let pkt = mqtt::build_publish(topic, payload, 0, None, false, true, client.v5());
                                 let _ = client.transport.write_all(&pkt);
                             }
                             break; // deliver each retained message at most once per SUBSCRIBE
@@ -2711,18 +2732,10 @@ fn handle_mqtt_packet(
                     if pub_pkt.qos == 1 {
                         if let Some(pid) = pub_pkt.packet_id {
                             if client.v5() {
-                                // v5: PUBACK with NOT_AUTHORIZED reason code
-                                let mut vh = Vec::with_capacity(4);
-                                vh.extend_from_slice(&pid.to_be_bytes());
-                                vh.push(mqtt::reason::NOT_AUTHORIZED);
-                                vh.push(0x00); // no properties
-                                use crate::mqtt::PacketType;
-                                let first_byte = ((PacketType::Puback as u8) << 4) | 0x00;
-                                let mut pkt = vec![first_byte, vh.len() as u8];
-                                pkt.extend_from_slice(&vh);
-                                let _ = client.transport.write_all(&pkt);
+                                let _ = client.transport.write_all(
+                                    &mqtt::build_puback_with_reason(pid, mqtt::reason::NOT_AUTHORIZED),
+                                );
                             } else {
-                                // v3.1.1: plain PUBACK (no reason code)
                                 let _ = client.transport.write_all(&mqtt::build_puback(pid));
                             }
                         }
@@ -2931,13 +2944,13 @@ fn deliver_messages(
                         if msg.id.is_some() {
                             batch_entries.push((sub_id.clone(), Some(pid)));
                         }
-                        let pkt = mqtt::build_publish_qos1(&msg.topic, &msg.payload, pid, client.v5());
+                        let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 1, Some(pid), false, false, client.v5());
                         if client.transport.write_all(&pkt).is_err() {
                             to_remove.push(sub_id.clone());
                         }
                     }
                 } else {
-                    let pkt = mqtt::build_publish_qos0(&msg.topic, &msg.payload, client.v5());
+                    let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 0, None, false, false, client.v5());
                     if client.transport.write_all(&pkt).is_err() {
                         to_remove.push(sub_id.clone());
                     }
@@ -3003,7 +3016,7 @@ fn redeliver_unacked_messages(
     for (cid, pid, topic, payload) in to_resend {
         if let Some(client) = clients.get_mut(&cid) {
             log!("pgmqtt mqtt: redelivering packet_id={} to '{}'", pid, cid);
-            let pkt = mqtt::build_publish_qos1_dup(&topic, &payload, pid, client.v5());
+            let pkt = mqtt::build_publish(&topic, &payload, 1, Some(pid), true, false, client.v5());
             if client.transport.write_all(&pkt).is_err() {
                 to_remove.push(cid);
             }

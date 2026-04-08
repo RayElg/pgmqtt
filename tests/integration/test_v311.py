@@ -83,13 +83,26 @@ def test_v311_connect_connack():
 
 
 def test_v311_connect_empty_client_id():
-    """MQTT 3.1.1 with empty client ID gets auto-assigned ID."""
-    s = v4_connect("")
+    """MQTT 3.1.1 with empty client ID and clean_session=1 gets auto-assigned ID."""
+    s = v4_connect("", clean_start=True)
     # Verify the connection is live
     s.sendall(create_pingreq_packet())
     resp = recv_packet(s, timeout=5)
     assert resp is not None, "No PINGRESP after empty client ID connect"
     validate_pingresp(resp)
+    s.close()
+
+
+def test_v311_empty_client_id_persistent_rejected():
+    """MQTT 3.1.1 §3.1.3.1: empty client ID + clean_session=0 MUST be rejected (rc=0x02)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet("", clean_start=False, protocol_version=V4))
+    resp = recv_packet(s, timeout=5)
+    assert resp is not None, "No CONNACK received"
+    sp, rc, _ = validate_connack(resp, protocol_version=V4)
+    assert rc == 0x02, f"Expected Identifier Rejected (0x02), got {rc:#04x}"
     s.close()
 
 
