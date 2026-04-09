@@ -793,6 +793,8 @@ struct MqttClient {
     keep_alive: u16,
     last_received_at: std::time::Instant,
     receive_maximum: u16,
+    /// MQTT protocol version (4 = v3.1.1, 5 = v5.0).
+    protocol_version: u8,
     /// JWT claim-based topic filters for subscribe authorization.
     sub_claims: Vec<String>,
     /// JWT claim-based topic filters for publish authorization.
@@ -808,6 +810,7 @@ impl MqttClient {
         will: Option<mqtt::Will>,
         keep_alive: u16,
         receive_maximum: u16,
+        protocol_version: u8,
         session: MqttSession,
     ) -> Self {
         Self {
@@ -818,10 +821,17 @@ impl MqttClient {
             keep_alive,
             last_received_at: std::time::Instant::now(),
             receive_maximum,
+            protocol_version,
             sub_claims: Vec::new(),
             pub_claims: Vec::new(),
             session,
         }
+    }
+
+    /// Returns true if this client is using MQTT 5.0.
+    #[inline]
+    fn v5(&self) -> bool {
+        mqtt::is_v5(self.protocol_version)
     }
 }
 
@@ -1145,7 +1155,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
         let _ = client
             .transport
-            .write_all(&mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN));
+            .write_all(&mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN, client.v5()));
 
         // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
         // The client did NOT send a normal DISCONNECT, so the will fires.
@@ -1745,7 +1755,8 @@ fn handle_new_connection(
         };
         connect_buf.extend_from_slice(&tmp[..n]);
 
-        match mqtt::parse_packet(&connect_buf) {
+        // Pass version=5 for initial CONNECT parse; parse_connect self-detects the real version.
+        match mqtt::parse_packet(&connect_buf, 5) {
             Ok((mqtt::InboundPacket::Connect(connect), _consumed)) => {
                 // Success! Proceed to register the client.
                 finish_connect(transport, connect, ws_jwt, clients, session_db_actions, pending_publishes);
@@ -1765,8 +1776,14 @@ fn handle_new_connection(
             }
             Err(e) => {
                 log!("pgmqtt mqtt: CONNECT parse error: {}", e);
+                // We don't know the client's version yet — try to extract it from the raw
+                // buffer. A well-formed CONNECT has: 2-byte fixed header + "MQTT" (2-byte
+                // len + 4 bytes) = 8 bytes before the protocol version byte at offset 8.
+                // For a malformed packet this may be wrong, so we default to false (v3.1.1)
+                // rather than risk sending a v5-format CONNACK to a v3 client.
+                let err_v5 = connect_buf.get(8).copied() == Some(5);
                 let _ = transport
-                    .write_all(&mqtt::build_connack(false, mqtt::reason::MALFORMED_PACKET));
+                    .write_all(&mqtt::build_connack(false, mqtt::reason::MALFORMED_PACKET, err_v5));
                 return;
             }
         }
@@ -1781,14 +1798,31 @@ fn finish_connect(
     session_db_actions: &mut Vec<SessionDbAction>,
     pending_publishes: &mut Vec<PendingPublish>,
 ) {
+    let v5 = mqtt::is_v5(packet.protocol_version);
+
+    // MQTT 3.1.1 §3.1.3.1: an empty client ID with clean_session=0 MUST be rejected.
+    // (v5 permits empty client IDs with auto-assignment regardless of clean_start.)
+    if !v5 && packet.client_id.is_empty() && !packet.clean_start {
+        log!("pgmqtt mqtt: MQTT 3.1.1 client sent empty client ID with clean_session=0 — rejecting");
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::CLIENT_IDENTIFIER_NOT_VALID,
+            false,
+        ));
+        return;
+    }
+
     let client_id = if packet.client_id.is_empty() {
         let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
         format!("pgmqtt-auto-{}", id)
     } else {
         packet.client_id.clone()
     };
-
-    log!("pgmqtt mqtt: CONNECT from client '{}'", client_id);
+    log!(
+        "pgmqtt mqtt: CONNECT from client '{}' (MQTT {})",
+        client_id,
+        if v5 { "5.0" } else { "3.1.1" }
+    );
 
     // ── JWT authentication ────────────────────────────────────────────────────
     let jwt_key_str = crate::get_jwt_public_key_guc();
@@ -1824,6 +1858,7 @@ fn finish_connect(
                             let _ = transport.write_all(&mqtt::build_connack(
                                 false,
                                 mqtt::reason::NOT_AUTHORIZED,
+                                v5,
                             ));
                             return;
                         }
@@ -1840,7 +1875,7 @@ fn finish_connect(
                     );
                     if jwt_required {
                         let _ = transport
-                            .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                            .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
                         return;
                     }
                 }
@@ -1852,7 +1887,7 @@ fn finish_connect(
                         client_id
                     );
                     let _ = transport
-                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
                     return;
                 }
             }
@@ -1860,7 +1895,7 @@ fn finish_connect(
                 log!("pgmqtt mqtt: failed to parse JWT public key GUC");
                 if jwt_required {
                     let _ = transport
-                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED));
+                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
                     return;
                 }
             }
@@ -1878,7 +1913,7 @@ fn finish_connect(
         );
         let _ = old_client
             .transport
-            .write_all(&mqtt::build_disconnect(mqtt::reason::SESSION_TAKEN_OVER));
+            .write_all(&mqtt::build_disconnect(mqtt::reason::SESSION_TAKEN_OVER, old_client.v5()));
         // Fire the old client's Will (MQTT 5.0 §3.1.3.3: Will is published
         // when the server closes the connection for any reason other than a
         // normal DISCONNECT from the client).
@@ -1922,7 +1957,7 @@ fn finish_connect(
             limit,
             client_id
         );
-        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::QUOTA_EXCEEDED));
+        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::QUOTA_EXCEEDED, v5));
         return;
     }
 
@@ -1960,7 +1995,7 @@ fn finish_connect(
     });
 
     // Send CONNACK with success
-    let connack = mqtt::build_connack(session_present, mqtt::reason::SUCCESS);
+    let connack = mqtt::build_connack(session_present, mqtt::reason::SUCCESS, v5);
     if transport.write_all(&connack).is_err() {
         log!("pgmqtt mqtt: failed to send CONNACK to '{}'", client_id);
         // Put session back so it isn't lost.
@@ -1982,7 +2017,7 @@ fn finish_connect(
     if session_present {
         // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
         for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
-            to_send.push(mqtt::build_publish_qos1_dup(topic, payload, *pid));
+            to_send.push(mqtt::build_publish(topic, payload, 1, Some(*pid), true, false, v5));
             // Reset the timer so redeliver_unacked_messages doesn't fire immediately.
             *sent_at = std::time::Instant::now();
         }
@@ -2005,10 +2040,14 @@ fn finish_connect(
                         std::time::Instant::now(),
                     ),
                 );
-                to_send.push(mqtt::build_publish_qos1(
+                to_send.push(mqtt::build_publish(
                     &queued.topic,
                     &queued.payload,
-                    pid,
+                    1,
+                    Some(pid),
+                    false,
+                    false,
+                    v5,
                 ));
             } else {
                 break;
@@ -2022,6 +2061,7 @@ fn finish_connect(
         packet.will,
         packet.keep_alive,
         packet.receive_maximum,
+        packet.protocol_version,
         session,
     );
     mqtt_client.sub_claims = jwt_sub_claims;
@@ -2123,7 +2163,7 @@ fn poll_mqtt_clients(
                     log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, MAX_REQUEST_BYTES);
                     let _ = client
                         .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET));
+                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
                     to_remove.push(client_id.clone());
                     continue;
                 }
@@ -2154,7 +2194,7 @@ fn poll_mqtt_clients(
                     log!("pgmqtt mqtt: packet error from '{}': {}", client_id, e);
                     let _ = client
                         .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET));
+                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
                     to_remove.push(client_id.clone());
                     break;
                 }
@@ -2162,7 +2202,7 @@ fn poll_mqtt_clients(
 
             let pkt_data: Vec<u8> = client.buf.drain(..pkt_len).collect();
 
-            match mqtt::parse_packet(&pkt_data) {
+            match mqtt::parse_packet(&pkt_data, client.protocol_version) {
                 Ok((packet, _)) => {
                     if !handle_mqtt_packet(
                         client,
@@ -2179,7 +2219,7 @@ fn poll_mqtt_clients(
                     log!("pgmqtt mqtt: parse error from '{}': {}", client_id, e);
                     let _ = client
                         .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET));
+                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
                     to_remove.push(client_id.clone());
                     break;
                 }
@@ -2417,10 +2457,14 @@ fn handle_mqtt_packet(
                         ),
                     );
                     (
-                        Some(mqtt::build_publish_qos1(
+                        Some(mqtt::build_publish(
                             &queued.topic,
                             &queued.payload,
-                            pid,
+                            1,
+                            Some(pid),
+                            false,
+                            false,
+                            client.v5(),
                         )),
                         queued.id.map(|id| (id, pid)),
                     )
@@ -2447,6 +2491,17 @@ fn handle_mqtt_packet(
         mqtt::InboundPacket::Subscribe(sub) => {
             let mut reason_codes = Vec::with_capacity(sub.topics.len());
             for (topic_filter, requested_qos) in &sub.topics {
+                // Shared subscriptions are MQTT 5.0 only (§4.8.2).
+                // Reject $share/ filters from v3.1.1 clients.
+                if topic_filter.starts_with("$share/") && !client.v5() {
+                    log!(
+                        "pgmqtt mqtt: MQTT 3.1.1 client '{}' attempted shared subscription '{}' (v5 only)",
+                        client_id,
+                        topic_filter
+                    );
+                    reason_codes.push(mqtt::reason::TOPIC_FILTER_INVALID);
+                    continue;
+                }
                 let shared = subscriptions::parse_shared_filter(topic_filter);
                 if topic_filter.starts_with("$share/") && shared.is_none() {
                     log!(
@@ -2499,7 +2554,7 @@ fn handle_mqtt_packet(
                     granted
                 );
             }
-            let suback = mqtt::build_suback(sub.packet_id, &reason_codes);
+            let suback = mqtt::build_suback(sub.packet_id, &reason_codes, client.v5());
             if client.transport.write_all(&suback).is_err() {
                 return false;
             }
@@ -2584,10 +2639,10 @@ fn handle_mqtt_packet(
                                     message_id: *msg_id,
                                     entries: vec![(client_id.clone(), Some(pid))],
                                 });
-                                let pkt = mqtt::build_publish_qos1_retain(topic, payload, pid);
+                                let pkt = mqtt::build_publish(topic, payload, 1, Some(pid), false, true, client.v5());
                                 let _ = client.transport.write_all(&pkt);
                             } else {
-                                let pkt = mqtt::build_publish_qos0_retain(topic, payload);
+                                let pkt = mqtt::build_publish(topic, payload, 0, None, false, true, client.v5());
                                 let _ = client.transport.write_all(&pkt);
                             }
                             break; // deliver each retained message at most once per SUBSCRIBE
@@ -2617,7 +2672,7 @@ fn handle_mqtt_packet(
                     topic_filter
                 );
             }
-            let unsuback = mqtt::build_unsuback(unsub.packet_id, &reason_codes);
+            let unsuback = mqtt::build_unsuback(unsub.packet_id, &reason_codes, client.v5());
             if client.transport.write_all(&unsuback).is_err() {
                 return false;
             }
@@ -2649,7 +2704,7 @@ fn handle_mqtt_packet(
                         client_id
                     );
                     let _ = client.transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR));
+                        .write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR, client.v5()));
                 } else {
                     client.session.expiry_interval = new_expiry;
                     session_db_actions.push(SessionDbAction::UpsertSession {
@@ -2676,16 +2731,13 @@ fn handle_mqtt_packet(
                     );
                     if pub_pkt.qos == 1 {
                         if let Some(pid) = pub_pkt.packet_id {
-                            // Send PUBACK with NOT_AUTHORIZED reason code
-                            let mut vh = Vec::with_capacity(4);
-                            vh.extend_from_slice(&pid.to_be_bytes());
-                            vh.push(mqtt::reason::NOT_AUTHORIZED);
-                            vh.push(0x00); // no properties
-                            use crate::mqtt::PacketType;
-                            let first_byte = ((PacketType::Puback as u8) << 4) | 0x00;
-                            let mut pkt = vec![first_byte, vh.len() as u8];
-                            pkt.extend_from_slice(&vh);
-                            let _ = client.transport.write_all(&pkt);
+                            if client.v5() {
+                                let _ = client.transport.write_all(
+                                    &mqtt::build_puback_with_reason(pid, mqtt::reason::NOT_AUTHORIZED),
+                                );
+                            } else {
+                                let _ = client.transport.write_all(&mqtt::build_puback(pid));
+                            }
                         }
                     }
                     // QoS 0: silently drop
@@ -2704,7 +2756,7 @@ fn handle_mqtt_packet(
                     pub_pkt.topic
                 );
                 let _ =
-                    client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID));
+                    client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID, client.v5()));
                 return false;
             }
 
@@ -2767,7 +2819,7 @@ fn handle_mqtt_packet(
                 "pgmqtt mqtt: '{}' sent second CONNECT — protocol error",
                 client_id
             );
-            let _ = client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR));
+            let _ = client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR, client.v5()));
             false
         }
     }
@@ -2892,13 +2944,13 @@ fn deliver_messages(
                         if msg.id.is_some() {
                             batch_entries.push((sub_id.clone(), Some(pid)));
                         }
-                        let pkt = mqtt::build_publish_qos1(&msg.topic, &msg.payload, pid);
+                        let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 1, Some(pid), false, false, client.v5());
                         if client.transport.write_all(&pkt).is_err() {
                             to_remove.push(sub_id.clone());
                         }
                     }
                 } else {
-                    let pkt = mqtt::build_publish_qos0(&msg.topic, &msg.payload);
+                    let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 0, None, false, false, client.v5());
                     if client.transport.write_all(&pkt).is_err() {
                         to_remove.push(sub_id.clone());
                     }
@@ -2964,7 +3016,7 @@ fn redeliver_unacked_messages(
     for (cid, pid, topic, payload) in to_resend {
         if let Some(client) = clients.get_mut(&cid) {
             log!("pgmqtt mqtt: redelivering packet_id={} to '{}'", pid, cid);
-            let pkt = mqtt::build_publish_qos1_dup(&topic, &payload, pid);
+            let pkt = mqtt::build_publish(&topic, &payload, 1, Some(pid), true, false, client.v5());
             if client.transport.write_all(&pkt).is_err() {
                 to_remove.push(cid);
             }

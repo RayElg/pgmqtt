@@ -180,69 +180,77 @@ def validate_fixed_header(packet, expected_type, check_flags=True):
     remaining_length, offset = decode_variable_byte_integer(packet, 1)
     return packet_type, flags, remaining_length, offset
 
-def validate_connack(packet):
+def validate_connack(packet, protocol_version=5):
     """
     Validate CONNACK packet per spec.
     Returns (session_present, reason_code, properties).
     """
+    v5 = (protocol_version == 5)
     packet_type, flags, remain_len, offset = validate_fixed_header(packet, MQTTControlPacket.CONNACK)
-    
+
     # Byte 1 of variable header: Connect Acknowledge Flags
     ack_flags = packet[offset]
     session_present = bool(ack_flags & 0x01)
     assert (ack_flags & 0xFE) == 0, "Reserved bits in CONNACK flags must be 0"
     offset += 1
-    
-    # Byte 2: Reason Code
+
+    # Byte 2: Reason Code (v5) or Return Code (v3.1.1)
     reason_code = packet[offset]
     offset += 1
-    
-    # Properties
-    props, offset = decode_properties(packet, offset)
-    
+
+    props = {}
+    if v5:
+        props, offset = decode_properties(packet, offset)
+
     return session_present, reason_code, props
 
-def validate_suback(packet, expected_packet_id):
+def validate_suback(packet, expected_packet_id, protocol_version=5):
     """
     Validate SUBACK packet per spec.
     Returns list of reason codes (granted QoS or error codes).
     """
+    v5 = (protocol_version == 5)
     packet_type, flags, remain_len, offset = validate_fixed_header(packet, MQTTControlPacket.SUBACK)
-    
+
     # Packet Identifier
     packet_id = struct.unpack_from('!H', packet, offset)[0]
     assert packet_id == expected_packet_id, \
         f"SUBACK packet ID mismatch: expected {expected_packet_id}, got {packet_id}"
     offset += 2
-    
-    # Properties
-    props, offset = decode_properties(packet, offset)
-    
+
+    if v5:
+        props, offset = decode_properties(packet, offset)
+
     # Payload: list of reason codes
     header_len = 1 + len(encode_variable_byte_integer(remain_len))
     end = header_len + remain_len
     reason_codes = list(packet[offset:end])
-    
+
     return reason_codes
 
-def validate_unsuback(packet, expected_packet_id):
+def validate_unsuback(packet, expected_packet_id, protocol_version=5):
     """
     Validate UNSUBACK packet per spec.
-    Returns list of reason codes.
+    Returns list of reason codes (v5) or empty list (v3.1.1).
     """
+    v5 = (protocol_version == 5)
     packet_type, flags, remain_len, offset = validate_fixed_header(packet, MQTTControlPacket.UNSUBACK)
-    
+
     packet_id = struct.unpack_from('!H', packet, offset)[0]
     assert packet_id == expected_packet_id, \
         f"UNSUBACK packet ID mismatch: expected {expected_packet_id}, got {packet_id}"
     offset += 2
-    
+
+    if not v5:
+        # MQTT 3.1.1 UNSUBACK: just packet ID, no properties, no reason codes
+        return []
+
     props, offset = decode_properties(packet, offset)
-    
+
     header_len = 1 + len(encode_variable_byte_integer(remain_len))
     end = header_len + remain_len
     reason_codes = list(packet[offset:end])
-    
+
     return reason_codes
 
 def validate_puback(packet, expected_packet_id):
@@ -301,48 +309,50 @@ def validate_pubcomp(packet, expected_packet_id):
     reason_code = packet[offset] if remain_len > 2 else ReasonCode.SUCCESS
     return reason_code
 
-def validate_publish(packet):
+def validate_publish(packet, protocol_version=5):
     """
     Validate PUBLISH packet per spec.
     Returns (topic, payload, qos, dup, retain, packet_id, properties).
     packet_id is None for QoS 0.
     """
+    v5 = (protocol_version == 5)
     assert packet and len(packet) >= 2, "Packet too short"
     packet_type = (packet[0] & 0xF0) >> 4
     flags = packet[0] & 0x0F
-    
+
     assert packet_type == MQTTControlPacket.PUBLISH, \
         f"Expected PUBLISH, got packet type {packet_type}"
-    
+
     dup = bool(flags & 0x08)
     qos = (flags & 0x06) >> 1
     retain = bool(flags & 0x01)
-    
+
     assert qos in (0, 1, 2), f"Invalid QoS value: {qos}"
-    
-    # DUP must be 0 for QoS 0
+
     if qos == 0:
         assert not dup, "DUP flag must be 0 for QoS 0 PUBLISH"
-    
+
     remain_len, offset = decode_variable_byte_integer(packet, 1)
     header_len = offset
-    
+
     # Topic Name
     topic, offset = decode_utf8_string(packet, offset)
-    
+
     # Packet Identifier (only for QoS > 0)
     packet_id = None
     if qos > 0:
         packet_id = struct.unpack_from('!H', packet, offset)[0]
         offset += 2
-    
-    # Properties
-    props, offset = decode_properties(packet, offset)
-    
+
+    # Properties (v5 only)
+    props = {}
+    if v5:
+        props, offset = decode_properties(packet, offset)
+
     # Payload
     end = header_len + remain_len
     payload = packet[offset:end]
-    
+
     return topic, payload, qos, dup, retain, packet_id, props
 
 def validate_pingresp(packet):
@@ -462,17 +472,19 @@ def recv_packet(s, timeout=5.0):
 
 def create_connect_packet(client_id, clean_start=True, properties=None, keep_alive=60,
                            will_topic=None, will_payload=None, will_qos=0, will_retain=False,
-                           will_properties=None):
+                           will_properties=None, protocol_version=5):
     """
-    Create MQTT 5.0 CONNECT packet with optional Will Message support.
+    Create MQTT CONNECT packet with optional Will Message support.
+    protocol_version: 5 for MQTT 5.0, 4 for MQTT 3.1.1.
     """
+    v5 = (protocol_version == 5)
     protocol_name = encode_utf8_string("MQTT")
-    protocol_version = b'\x05'
-    
+    version_byte = b'\x05' if v5 else b'\x04'
+
     flags = 0x00
     if clean_start:
         flags |= 0x02
-    
+
     # Will Message
     will_payload_bytes = b''
     if will_topic is not None:
@@ -480,52 +492,69 @@ def create_connect_packet(client_id, clean_start=True, properties=None, keep_ali
         flags |= (will_qos << 3)  # Will QoS
         if will_retain:
             flags |= 0x20  # Will Retain
-        
-        will_prop_bytes = encode_properties(will_properties if will_properties else {})
-        will_payload_bytes = will_prop_bytes + encode_utf8_string(will_topic)
+
+        if v5:
+            will_prop_bytes = encode_properties(will_properties if will_properties else {})
+            will_payload_bytes = will_prop_bytes + encode_utf8_string(will_topic)
+        else:
+            will_payload_bytes = encode_utf8_string(will_topic)
         if will_payload:
             will_payload_bytes += struct.pack('!H', len(will_payload)) + will_payload
         else:
             will_payload_bytes += struct.pack('!H', 0)
-    
+
     connect_flags = bytes([flags])
     keep_alive_bytes = struct.pack('!H', keep_alive)
-    
-    prop_bytes = encode_properties(properties if properties else {})
+
+    if v5:
+        prop_bytes = encode_properties(properties if properties else {})
+    else:
+        prop_bytes = b''
     payload = encode_utf8_string(client_id) + will_payload_bytes
-    variable_header = protocol_name + protocol_version + connect_flags + keep_alive_bytes + prop_bytes
+    variable_header = protocol_name + version_byte + connect_flags + keep_alive_bytes + prop_bytes
     remaining_length = len(variable_header) + len(payload)
     fixed_header = bytes([(MQTTControlPacket.CONNECT << 4)]) + encode_variable_byte_integer(remaining_length)
     return fixed_header + variable_header + payload
 
-def create_subscribe_packet(packet_id, topic, qos=0, properties=None):
-    prop_bytes = encode_properties(properties if properties else {})
+def create_subscribe_packet(packet_id, topic, qos=0, properties=None, protocol_version=5):
+    v5 = (protocol_version == 5)
+    if v5:
+        prop_bytes = encode_properties(properties if properties else {})
+    else:
+        prop_bytes = b''
     payload = struct.pack('!H', packet_id) + prop_bytes + encode_utf8_string(topic) + bytes([qos])
     remaining_length = len(payload)
     fixed_header = bytes([(MQTTControlPacket.SUBSCRIBE << 4) | 0x02]) + encode_variable_byte_integer(remaining_length)
     return fixed_header + payload
 
-def create_unsubscribe_packet(packet_id, topic, properties=None):
-    """Create MQTT 5.0 UNSUBSCRIBE packet."""
-    prop_bytes = encode_properties(properties if properties else {})
+def create_unsubscribe_packet(packet_id, topic, properties=None, protocol_version=5):
+    """Create MQTT UNSUBSCRIBE packet."""
+    v5 = (protocol_version == 5)
+    if v5:
+        prop_bytes = encode_properties(properties if properties else {})
+    else:
+        prop_bytes = b''
     payload = struct.pack('!H', packet_id) + prop_bytes + encode_utf8_string(topic)
     remaining_length = len(payload)
-    # UNSUBSCRIBE fixed header flags must be 0010
     fixed_header = bytes([(MQTTControlPacket.UNSUBSCRIBE << 4) | 0x02]) + encode_variable_byte_integer(remaining_length)
     return fixed_header + payload
 
-def create_publish_packet(topic, payload, qos=0, packet_id=None, properties=None, dup=False, retain=False):
+def create_publish_packet(topic, payload, qos=0, packet_id=None, properties=None, dup=False, retain=False, protocol_version=5):
+    v5 = (protocol_version == 5)
     flags = (qos << 1)
     if dup: flags |= 0x08
     if retain: flags |= 0x01
-    
-    prop_bytes = encode_properties(properties if properties else {})
+
+    if v5:
+        prop_bytes = encode_properties(properties if properties else {})
+    else:
+        prop_bytes = b''
     var_header = encode_utf8_string(topic)
     if qos > 0:
         if packet_id is None: raise ValueError("Packet ID required for QoS > 0")
         var_header += struct.pack('!H', packet_id)
     var_header += prop_bytes
-    
+
     remaining_length = len(var_header) + len(payload)
     fixed_header = bytes([(MQTTControlPacket.PUBLISH << 4) | flags]) + \
                    encode_variable_byte_integer(remaining_length)
@@ -544,12 +573,16 @@ def create_pingreq_packet():
     # PINGREQ has no variable header or payload
     return bytes([(MQTTControlPacket.PINGREQ << 4), 0x00])
 
-def create_disconnect_packet(reason_code=0, properties=None):
-    """Create MQTT 5.0 DISCONNECT packet."""
-    if reason_code == 0 and not properties:
-        # Short form: no variable header
+def create_disconnect_packet(reason_code=0, properties=None, protocol_version=5):
+    """Create MQTT DISCONNECT packet. v3.1.1 DISCONNECT has no variable header."""
+    v5 = (protocol_version == 5)
+    if not v5:
+        # MQTT 3.1.1: DISCONNECT is just the fixed header, no payload
         return bytes([(MQTTControlPacket.DISCONNECT << 4), 0x00])
-    
+
+    if reason_code == 0 and not properties:
+        return bytes([(MQTTControlPacket.DISCONNECT << 4), 0x00])
+
     prop_bytes = encode_properties(properties if properties else {})
     var_header = bytes([reason_code]) + prop_bytes
     return bytes([(MQTTControlPacket.DISCONNECT << 4)]) + encode_variable_byte_integer(len(var_header)) + var_header

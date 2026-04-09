@@ -26,9 +26,12 @@ Retained messages are **supported**:
 
 ---
 
-# pgmqtt MQTT 5.0 Feature Matrix
+# pgmqtt MQTT Feature Matrix
 
 Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
+Both MQTT 5.0 and MQTT 3.1.1 clients are supported and can interoperate on the
+same broker. The tables below cover MQTT 5.0; the dedicated
+[MQTT 3.1.1](#mqtt-311) section documents version-specific behaviour.
 
 ## Legend
 
@@ -92,6 +95,51 @@ Feature support status for the pgmqtt PostgreSQL extension MQTT broker.
 | Receive Maximum enforcement | :white_check_mark: | [test_flow_control.py](tests/integration/test_flow_control.py) |
 | Default Receive Maximum (65535) | :white_check_mark: | [test_flow_control.py](tests/integration/test_flow_control.py) |
 | Queuing beyond Receive Maximum | :white_check_mark: | [test_flow_control.py](tests/integration/test_flow_control.py) |
+
+## MQTT 3.1.1
+
+MQTT 3.1.1 (protocol level 4) clients connect alongside v5 clients on the
+same listener. The broker auto-detects the protocol version from the CONNECT
+packet and adapts all subsequent packets accordingly:
+
+- **CONNACK** uses v3.1.1 return codes (0x00–0x05), not v5 reason codes.
+- **SUBACK** return codes are 0x00/0x01/0x02 (granted QoS) or 0x80 (failure).
+- **UNSUBACK** contains only the packet identifier (no reason codes, no properties).
+- **PUBLISH** packets omit the properties section.
+- **DISCONNECT** from the server is sent as an empty packet (no reason code).
+- **Clean Session** (`clean_session=0`) persists the session indefinitely across
+  disconnects, equivalent to `Session Expiry Interval = ∞` in v5.
+- **Shared subscriptions** (`$share/`) are rejected for v3.1.1 clients (v5-only feature).
+- **Session Expiry Interval**, **Receive Maximum**, **Will Delay Interval**,
+  and **Message Expiry Interval** are v5 properties with no v3.1.1 equivalent.
+  Sensible defaults are applied (expiry governed by Clean Session flag,
+  Receive Maximum = 65535).
+
+| Feature | Status | Test |
+|---------|--------|------|
+| CONNECT / CONNACK (return codes) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| CONNACK packet format (no properties) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Clean Session persistence (`clean_session=0`) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Clean Session clear (`clean_session=1`) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Keep Alive / PINGREQ / PINGRESP | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Session Takeover | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Auto-generated Client IDs | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| DISCONNECT (empty packet) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| QoS 0 pub/sub | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| QoS 1 pub/sub with PUBACK | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| SUBSCRIBE / SUBACK (return codes) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| UNSUBSCRIBE / UNSUBACK (no reason codes) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| PUBLISH (no properties) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Wildcard subscriptions (`+`, `#`) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Shared subscriptions rejected | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Retained messages | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Last Will (abrupt + clean disconnect) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Unsupported version rejection (v3) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Cross-version interop (v5 ↔ v3.1.1) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Cross-version session resumption | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Protocol state machine violations | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Topic validation (wildcards, null, empty) | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
+| Malformed/truncated packet handling | :white_check_mark: | [test_v311.py](tests/integration/test_v311.py) |
 
 ## CDC (Change Data Capture)
 
