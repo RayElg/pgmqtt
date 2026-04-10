@@ -45,21 +45,34 @@ RUN cargo pgrx package && \
 # Runtime stage
 FROM postgres:16-bookworm
 
+# Install TimescaleDB
+RUN apt-get update && apt-get install -y gnupg curl lsb-release \
+    && curl -fsSL https://packagecloud.io/timescale/timescaledb/gpgkey \
+       | gpg --dearmor -o /usr/share/keyrings/timescaledb.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/timescaledb.gpg] \
+       https://packagecloud.io/timescale/timescaledb/debian/ bookworm main" \
+       > /etc/apt/sources.list.d/timescaledb.list \
+    && apt-get update \
+    && apt-get install -y timescaledb-2-postgresql-16 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy artifacts from builder
 COPY --from=builder /app/dist/usr/share/postgresql/16/extension /usr/share/postgresql/16/extension
 COPY --from=builder /app/dist/usr/lib/postgresql/16/lib /usr/lib/postgresql/16/lib
 
-# Configure PostgreSQL for logical decoding
+# Configure PostgreSQL for logical decoding.
+# timescaledb must appear before pgmqtt in shared_preload_libraries.
 RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "shared_preload_libraries = 'timescaledb,pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "local   all             all                                     trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
     echo "host    all             all             all                     trust" >> /usr/share/postgresql/pg_hba.conf.sample
 
-# Auto-create the extension on first startup
+# Auto-create extensions on first startup (timescaledb before pgmqtt)
 RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \
+    echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
     echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pgmqtt;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
     chmod +x /docker-entrypoint-initdb.d/01-create-extension.sh
 

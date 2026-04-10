@@ -276,4 +276,5 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
             Ok::<_, pgrx::spi::Error>(())
         });
     });
+    crate::metrics::inc(&crate::metrics::get().db_batches_committed);
 }

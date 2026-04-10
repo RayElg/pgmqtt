@@ -6,6 +6,7 @@ mod ffi_safe;
 pub mod inbound_map;
 mod init010;
 pub mod license;
+pub mod metrics;
 mod mqtt;
 mod ring_buffer;
 mod server;
@@ -68,6 +69,20 @@ static JWT_PUBLIC_KEY: GucSetting<Option<CString>> =
 static JWT_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+// Observability GUCs (enterprise: metrics feature)
+/// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.
+static METRICS_SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60);
+/// Days to retain historical metric snapshots. 0 = keep forever.
+static METRICS_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);
+/// How often (seconds) to refresh pgmqtt_connections_cache. 0 = disabled.
+static METRICS_CONNECTIONS_CACHE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(10);
+/// Fully-qualified SQL function called after each snapshot flush: fn(jsonb) → void.
+static METRICS_HOOK_FUNCTION: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// PostgreSQL NOTIFY channel for streaming metric snapshots as JSON. Empty = disabled.
+static METRICS_NOTIFY_CHANNEL: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+
 // ---------------------------------------------------------------------------
 // GUC accessors
 // ---------------------------------------------------------------------------
@@ -92,6 +107,32 @@ pub fn get_jwt_required_guc() -> bool {
 
 pub fn get_jwt_required_ws_guc() -> bool {
     JWT_REQUIRED_WS.get()
+}
+
+pub fn get_metrics_snapshot_interval_guc() -> i32 {
+    METRICS_SNAPSHOT_INTERVAL.get()
+}
+
+pub fn get_metrics_retention_days_guc() -> i32 {
+    METRICS_RETENTION_DAYS.get()
+}
+
+pub fn get_metrics_connections_cache_interval_guc() -> i32 {
+    METRICS_CONNECTIONS_CACHE_INTERVAL.get()
+}
+
+pub fn get_metrics_hook_function_guc() -> String {
+    METRICS_HOOK_FUNCTION
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn get_metrics_notify_channel_guc() -> String {
+    METRICS_NOTIFY_CHANNEL
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub struct PortConfig {
@@ -670,6 +711,386 @@ fn pgmqtt_status() -> TableIterator<
 }
 
 // ---------------------------------------------------------------------------
+// Enterprise observability SQL functions
+// ---------------------------------------------------------------------------
+
+/// Return all broker metrics as named (metric_name, value, unit, description) rows.
+///
+/// Values are read from `pgmqtt_metrics_current`, which the background worker
+/// refreshes every `pgmqtt.metrics_snapshot_interval` seconds.  All timestamps
+/// are Unix epoch seconds; use `to_timestamp(value)` to convert.
+///
+/// Requires an enterprise license with the `metrics` feature.
+#[pg_extern]
+fn pgmqtt_metrics() -> TableIterator<
+    'static,
+    (
+        name!(metric_name, String),
+        name!(value, i64),
+        name!(unit, String),
+        name!(description, String),
+    ),
+> {
+    if !crate::license::has_feature(crate::license::Feature::Metrics) {
+        pgrx::error!(
+            "pgmqtt_metrics() requires an enterprise license with the 'metrics' feature"
+        );
+    }
+
+    let rows = Spi::connect(|client| {
+        let table_exists = client
+            .select(
+                "SELECT to_regclass('pgmqtt_metrics_current')::text",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|mut t| t.next())
+            .and_then(|r| r.get_by_name::<String, _>("to_regclass").ok().flatten())
+            .is_some();
+
+        if !table_exists {
+            return Ok::<Vec<(String, i64, String, String)>, spi::Error>(Vec::new());
+        }
+
+        let mut out: Vec<(String, i64, String, String)> = Vec::new();
+
+        if let Ok(mut rows) = client.select(
+            "SELECT captured_at, started_at, last_reset_at,
+                    connections_accepted, connections_rejected, connections_current,
+                    disconnections_clean, disconnections_unclean, wills_fired,
+                    sessions_created, sessions_resumed, sessions_expired,
+                    msgs_received, msgs_received_qos0, msgs_received_qos1, bytes_received,
+                    msgs_sent, bytes_sent, msgs_dropped,
+                    pubacks_sent, pubacks_received,
+                    subscribe_ops, unsubscribe_ops,
+                    cdc_events_processed, cdc_msgs_published, cdc_errors, cdc_lag_ms_last,
+                    inbound_writes_ok, inbound_writes_failed, inbound_retries, inbound_dead_letters,
+                    db_batches_committed, db_errors
+             FROM pgmqtt_metrics_current
+             LIMIT 1",
+            None,
+            &[],
+        ) {
+            if let Some(row) = rows.next() {
+                macro_rules! m {
+                    ($name:expr, $unit:expr, $desc:expr) => {
+                        out.push((
+                            $name.to_string(),
+                            row.get_by_name::<i64, _>($name).ok().flatten().unwrap_or(0),
+                            $unit.to_string(),
+                            $desc.to_string(),
+                        ));
+                    };
+                }
+                m!("captured_at",            "unix_seconds", "Unix timestamp when this snapshot was captured");
+                m!("started_at",             "unix_seconds", "Unix timestamp when the broker started");
+                m!("last_reset_at",          "unix_seconds", "Unix timestamp of last counter reset");
+                m!("connections_accepted",   "total",        "MQTT clients accepted (CONNACK success sent)");
+                m!("connections_rejected",   "total",        "Connection attempts rejected (auth or license limit)");
+                m!("connections_current",    "gauge",        "Currently active connections");
+                m!("disconnections_clean",   "total",        "Clients that sent a normal DISCONNECT packet");
+                m!("disconnections_unclean", "total",        "Clients disconnected unexpectedly (keepalive, error)");
+                m!("wills_fired",            "total",        "Will messages fired");
+                m!("sessions_created",       "total",        "Brand-new sessions created");
+                m!("sessions_resumed",       "total",        "Sessions resumed from persistent state");
+                m!("sessions_expired",       "total",        "Sessions reaped by the expiry sweeper");
+                m!("msgs_received",          "total",        "PUBLISH packets received from clients");
+                m!("msgs_received_qos0",     "total",        "QoS 0 PUBLISH packets received");
+                m!("msgs_received_qos1",     "total",        "QoS 1 PUBLISH packets received");
+                m!("bytes_received",         "bytes",        "Bytes received in PUBLISH payloads");
+                m!("msgs_sent",              "total",        "PUBLISH packets delivered to subscribers");
+                m!("bytes_sent",             "bytes",        "Bytes sent in PUBLISH payloads");
+                m!("msgs_dropped",           "total",        "Messages dropped (queue full or auth)");
+                m!("pubacks_sent",           "total",        "PUBACK packets sent");
+                m!("pubacks_received",       "total",        "PUBACK packets received from clients");
+                m!("subscribe_ops",          "total",        "SUBSCRIBE operations");
+                m!("unsubscribe_ops",        "total",        "UNSUBSCRIBE operations");
+                m!("cdc_events_processed",   "total",        "WAL events decoded from CDC slot");
+                m!("cdc_msgs_published",     "total",        "Messages emitted from CDC pipeline");
+                m!("cdc_errors",             "total",        "CDC pipeline errors");
+                m!("cdc_lag_ms_last",        "milliseconds", "Most recent CDC replication lag");
+                m!("inbound_writes_ok",      "total",        "Successful inbound MQTT-to-DB writes");
+                m!("inbound_writes_failed",  "total",        "Failed inbound MQTT-to-DB writes");
+                m!("inbound_retries",        "total",        "Inbound write retries");
+                m!("inbound_dead_letters",   "total",        "Messages moved to dead-letter table");
+                m!("db_batches_committed",   "total",        "DB session action batches committed");
+                m!("db_errors",              "total",        "DB batch errors");
+            }
+        }
+        Ok::<_, spi::Error>(out)
+    })
+    .unwrap_or_default();
+
+    TableIterator::new(rows.into_iter())
+}
+
+/// Return per-client connection detail from `pgmqtt_connections_cache`.
+///
+/// The cache is refreshed by the background worker every
+/// `pgmqtt.metrics_connections_cache_interval` seconds (default 10 s).
+/// `connected_at_unix` and `last_activity_at_unix` are Unix epoch seconds;
+/// use `to_timestamp(connected_at_unix)` to convert.
+///
+/// Requires an enterprise license with the `metrics` feature.
+#[pg_extern]
+fn pgmqtt_connections() -> TableIterator<
+    'static,
+    (
+        name!(client_id, String),
+        name!(transport, String),
+        name!(connected_at_unix, i64),
+        name!(last_activity_at_unix, i64),
+        name!(keep_alive_secs, i32),
+        name!(msgs_received, i64),
+        name!(msgs_sent, i64),
+        name!(bytes_received, i64),
+        name!(bytes_sent, i64),
+        name!(subscriptions, i32),
+        name!(queue_depth, i32),
+        name!(inflight_count, i32),
+        name!(will_set, bool),
+        name!(cached_at_unix, i64),
+    ),
+> {
+    if !crate::license::has_feature(crate::license::Feature::Metrics) {
+        pgrx::error!(
+            "pgmqtt_connections() requires an enterprise license with the 'metrics' feature"
+        );
+    }
+
+    type Row = (String, String, i64, i64, i32, i64, i64, i64, i64, i32, i32, i32, bool, i64);
+    let rows = Spi::connect(|client| {
+        let table_exists = client
+            .select(
+                "SELECT to_regclass('pgmqtt_connections_cache')::text",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|mut t| t.next())
+            .and_then(|r| r.get_by_name::<String, _>("to_regclass").ok().flatten())
+            .is_some();
+
+        if !table_exists {
+            return Ok::<Vec<Row>, spi::Error>(Vec::new());
+        }
+
+        let mut out: Vec<Row> = Vec::new();
+        if let Ok(table) = client.select(
+            "SELECT client_id, transport, connected_at_unix, last_activity_at_unix,
+                    keep_alive_secs, msgs_received, msgs_sent, bytes_received, bytes_sent,
+                    subscriptions, queue_depth, inflight_count, will_set, cached_at_unix
+             FROM pgmqtt_connections_cache
+             ORDER BY client_id",
+            None,
+            &[],
+        ) {
+            for row in table {
+                let g_str  = |n: &str| row.get_by_name::<String, _>(n).ok().flatten().unwrap_or_default();
+                let g_i64  = |n: &str| row.get_by_name::<i64, _>(n).ok().flatten().unwrap_or(0);
+                let g_i32  = |n: &str| row.get_by_name::<i32, _>(n).ok().flatten().unwrap_or(0);
+                let g_bool = |n: &str| row.get_by_name::<bool, _>(n).ok().flatten().unwrap_or(false);
+                out.push((
+                    g_str("client_id"),
+                    g_str("transport"),
+                    g_i64("connected_at_unix"),
+                    g_i64("last_activity_at_unix"),
+                    g_i32("keep_alive_secs"),
+                    g_i64("msgs_received"),
+                    g_i64("msgs_sent"),
+                    g_i64("bytes_received"),
+                    g_i64("bytes_sent"),
+                    g_i32("subscriptions"),
+                    g_i32("queue_depth"),
+                    g_i32("inflight_count"),
+                    g_bool("will_set"),
+                    g_i64("cached_at_unix"),
+                ));
+            }
+        }
+        Ok::<_, spi::Error>(out)
+    })
+    .unwrap_or_default();
+
+    TableIterator::new(rows.into_iter())
+}
+
+/// Return all broker metrics in Prometheus text exposition format.
+///
+/// Reads from `pgmqtt_metrics_current`.  Compatible with `postgres_exporter`
+/// custom query files and any Prometheus scraper that can run SQL.
+///
+/// Requires an enterprise license with the `metrics` feature.
+#[pg_extern]
+fn pgmqtt_prometheus_metrics() -> String {
+    if !crate::license::has_feature(crate::license::Feature::Metrics) {
+        pgrx::error!(
+            "pgmqtt_prometheus_metrics() requires an enterprise license with the 'metrics' feature"
+        );
+    }
+
+    // Re-use MetricsSnapshot to build the Prometheus text. We read from the
+    // current table (same data that pgmqtt_metrics() returns) rather than the
+    // live in-process atomics, since this function runs in a user backend.
+    let snap = Spi::connect(|client| {
+        let mut s = crate::metrics::MetricsSnapshot {
+            captured_at_unix: 0, started_at_unix: 0, last_reset_at_unix: 0,
+            connections_accepted: 0, connections_rejected: 0, connections_current: 0,
+            disconnections_clean: 0, disconnections_unclean: 0, wills_fired: 0,
+            sessions_created: 0, sessions_resumed: 0, sessions_expired: 0,
+            msgs_received: 0, msgs_received_qos0: 0, msgs_received_qos1: 0,
+            bytes_received: 0, msgs_sent: 0, bytes_sent: 0, msgs_dropped: 0,
+            pubacks_sent: 0, pubacks_received: 0,
+            subscribe_ops: 0, unsubscribe_ops: 0,
+            cdc_events_processed: 0, cdc_msgs_published: 0, cdc_errors: 0, cdc_lag_ms_last: 0,
+            inbound_writes_ok: 0, inbound_writes_failed: 0, inbound_retries: 0,
+            inbound_dead_letters: 0, db_batches_committed: 0, db_errors: 0,
+        };
+        if let Ok(mut rows) = client.select(
+            "SELECT * FROM pgmqtt_metrics_current LIMIT 1", None, &[],
+        ) {
+            if let Some(row) = rows.next() {
+                macro_rules! g {
+                    ($field:ident) => {
+                        s.$field = row.get_by_name::<i64, _>(stringify!($field))
+                            .ok().flatten().unwrap_or(0);
+                    };
+                }
+                g!(captured_at_unix); g!(started_at_unix); g!(last_reset_at_unix);
+                g!(connections_accepted); g!(connections_rejected); g!(connections_current);
+                g!(disconnections_clean); g!(disconnections_unclean); g!(wills_fired);
+                g!(sessions_created); g!(sessions_resumed); g!(sessions_expired);
+                g!(msgs_received); g!(msgs_received_qos0); g!(msgs_received_qos1);
+                g!(bytes_received); g!(msgs_sent); g!(bytes_sent); g!(msgs_dropped);
+                g!(pubacks_sent); g!(pubacks_received);
+                g!(subscribe_ops); g!(unsubscribe_ops);
+                g!(cdc_events_processed); g!(cdc_msgs_published); g!(cdc_errors);
+                g!(cdc_lag_ms_last);
+                g!(inbound_writes_ok); g!(inbound_writes_failed); g!(inbound_retries);
+                g!(inbound_dead_letters); g!(db_batches_committed); g!(db_errors);
+            }
+        }
+        Ok::<_, spi::Error>(s)
+    })
+    .unwrap_or_else(|_| crate::metrics::MetricsSnapshot {
+        captured_at_unix: 0, started_at_unix: 0, last_reset_at_unix: 0,
+        connections_accepted: 0, connections_rejected: 0, connections_current: 0,
+        disconnections_clean: 0, disconnections_unclean: 0, wills_fired: 0,
+        sessions_created: 0, sessions_resumed: 0, sessions_expired: 0,
+        msgs_received: 0, msgs_received_qos0: 0, msgs_received_qos1: 0,
+        bytes_received: 0, msgs_sent: 0, bytes_sent: 0, msgs_dropped: 0,
+        pubacks_sent: 0, pubacks_received: 0, subscribe_ops: 0, unsubscribe_ops: 0,
+        cdc_events_processed: 0, cdc_msgs_published: 0, cdc_errors: 0, cdc_lag_ms_last: 0,
+        inbound_writes_ok: 0, inbound_writes_failed: 0, inbound_retries: 0,
+        inbound_dead_letters: 0, db_batches_committed: 0, db_errors: 0,
+    });
+
+    snap.to_prometheus()
+}
+
+/// Convert `pgmqtt_metrics_snapshots` to a TimescaleDB hypertable, enabling
+/// automatic partitioning and optional compression/retention policies.
+///
+/// Run once after enabling TimescaleDB:
+/// ```sql
+/// SELECT pgmqtt_enable_timescaledb();
+/// ```
+///
+/// Requires an enterprise license with the `metrics` feature and the
+/// `timescaledb` extension to be installed in the current database.
+#[pg_extern]
+fn pgmqtt_enable_timescaledb() -> String {
+    if !crate::license::has_feature(crate::license::Feature::Metrics) {
+        pgrx::error!(
+            "pgmqtt_enable_timescaledb() requires an enterprise license with the 'metrics' feature"
+        );
+    }
+
+    // Check that TimescaleDB is present.
+    let tsdb_present = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT COUNT(*)::int FROM pg_extension WHERE extname = 'timescaledb'",
+                None,
+                &[],
+            )?
+            .first()
+            .get_one::<i32>()?
+            .unwrap_or(0);
+        Ok::<bool, spi::Error>(result > 0)
+    })
+    .unwrap_or(false);
+
+    if !tsdb_present {
+        return "timescaledb extension is not installed in this database".to_string();
+    }
+
+    // pgmqtt_metrics_snapshots uses snapshot_at bigint (unix seconds).
+    // TimescaleDB needs a timestamp column; we add a computed column approach:
+    // wrap the table with a generated timestamptz column via a view, OR convert
+    // snapshot_at to a proper timestamptz. We'll use a thin wrapper view so the
+    // underlying table stays schema-stable.
+    let result = Spi::connect_mut(|client| {
+        // TimescaleDB requires every unique index to include the partition column.
+        // The default table has PRIMARY KEY (id); we need PRIMARY KEY (id, snapshot_at).
+        // Drop the old constraint (idempotent via IF EXISTS) then add the composite one.
+        let _ = client.update(
+            "ALTER TABLE pgmqtt_metrics_snapshots \
+             DROP CONSTRAINT IF EXISTS pgmqtt_metrics_snapshots_pkey",
+            None,
+            &[],
+        );
+        // Add composite PK only if one doesn't already exist with snapshot_at
+        let pk_ok = client
+            .select(
+                "SELECT 1 FROM pg_constraint c \
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid \
+                   AND a.attnum = ANY(c.conkey) \
+                 WHERE c.conrelid = 'pgmqtt_metrics_snapshots'::regclass \
+                   AND c.contype = 'p' AND a.attname = 'snapshot_at'",
+                None,
+                &[],
+            )
+            .map(|mut t| t.next().is_some())
+            .unwrap_or(false);
+        if !pk_ok {
+            let _ = client.update(
+                "ALTER TABLE pgmqtt_metrics_snapshots ADD PRIMARY KEY (id, snapshot_at)",
+                None,
+                &[],
+            );
+        }
+        // Create the hypertable partitioned on snapshot_at (Unix seconds, bigint).
+        // chunk_time_interval = 86400 → one chunk per day.
+        client.select(
+            "SELECT create_hypertable('pgmqtt_metrics_snapshots', 'snapshot_at', \
+                                      chunk_time_interval => 86400, \
+                                      if_not_exists => true, \
+                                      migrate_data => true)",
+            None,
+            &[],
+        ).map(|_| ())
+    });
+
+    match result {
+        Ok(()) => "pgmqtt_metrics_snapshots converted to TimescaleDB hypertable (chunk_time_interval = 86400 seconds)".to_string(),
+        Err(e) => format!("timescaledb setup failed: {}", e),
+    }
+}
+
+extension_sql!(
+    r#"
+    REVOKE EXECUTE ON FUNCTION pgmqtt_metrics() FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_connections() FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_prometheus_metrics() FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_enable_timescaledb() FROM PUBLIC;
+    "#,
+    name = "revoke_metrics_from_public",
+    requires = [pgmqtt_metrics, pgmqtt_connections, pgmqtt_prometheus_metrics, pgmqtt_enable_timescaledb],
+);
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -818,6 +1239,49 @@ pub unsafe extern "C" fn _PG_init() {
         c"Require valid JWT for WebSocket connections (overrides jwt_required for WS)",
         c"",
         &JWT_REQUIRED_WS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.metrics_snapshot_interval",
+        c"Seconds between metric snapshot flushes to pgmqtt_metrics_snapshots (0 = disabled)",
+        c"",
+        &METRICS_SNAPSHOT_INTERVAL,
+        0, 86400,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.metrics_retention_days",
+        c"Days to retain rows in pgmqtt_metrics_snapshots (0 = keep forever)",
+        c"",
+        &METRICS_RETENTION_DAYS,
+        0, 3650,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.metrics_connections_cache_interval",
+        c"Seconds between pgmqtt_connections_cache refreshes (0 = disabled)",
+        c"",
+        &METRICS_CONNECTIONS_CACHE_INTERVAL,
+        0, 3600,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
+        c"pgmqtt.metrics_hook_function",
+        c"SQL function called after each metric flush: schema.function(jsonb) -> void",
+        c"",
+        &METRICS_HOOK_FUNCTION,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
+        c"pgmqtt.metrics_notify_channel",
+        c"PostgreSQL NOTIFY channel for streaming metric snapshots as JSON (empty = disabled)",
+        c"",
+        &METRICS_NOTIFY_CHANNEL,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
