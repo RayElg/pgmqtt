@@ -1,0 +1,259 @@
+:root {
+  --bg: #0d1117;
+  --card-bg: rgba(22, 27, 34, 0.8);
+  --accent: #58a6ff;
+  --accent2: #3fb950;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --border: rgba(48, 54, 61, 0.8);
+  --danger: #f85149;
+  --warning: #d29922;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  background-image:
+    radial-gradient(circle at 15% 15%, rgba(88,166,255,.06) 0%, transparent 45%),
+    radial-gradient(circle at 85% 85%, rgba(63,185,80,.05) 0%, transparent 45%);
+}
+
+.app { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+
+/* ─── Header ─────────────────────────────────────────────────────────── */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.logo { font-size: 1.8rem; font-weight: 700; letter-spacing: -1px; }
+.logo span { color: var(--accent); }
+
+.blurb {
+  color: var(--muted);
+  font-size: .9rem;
+  margin-bottom: 1.5rem;
+  max-width: 780px;
+  line-height: 1.7;
+}
+
+/* ─── Tabs ────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: .5rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: .75rem;
+}
+.tab {
+  padding: .45rem 1rem;
+  border-radius: .4rem;
+  font-size: .85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: none;
+  transition: .15s;
+}
+.tab:hover { color: var(--text); border-color: var(--border); }
+.tab.active {
+  background: var(--card-bg);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.panel { display: none; }
+.panel.active { display: block; }
+
+/* ─── Stat Cards ──────────────────────────────────────────────────────── */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.stat-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  padding: 1.25rem;
+}
+.stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.stat-label {
+  font-size: .75rem;
+  color: var(--muted);
+  margin-top: .3rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+/* ─── Section headings ────────────────────────────────────────────────── */
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.section-head h2 { font-size: 1rem; font-weight: 600; }
+.section-head .badge {
+  font-size: .7rem;
+  padding: .2rem .6rem;
+  border-radius: 2rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ─── Table ───────────────────────────────────────────────────────────── */
+.data-table-wrap {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  overflow: hidden;
+  margin-bottom: 1.5rem;
+}
+table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+thead th {
+  background: rgba(255,255,255,.03);
+  padding: .7rem 1rem;
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border-bottom: 1px solid var(--border);
+}
+tbody td {
+  padding: .65rem 1rem;
+  border-bottom: 1px solid rgba(48,54,61,.4);
+  font-family: 'JetBrains Mono', monospace;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: rgba(255,255,255,.02); }
+
+/* ─── Live stream ─────────────────────────────────────────────────────── */
+.stream-status {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  font-size: .8rem;
+  color: var(--muted);
+  margin-bottom: 1rem;
+}
+.pulse {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--danger);
+  flex-shrink: 0;
+}
+.pulse.live {
+  background: var(--accent2);
+  animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: .5; transform: scale(.85); }
+}
+
+.stream-feed {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  padding: 1rem;
+  height: 340px;
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .76rem;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: .4rem;
+}
+.stream-entry {
+  padding: .5rem .75rem;
+  background: rgba(88,166,255,.05);
+  border: 1px solid rgba(88,166,255,.15);
+  border-radius: .4rem;
+  color: var(--accent);
+}
+.stream-entry .ts { color: var(--muted); font-size: .7rem; margin-bottom: .2rem; }
+.stream-entry .kv { display: flex; flex-wrap: wrap; gap: .5rem; }
+.stream-entry .kv span { color: var(--text); }
+.stream-entry .kv span b { color: var(--accent2); }
+
+/* ─── Value-change flash ─────────────────────────────────────────────────── */
+@keyframes flash-up {
+  0%   { color: var(--accent2); transform: scale(1.08); }
+  100% { color: var(--accent);  transform: scale(1); }
+}
+.stat-value.changed {
+  animation: flash-up 0.5s ease-out forwards;
+}
+
+@keyframes row-flash {
+  0%   { background: rgba(88,166,255,.15); }
+  100% { background: transparent; }
+}
+.row-new {
+  animation: row-flash 1s ease-out forwards;
+}
+
+.delta-badge {
+  display: inline-block;
+  font-size: .65rem;
+  font-weight: 700;
+  color: var(--accent2);
+  margin-left: .4rem;
+  font-family: 'JetBrains Mono', monospace;
+  animation: flash-up 0.8s ease-out forwards;
+}
+
+/* ─── Hook log ────────────────────────────────────────────────────────── */
+.hook-row.alert td:first-child { color: var(--danger); }
+.hook-row td.payload-cell {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/* ─── Grafana iframe ──────────────────────────────────────────────────── */
+.grafana-wrap {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  overflow: hidden;
+  height: 900px;
+}
+.grafana-wrap iframe { width: 100%; height: 100%; border: none; }
+.grafana-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 1rem;
+  color: var(--muted);
+  font-size: .9rem;
+}
+.grafana-fallback a {
+  color: var(--accent);
+  text-decoration: none;
+  padding: .6rem 1.4rem;
+  border: 1px solid var(--accent);
+  border-radius: .5rem;
+}
