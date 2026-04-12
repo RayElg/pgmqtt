@@ -1,6 +1,6 @@
 # pgmqtt Observability Demo
 
-Four production-ready patterns for consuming broker metrics, all driven by the same counter pipeline inside PostgreSQL.
+Four patterns for consuming broker metrics, all driven by the same counter pipeline inside PostgreSQL.
 
 <video src="https://private-user-images.githubusercontent.com/17395710/577092935-eb576e6e-bdfc-4fd7-981e-22870b86adf8.mp4?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzYwMjA0ODQsIm5iZiI6MTc3NjAyMDE4NCwicGF0aCI6Ii8xNzM5NTcxMC81NzcwOTI5MzUtZWI1NzZlNmUtYmRmYy00ZmQ3LTk4MWUtMjI4NzBiODZhZGY4Lm1wND9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA0MTIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNDEyVDE4NTYyNFomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTA3ZDNmZDk0N2JmNjM2ZmY2NWNmMjg4NTgyZDdlYjM1ZmYzOWMwYjRlMTljYmE0MWNlYmE1NWQ3YzllOTRhYWMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT12aWRlbyUyRm1wNCJ9.5zMFNbNp5fQhIj5sFSrY0ZIe8HjSPVX-ssVr9KqTTQs" controls autoplay loop muted width="100%"></video>
 
@@ -39,7 +39,7 @@ flowchart LR
 
 | Tab | Pattern | How it works |
 |-----|---------|-------------|
-| **SQL Polling** | `SELECT * FROM pgmqtt_metrics()` via PostgREST | Browser polls every 5 s; shows live counter table and stat cards |
+| **SQL Polling** | `SELECT * FROM pgmqtt_metrics()` via PostgREST | Browser polls; shows live counter table and stat cards |
 | **Connections** | `SELECT * FROM pgmqtt_connections()` via PostgREST | Per-client view: transport, uptime, message counts, queue depth |
 | **Live Stream** | `LISTEN pgmqtt_live` → SSE → `EventSource` | Every flush fires a NOTIFY with a JSON snapshot; bridge forwards to browser with no polling |
 | **Hook Log** | `pgmqtt.metrics_hook_function = 'public.pgmqtt_alert_hook'` | SQL function called on each flush; writes payload + alert flag to `pgmqtt_hook_log` |
