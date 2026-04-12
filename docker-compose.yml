@@ -29,3 +29,4 @@ services:
       - "${DOCKER_BIND_IP:-127.0.0.1}:9187:9187"
     depends_on:
       - postgres
+    restart: unless-stopped

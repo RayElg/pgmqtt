@@ -1274,6 +1274,7 @@ const CDC_BATCH_SIZE: usize = 256;
 fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
     use crate::ring_buffer;
     use crate::topic_map;
+    use pgrx::pg_sys::pg_try::PgTryBuilder;
     use pgrx::spi::{self, Spi};
 
     // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
@@ -1413,10 +1414,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                         &[],
                     );
                     let mut n = 0usize;
-                    if let Ok(table) = client.select(&advance_query, None, &[]) {
-                        for _ in table {
-                            n += 1;
-                        }
+                    let table = client.select(&advance_query, None, &[])?;
+                    for _ in table {
+                        n += 1;
                     }
                     Ok::<usize, spi::Error>(n)
                 }) {
@@ -1541,16 +1541,41 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                 if rendered.qos > 0 {
                                     // Persist within this transaction — committed atomically
                                     // with the slot advance above.
-                                    let result = pgrx::spi::Spi::connect_mut(|client| {
-                                        let msg_id = db_action::persist_message(
-                                            client,
-                                            &topic_str,
-                                            &rendered.payload,
-                                            rendered.qos,
-                                            false,
-                                        )?;
-                                        Ok::<_, pgrx::spi::Error>(Some(msg_id))
-                                    });
+                                    //
+                                    // Use a subtransaction (savepoint) so that a PostgreSQL
+                                    // error inside persist_message is caught and counted
+                                    // without crashing the background worker.  On error the
+                                    // subtransaction is rolled back and we return an Err so
+                                    // the outer batch rolls back too (events are retried).
+                                    unsafe {
+                                        pgrx::pg_sys::BeginInternalSubTransaction(
+                                            std::ptr::null_mut(),
+                                        );
+                                    }
+                                    let result = PgTryBuilder::new(|| {
+                                        pgrx::spi::Spi::connect_mut(|client| {
+                                            let msg_id = db_action::persist_message(
+                                                client,
+                                                &topic_str,
+                                                &rendered.payload,
+                                                rendered.qos,
+                                                false,
+                                            )?;
+                                            Ok::<_, spi::Error>(Some(msg_id))
+                                        })
+                                    })
+                                    .catch_others(|_caught| {
+                                        unsafe {
+                                            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                                        }
+                                        Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
+                                    })
+                                    .execute();
+                                    if result.is_ok() {
+                                        unsafe {
+                                            pgrx::pg_sys::ReleaseCurrentSubTransaction();
+                                        }
+                                    }
 
                                     match result {
                                         Ok(msg_id) => {
