@@ -1,8 +1,19 @@
 services:
-  postgres:
+  # Base pgmqtt image (no TimescaleDB) — built first, used as base for postgres.
+  pgmqtt-base:
     build:
       context: ../../
       dockerfile: docker/Dockerfile
+    image: pgmqtt-base
+
+  postgres:
+    build:
+      context: ./db
+      args:
+        BASE_IMAGE: pgmqtt-base
+    depends_on:
+      pgmqtt-base:
+        condition: service_started
     environment:
       POSTGRES_PASSWORD: password
     volumes:
@@ -45,6 +56,9 @@ services:
       MQTT_PORT: "1883"
     restart: unless-stopped
 
+  # NOTE: This demo uses the postgres superuser as the anon role for simplicity.
+  # In production, create a dedicated read-only role with access only to the
+  # pgmqtt_metrics/connections functions and the hook_log table.
   postgrest:
     image: postgrest/postgrest
     depends_on:

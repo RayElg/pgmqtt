@@ -480,13 +480,20 @@ def _has_timescaledb() -> bool:
     except Exception:
         return False
 
-
+# TODO - lets somehow handle this without the demo image
 @pytest.mark.skipif(
     not _has_timescaledb(),
-    reason="TimescaleDB extension not installed",
+    reason="TimescaleDB extension not installed — run against the observability "
+           "demo image (demos/observability) which bundles TimescaleDB",
 )
 def test_enable_timescaledb_converts_hypertable():
-    """With TimescaleDB installed, the function converts the snapshot table."""
+    """With TimescaleDB installed, the function converts the snapshot table.
+
+    This test is expected to skip when running against the base dev image
+    (docker/Dockerfile), which does not include TimescaleDB.  To exercise it,
+    run the enterprise suite against the observability demo stack
+    (demos/observability/docker-compose.yml) where TimescaleDB is installed.
+    """
     result = run_sql("SELECT pgmqtt_enable_timescaledb()")
     assert result
     assert "hypertable" in result[0][0].lower(), (

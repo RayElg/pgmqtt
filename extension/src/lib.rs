@@ -934,19 +934,7 @@ fn pgmqtt_prometheus_metrics() -> String {
     // current table (same data that pgmqtt_metrics() returns) rather than the
     // live in-process atomics, since this function runs in a user backend.
     let snap = Spi::connect(|client| {
-        let mut s = crate::metrics::MetricsSnapshot {
-            captured_at_unix: 0, started_at_unix: 0, last_reset_at_unix: 0,
-            connections_accepted: 0, connections_rejected: 0, connections_current: 0,
-            disconnections_clean: 0, disconnections_unclean: 0, wills_fired: 0,
-            sessions_created: 0, sessions_resumed: 0, sessions_expired: 0,
-            msgs_received: 0, msgs_received_qos0: 0, msgs_received_qos1: 0,
-            bytes_received: 0, msgs_sent: 0, bytes_sent: 0, msgs_dropped: 0,
-            pubacks_sent: 0, pubacks_received: 0,
-            subscribe_ops: 0, unsubscribe_ops: 0,
-            cdc_events_processed: 0, cdc_msgs_published: 0, cdc_errors: 0, cdc_lag_ms_last: 0,
-            inbound_writes_ok: 0, inbound_writes_failed: 0, inbound_retries: 0,
-            inbound_dead_letters: 0, db_batches_committed: 0, db_errors: 0,
-        };
+        let mut s = crate::metrics::MetricsSnapshot::default();
         if let Ok(mut rows) = client.select(
             "SELECT * FROM pgmqtt_metrics_current LIMIT 1", None, &[],
         ) {
@@ -956,8 +944,12 @@ fn pgmqtt_prometheus_metrics() -> String {
                         s.$field = row.get_by_name::<i64, _>(stringify!($field))
                             .ok().flatten().unwrap_or(0);
                     };
+                    ($field:ident, $col:expr) => {
+                        s.$field = row.get_by_name::<i64, _>($col)
+                            .ok().flatten().unwrap_or(0);
+                    };
                 }
-                g!(captured_at_unix); g!(started_at_unix); g!(last_reset_at_unix);
+                g!(captured_at_unix, "captured_at"); g!(started_at_unix, "started_at"); g!(last_reset_at_unix, "last_reset_at");
                 g!(connections_accepted); g!(connections_rejected); g!(connections_current);
                 g!(disconnections_clean); g!(disconnections_unclean); g!(wills_fired);
                 g!(sessions_created); g!(sessions_resumed); g!(sessions_expired);
@@ -973,18 +965,7 @@ fn pgmqtt_prometheus_metrics() -> String {
         }
         Ok::<_, spi::Error>(s)
     })
-    .unwrap_or_else(|_| crate::metrics::MetricsSnapshot {
-        captured_at_unix: 0, started_at_unix: 0, last_reset_at_unix: 0,
-        connections_accepted: 0, connections_rejected: 0, connections_current: 0,
-        disconnections_clean: 0, disconnections_unclean: 0, wills_fired: 0,
-        sessions_created: 0, sessions_resumed: 0, sessions_expired: 0,
-        msgs_received: 0, msgs_received_qos0: 0, msgs_received_qos1: 0,
-        bytes_received: 0, msgs_sent: 0, bytes_sent: 0, msgs_dropped: 0,
-        pubacks_sent: 0, pubacks_received: 0, subscribe_ops: 0, unsubscribe_ops: 0,
-        cdc_events_processed: 0, cdc_msgs_published: 0, cdc_errors: 0, cdc_lag_ms_last: 0,
-        inbound_writes_ok: 0, inbound_writes_failed: 0, inbound_retries: 0,
-        inbound_dead_letters: 0, db_batches_committed: 0, db_errors: 0,
-    });
+    .unwrap_or_default();
 
     snap.to_prometheus()
 }

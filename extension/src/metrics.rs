@@ -159,6 +159,7 @@ pub fn dec(counter: &AtomicU64) {
 ///
 /// Captured by the background worker and written to `pgmqtt_metrics_current`
 /// and `pgmqtt_metrics_snapshots`.
+#[derive(Default)]
 pub struct MetricsSnapshot {
     pub captured_at_unix:        i64,
     pub started_at_unix:         i64,

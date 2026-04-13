@@ -1171,16 +1171,18 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
         // ── Enterprise metrics flush ──────────────────────────────────────────
         if crate::license::has_feature(crate::license::Feature::Metrics) {
-            let snap_interval =
-                crate::get_metrics_snapshot_interval_guc().max(1) as u64;
-            if last_metrics_flush.elapsed().as_secs() >= snap_interval {
+            let snap_interval = crate::get_metrics_snapshot_interval_guc();
+            if snap_interval > 0
+                && last_metrics_flush.elapsed().as_secs() >= snap_interval as u64
+            {
                 let snap = crate::metrics::MetricsSnapshot::capture();
                 flush_metrics_snapshot(&snap);
                 last_metrics_flush = std::time::Instant::now();
             }
-            let conn_interval =
-                crate::get_metrics_connections_cache_interval_guc().max(1) as u64;
-            if last_connections_flush.elapsed().as_secs() >= conn_interval {
+            let conn_interval = crate::get_metrics_connections_cache_interval_guc();
+            if conn_interval > 0
+                && last_connections_flush.elapsed().as_secs() >= conn_interval as u64
+            {
                 flush_connections_cache(&clients);
                 last_connections_flush = std::time::Instant::now();
             }
@@ -3346,11 +3348,11 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
 fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
     use pgrx::datum::DatumWithOid;
 
-    let retention_days = crate::get_metrics_retention_days_guc().max(1);
+    let retention_days = crate::get_metrics_retention_days_guc();
     let hook_fn_str = crate::get_metrics_hook_function_guc();
     let notify_chan_str = crate::get_metrics_notify_channel_guc();
     let json_payload = snap.to_json();
-    let cutoff = snap.captured_at_unix - (retention_days as i64 * 86400);
+    let captured_at = snap.captured_at_unix;
 
     // All values are i64 — safe to embed directly in the SQL string.
     let upsert_sql = format!(
@@ -3452,13 +3454,16 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
             if let Err(e) = spi.update(&insert_snap_sql, None, &[]) {
                 pgrx::log!("pgmqtt metrics: failed to insert metrics snapshot: {}", e);
             }
-            // Purge snapshots older than the retention window
-            let delete_old = format!(
-                "DELETE FROM pgmqtt_metrics_snapshots WHERE snapshot_at < {}",
-                cutoff,
-            );
-            if let Err(e) = spi.update(&delete_old, None, &[]) {
-                pgrx::log!("pgmqtt metrics: failed to purge old snapshots: {}", e);
+            // Purge snapshots older than the retention window (0 = keep forever)
+            if retention_days > 0 {
+                let cutoff = captured_at - (retention_days as i64 * 86400);
+                let delete_old = format!(
+                    "DELETE FROM pgmqtt_metrics_snapshots WHERE snapshot_at < {}",
+                    cutoff,
+                );
+                if let Err(e) = spi.update(&delete_old, None, &[]) {
+                    pgrx::log!("pgmqtt metrics: failed to purge old snapshots: {}", e);
+                }
             }
             // Call hook function if configured.
             // The GUC is superuser-settable; we still validate identifier characters.
@@ -3501,8 +3506,10 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
 
 /// Rebuild `pgmqtt_connections_cache` from the current in-memory client map.
 ///
-/// Runs a TRUNCATE + batch-INSERT in a single transaction so readers always
+/// Runs a DELETE + batch-INSERT in a single transaction so readers always
 /// see a consistent snapshot even while the table is being refreshed.
+/// Uses DELETE instead of TRUNCATE to avoid AccessExclusiveLock, which would
+/// block concurrent readers (PostgREST, dashboards).
 fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
     use pgrx::datum::DatumWithOid;
 
@@ -3520,6 +3527,7 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
         msgs_sent: i64,
         bytes_received: i64,
         bytes_sent: i64,
+        subscriptions: i32,
         queue_depth: i32,
         inflight_count: i32,
         will_set: bool,
@@ -3542,6 +3550,7 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                 msgs_sent: client.msgs_sent_count as i64,
                 bytes_received: client.bytes_received_count as i64,
                 bytes_sent: client.bytes_sent_count as i64,
+                subscriptions: subscriptions::subscription_count(id) as i32,
                 queue_depth: client.session.queue.len() as i32,
                 inflight_count: client.session.inflight.len() as i32,
                 will_set: client.will.is_some(),
@@ -3551,9 +3560,9 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
 
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|spi| {
-            if let Err(e) = spi.update("TRUNCATE pgmqtt_connections_cache", None, &[]) {
+            if let Err(e) = spi.update("DELETE FROM pgmqtt_connections_cache", None, &[]) {
                 pgrx::log!(
-                    "pgmqtt metrics: failed to truncate connections_cache: {}",
+                    "pgmqtt metrics: failed to clear connections_cache: {}",
                     e
                 );
                 return Ok::<_, pgrx::spi::Error>(());
@@ -3569,6 +3578,7 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                     row.msgs_sent.into(),
                     row.bytes_received.into(),
                     row.bytes_sent.into(),
+                    row.subscriptions.into(),
                     row.queue_depth.into(),
                     row.inflight_count.into(),
                     row.will_set.into(),
@@ -3578,8 +3588,8 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                     "INSERT INTO pgmqtt_connections_cache \
                      (client_id,transport,connected_at_unix,last_activity_at_unix,\
                       keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
-                      queue_depth,inflight_count,will_set,cached_at_unix) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                      subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
                     None,
                     &args,
                 ) {

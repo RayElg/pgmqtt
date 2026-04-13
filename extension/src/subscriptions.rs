@@ -395,6 +395,16 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
     })
 }
 
+/// Return the number of active topic filters for a client.
+pub fn subscription_count(client_id: &str) -> usize {
+    with_state(|state| {
+        state.client_to_filters
+            .get(client_id)
+            .map(|f| f.len())
+            .unwrap_or(0)
+    })
+}
+
 /// Remove all subscriptions for a client (on disconnect).
 pub fn remove_client(client_id: &str) {
     with_state(|state| {
