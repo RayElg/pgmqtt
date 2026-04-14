@@ -15,4 +15,4 @@ pg_pgmqtt:
         description: "Current value of the pgmqtt metric"
     - description:
         usage: "LABEL"
-        description: "Human-readable description"
+        description: "Human-readable description of the metric"

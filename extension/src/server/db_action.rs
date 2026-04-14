@@ -117,6 +117,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
 
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
+            let mut had_error = false;
             for action in actions {
                 match action {
                     SessionDbAction::UpsertSession {
@@ -139,6 +140,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to upsert session '{}': {}", client_id, e);
                         }
                     }
@@ -149,6 +151,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to mark session '{}' disconnected: {}", client_id, e);
                         }
                     }
@@ -159,6 +162,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
                         }
                         // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
@@ -197,6 +201,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         );
 
                         if let Err(e) = client.update(&query, None, &args) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to batch insert messages for message {}: {}", message_id, e);
                         }
                     }
@@ -216,6 +221,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to update message {} as inflight for session '{}': {}", message_id, client_id, e);
                         }
                     }
@@ -230,9 +236,11 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
                         }
                         if let Err(e) = cleanup_orphaned_message(client, message_id) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to delete orphaned message {}: {}", message_id, e);
                         }
                     }
@@ -254,6 +262,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to insert subscription for '{}' to '{}': {}", client_id, topic_filter, e);
                         }
                     }
@@ -268,10 +277,14 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             None,
                             &args,
                         ) {
+                            had_error = true;
                             pgrx::log!("pgmqtt: failed to delete subscription for '{}' from '{}': {}", client_id, topic_filter, e);
                         }
                     }
                 }
+            }
+            if had_error {
+                crate::metrics::inc(&crate::metrics::get().db_errors);
             }
             crate::metrics::inc(&crate::metrics::get().db_batches_committed);
             Ok::<_, pgrx::spi::Error>(())

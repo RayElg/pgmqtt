@@ -8,6 +8,7 @@ import threading
 import time
 
 import psycopg2
+from psycopg2 import sql as pg_sql
 from flask import Flask, Response
 
 PGHOST    = os.getenv("PGHOST", "localhost")
@@ -44,7 +45,7 @@ def _pg_listener():
             conn = psycopg2.connect(dsn)
             conn.autocommit = True
             with conn.cursor() as cur:
-                cur.execute(f"LISTEN {CHANNEL}")
+                cur.execute(pg_sql.SQL("LISTEN {}").format(pg_sql.Identifier(CHANNEL)))
             print(f"[bridge] listening on {CHANNEL}", flush=True)
             while True:
                 if _select.select([conn], [], [], 2.0)[0]:

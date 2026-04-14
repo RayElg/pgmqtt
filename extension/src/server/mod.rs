@@ -695,6 +695,7 @@ fn handle_inbound_failure(
             payload,
         );
     } else {
+        crate::metrics::inc(&crate::metrics::get().inbound_retries);
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
             retry_count + 1,
@@ -735,6 +736,7 @@ fn dead_letter_inbound(
     topic: &str,
     payload: &[u8],
 ) {
+    crate::metrics::inc(&crate::metrics::get().inbound_dead_letters);
     log!(
         "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
         message_id,
@@ -1576,6 +1578,10 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                     if result.is_ok() {
                                         unsafe {
                                             pgrx::pg_sys::ReleaseCurrentSubTransaction();
+                                        }
+                                    } else {
+                                        unsafe {
+                                            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
                                         }
                                     }
 
@@ -3567,37 +3573,45 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                 );
                 return Ok::<_, pgrx::spi::Error>(());
             }
-            for row in &rows {
-                let args: Vec<DatumWithOid> = vec![
-                    row.client_id.as_str().into(),
-                    row.transport.into(),
-                    row.connected_at_unix.into(),
-                    row.last_activity_unix.into(),
-                    row.keep_alive_secs.into(),
-                    row.msgs_received.into(),
-                    row.msgs_sent.into(),
-                    row.bytes_received.into(),
-                    row.bytes_sent.into(),
-                    row.subscriptions.into(),
-                    row.queue_depth.into(),
-                    row.inflight_count.into(),
-                    row.will_set.into(),
-                    now_unix.into(),
-                ];
-                if let Err(e) = spi.update(
+            // Batch-insert rows in chunks of 50 to avoid excessive SPI round-trips
+            // while keeping the parameter list manageable.
+            const BATCH: usize = 50;
+            const COLS: usize = 14;
+            for chunk in rows.chunks(BATCH) {
+                let mut values_clauses = Vec::with_capacity(chunk.len());
+                let mut args: Vec<DatumWithOid> = Vec::with_capacity(chunk.len() * COLS);
+                for (i, row) in chunk.iter().enumerate() {
+                    let base = i * COLS + 1;
+                    values_clauses.push(format!(
+                        "(${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
+                        base, base+1, base+2, base+3, base+4, base+5, base+6,
+                        base+7, base+8, base+9, base+10, base+11, base+12, base+13,
+                    ));
+                    args.push(row.client_id.as_str().into());
+                    args.push(row.transport.into());
+                    args.push(row.connected_at_unix.into());
+                    args.push(row.last_activity_unix.into());
+                    args.push(row.keep_alive_secs.into());
+                    args.push(row.msgs_received.into());
+                    args.push(row.msgs_sent.into());
+                    args.push(row.bytes_received.into());
+                    args.push(row.bytes_sent.into());
+                    args.push(row.subscriptions.into());
+                    args.push(row.queue_depth.into());
+                    args.push(row.inflight_count.into());
+                    args.push(row.will_set.into());
+                    args.push(now_unix.into());
+                }
+                let query = format!(
                     "INSERT INTO pgmqtt_connections_cache \
                      (client_id,transport,connected_at_unix,last_activity_at_unix,\
                       keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
                       subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-                    None,
-                    &args,
-                ) {
-                    pgrx::log!(
-                        "pgmqtt metrics: failed to cache connection '{}': {}",
-                        row.client_id,
-                        e
-                    );
+                     VALUES {}",
+                    values_clauses.join(",")
+                );
+                if let Err(e) = spi.update(&query, None, &args) {
+                    pgrx::log!("pgmqtt metrics: failed to cache connections batch: {}", e);
                 }
             }
             Ok::<_, pgrx::spi::Error>(())
