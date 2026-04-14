@@ -1,18 +1,1 @@
-pg_pgmqtt:
-  query: |
-    SELECT metric_name,
-           value::float8 AS metric_value,
-           description
-    FROM pgmqtt_metrics()
-  master: true
-  cache_seconds: 0
-  metrics:
-    - metric_name:
-        usage: "LABEL"
-        description: "pgmqtt metric name"
-    - metric_value:
-        usage: "GAUGE"
-        description: "Current value of the pgmqtt metric"
-    - description:
-        usage: "LABEL"
-        description: "Human-readable description of the metric"
+../../../docker/postgres_exporter/queries.yaml

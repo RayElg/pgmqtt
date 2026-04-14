@@ -1556,6 +1556,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                             std::ptr::null_mut(),
                                         );
                                     }
+                                    // Track whether catch_others already rolled back
+                                    // the subtransaction (PG longjmp error path).
+                                    let pg_error_caught = std::sync::atomic::AtomicBool::new(false);
                                     let result = PgTryBuilder::new(|| {
                                         pgrx::spi::Spi::connect_mut(|client| {
                                             let msg_id = db_action::persist_message(
@@ -1572,6 +1575,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                         unsafe {
                                             pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
                                         }
+                                        pg_error_caught.store(true, std::sync::atomic::Ordering::Relaxed);
                                         Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
                                     })
                                     .execute();
@@ -1579,7 +1583,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                         unsafe {
                                             pgrx::pg_sys::ReleaseCurrentSubTransaction();
                                         }
-                                    } else {
+                                    } else if !pg_error_caught.load(std::sync::atomic::Ordering::Relaxed) {
+                                        // Rust-level Err (SPI error without longjmp) —
+                                        // subtransaction is still open.
                                         unsafe {
                                             pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
                                         }
