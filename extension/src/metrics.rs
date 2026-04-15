@@ -1,83 +1,62 @@
-//! In-broker metrics store: atomic counters maintained by the background worker.
+//! Atomic metric counters for the background worker.
 //!
-//! These counters live in the background worker process and cannot be read
-//! directly from SQL functions (which run in separate user backend processes).
-//! The background worker periodically flushes a `MetricsSnapshot` to the
-//! `pgmqtt_metrics_current` and `pgmqtt_metrics_snapshots` tables, which
-//! `pgmqtt_metrics()` and related SQL functions then query.
+//! The BGW periodically flushes snapshots to `pgmqtt_metrics_current` /
+//! `pgmqtt_metrics_snapshots`, which SQL accessor functions query.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// All broker-level metric counters, held as lock-free atomics.
-///
-/// The background worker is single-threaded, so all writes use `Relaxed`
-/// ordering — there is no concurrent writer to synchronize with.
+/// Broker-level metric counters (lock-free atomics, `Relaxed` ordering).
 pub struct BrokerMetrics {
-    // --- Connections ---
-    /// Cumulative MQTT clients accepted (CONNACK success sent).
+    // Connections
     pub connections_accepted: AtomicU64,
-    /// Cumulative connection attempts rejected (auth failure, license limit).
     pub connections_rejected: AtomicU64,
-    /// Gauge: currently connected clients.
-    pub connections_current: AtomicU64,
-    /// Cumulative clients that sent a normal DISCONNECT packet.
+    pub connections_current: AtomicU64,  // gauge
     pub disconnections_clean: AtomicU64,
-    /// Cumulative clients disconnected unexpectedly (keepalive, error, shutdown).
     pub disconnections_unclean: AtomicU64,
-    /// Cumulative Will messages fired.
     pub wills_fired: AtomicU64,
 
-    // --- Sessions ---
-    /// Cumulative brand-new sessions created (no prior state).
+    // Sessions
     pub sessions_created: AtomicU64,
-    /// Cumulative sessions resumed from persistent state.
     pub sessions_resumed: AtomicU64,
-    /// Cumulative sessions reaped by the expiry sweeper.
     pub sessions_expired: AtomicU64,
 
-    // --- Messages received from MQTT clients ---
-    /// Cumulative PUBLISH packets received from clients.
+    // Messages received
     pub msgs_received: AtomicU64,
     pub msgs_received_qos0: AtomicU64,
     pub msgs_received_qos1: AtomicU64,
-    /// Cumulative bytes received in PUBLISH payloads.
     pub bytes_received: AtomicU64,
 
-    // --- Messages sent to MQTT clients ---
-    /// Cumulative PUBLISH packets sent to subscribing clients.
+    // Messages sent
     pub msgs_sent: AtomicU64,
-    /// Cumulative bytes sent in PUBLISH payloads.
     pub bytes_sent: AtomicU64,
-    /// Cumulative messages dropped (queue-full disconnect, auth drop).
     pub msgs_dropped: AtomicU64,
 
-    // --- QoS handshakes ---
+    // QoS handshakes
     pub pubacks_sent: AtomicU64,
     pub pubacks_received: AtomicU64,
 
-    // --- Subscriptions ---
+    // Subscriptions
     pub subscribe_ops: AtomicU64,
     pub unsubscribe_ops: AtomicU64,
 
-    // --- CDC / outbound pipeline ---
+    // CDC / outbound pipeline
     pub cdc_events_processed: AtomicU64,
     pub cdc_msgs_published: AtomicU64,
     pub cdc_errors: AtomicU64,
-    /// Most-recent CDC lag measurement in milliseconds (not cumulative).
-    pub cdc_lag_ms_last: AtomicI64,
+    pub cdc_lag_ms_last: AtomicI64, // gauge, milliseconds
 
-    // --- Inbound pipeline (MQTT → DB table writes) ---
+    // Inbound pipeline (MQTT -> DB)
     pub inbound_writes_ok: AtomicU64,
     pub inbound_writes_failed: AtomicU64,
     pub inbound_retries: AtomicU64,
     pub inbound_dead_letters: AtomicU64,
 
-    // --- DB batch operations ---
+    // DB batch operations
     pub db_batches_committed: AtomicU64,
     pub db_errors: AtomicU64,
 
-    // --- Lifecycle timestamps (unix seconds) ---
+    // Lifecycle timestamps (unix seconds)
     pub started_at_unix: AtomicU64,
     pub last_reset_at_unix: AtomicU64,
 }
@@ -124,18 +103,15 @@ impl BrokerMetrics {
 
 static METRICS: OnceLock<BrokerMetrics> = OnceLock::new();
 
-/// Return the global broker metrics store (lazily initialized).
 pub fn get() -> &'static BrokerMetrics {
     METRICS.get_or_init(BrokerMetrics::new)
 }
 
-/// Increment a counter by 1 using `Relaxed` ordering.
 #[inline(always)]
 pub fn inc(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Add `n` to a counter using `Relaxed` ordering.
 #[inline(always)]
 pub fn add(counter: &AtomicU64, n: u64) {
     if n > 0 {
@@ -143,7 +119,6 @@ pub fn add(counter: &AtomicU64, n: u64) {
     }
 }
 
-/// Decrement a counter by 1, saturating at 0.
 #[inline(always)]
 pub fn dec(counter: &AtomicU64) {
     counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -151,14 +126,6 @@ pub fn dec(counter: &AtomicU64) {
     }).ok();
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot
-// ---------------------------------------------------------------------------
-
-/// A plain-data point-in-time snapshot of all broker metrics.
-///
-/// Captured by the background worker and written to `pgmqtt_metrics_current`
-/// and `pgmqtt_metrics_snapshots`.
 #[derive(Default)]
 pub struct MetricsSnapshot {
     pub captured_at_unix:        i64,
@@ -197,9 +164,6 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
-    /// Capture the current values of all atomics. Uses `Relaxed` ordering
-    /// throughout — no cross-counter consistency guarantees, but that is
-    /// acceptable for monitoring data.
     pub fn capture() -> Self {
         let m = get();
         Self {
@@ -239,12 +203,8 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Serialize snapshot to a compact JSON string for hook/NOTIFY payloads.
-    ///
-    /// INVARIANT: every field in `MetricsSnapshot` is i64, so the format!()
-    /// below produces valid JSON without escaping.  The `test_to_json_roundtrip`
-    /// test enforces this — if a non-numeric field is ever added, the test will
-    /// fail until this function is updated to handle it.
+    /// Compact JSON for hook/NOTIFY payloads. All fields are i64 so no escaping needed.
+    /// `test_to_json_roundtrip` enforces this invariant.
     pub fn to_json(&self) -> String {
         format!(
             concat!(
@@ -296,7 +256,6 @@ impl MetricsSnapshot {
         )
     }
 
-    /// Format all metrics in Prometheus text exposition format.
     pub fn to_prometheus(&self) -> String {
         let mut out = String::with_capacity(4096);
         let lines: &[(&str, &str, i64, &str)] = &[
@@ -353,8 +312,6 @@ impl MetricsSnapshot {
         out
     }
 
-    /// Number of metric fields (excluding the three timestamp fields).
-    /// Used by tests to verify to_json() completeness.
     pub const FIELD_COUNT: usize = 33;
 }
 
@@ -363,8 +320,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Verify that `to_json()` produces valid JSON with exactly the expected
-    /// number of fields, and that every value round-trips as a JSON number.
     #[test]
     fn test_to_json_roundtrip() {
         let snap = MetricsSnapshot {
@@ -405,16 +360,13 @@ mod tests {
 
         let json_str = snap.to_json();
 
-        // Must be valid JSON.
         let parsed: HashMap<String, serde_json::Value> =
             serde_json::from_str(&json_str).expect("to_json() produced invalid JSON");
 
-        // Every value must be a number.
         for (key, val) in &parsed {
             assert!(val.is_number(), "Field '{key}' is not a number: {val}");
         }
 
-        // Field count must match the struct.
         assert_eq!(
             parsed.len(),
             MetricsSnapshot::FIELD_COUNT,
@@ -422,7 +374,6 @@ mod tests {
              without updating to_json()?"
         );
 
-        // Spot-check a few values.
         assert_eq!(parsed["connections_accepted"], 42);
         assert_eq!(parsed["cdc_lag_ms_last"], 15);
         assert_eq!(parsed["captured_at_unix"], 1700000000_i64);
