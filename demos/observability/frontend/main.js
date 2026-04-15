@@ -236,7 +236,9 @@ async function fetchHookLog() {
         const newMax = rows[0]?.id ?? 0;
         tbody.innerHTML = rows.map(r => {
             const p    = r.payload || {};
-            const errs = (p.db_errors||0) + (p.cdc_errors||0) + (p.connections_rejected||0);
+            const errs = (p.db_session_errors||0) + (p.db_message_errors||0) + (p.db_subscription_errors||0)
+                       + (p.cdc_render_errors||0) + (p.cdc_slot_errors||0) + (p.cdc_persist_errors||0)
+                       + (p.connections_rejected||0);
             const isNew = r.id > _maxHookId;
             return `
             <tr class="hook-row${r.is_alert ? ' alert' : ''}${isNew ? ' row-new' : ''}">

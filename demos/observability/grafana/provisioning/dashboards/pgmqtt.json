@@ -172,8 +172,8 @@
         },
         {
           "datasource": { "uid": "prometheus" },
-          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"msgs_dropped\"}[$__rate_interval])",
-          "legendFormat": "dropped/s"
+          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"msgs_dropped_queue_full\"}[$__rate_interval])",
+          "legendFormat": "dropped (queue full)/s"
         }
       ]
     },
@@ -228,12 +228,12 @@
         },
         {
           "datasource": { "uid": "prometheus" },
-          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"db_errors\"}[$__rate_interval])",
+          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"db_session_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"db_message_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"db_subscription_errors\"}[$__rate_interval])",
           "legendFormat": "DB errors/s"
         },
         {
           "datasource": { "uid": "prometheus" },
-          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"cdc_errors\"}[$__rate_interval])",
+          "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"cdc_render_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"cdc_slot_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"cdc_persist_errors\"}[$__rate_interval])",
           "legendFormat": "CDC errors/s"
         }
       ]

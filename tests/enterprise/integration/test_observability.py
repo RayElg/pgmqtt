@@ -245,12 +245,19 @@ def test_alert_hook_pattern_captures_snapshots():
     baseline_rows = run_sql(
         "SELECT metric_name, value::bigint "
         "FROM pgmqtt_metrics() "
-        "WHERE metric_name IN ('connections_rejected', 'db_errors', 'cdc_errors')"
+        "WHERE metric_name IN ("
+        "  'connections_rejected',"
+        "  'db_session_errors','db_message_errors','db_subscription_errors',"
+        "  'cdc_render_errors','cdc_slot_errors','cdc_persist_errors')"
     )
     baseline = {r[0]: int(r[1]) for r in baseline_rows}
     base_rejected = baseline.get("connections_rejected", 0)
-    base_db_err = baseline.get("db_errors", 0)
-    base_cdc_err = baseline.get("cdc_errors", 0)
+    base_db_sess = baseline.get("db_session_errors", 0)
+    base_db_msg = baseline.get("db_message_errors", 0)
+    base_db_sub = baseline.get("db_subscription_errors", 0)
+    base_cdc_render = baseline.get("cdc_render_errors", 0)
+    base_cdc_slot = baseline.get("cdc_slot_errors", 0)
+    base_cdc_persist = baseline.get("cdc_persist_errors", 0)
 
     run_sql(
         "CREATE TABLE IF NOT EXISTS _obs_hook_log ("
@@ -269,8 +276,12 @@ def test_alert_hook_pattern_captures_snapshots():
         "BEGIN "
         "  INSERT INTO _obs_hook_log (is_alert, payload) VALUES ( "
         f"    COALESCE((snap->>'connections_rejected')::bigint, 0) > {base_rejected} OR "
-        f"    COALESCE((snap->>'db_errors')::bigint, 0) > {base_db_err} OR "
-        f"    COALESCE((snap->>'cdc_errors')::bigint, 0) > {base_cdc_err}, "
+        f"    COALESCE((snap->>'db_session_errors')::bigint, 0) > {base_db_sess} OR "
+        f"    COALESCE((snap->>'db_message_errors')::bigint, 0) > {base_db_msg} OR "
+        f"    COALESCE((snap->>'db_subscription_errors')::bigint, 0) > {base_db_sub} OR "
+        f"    COALESCE((snap->>'cdc_render_errors')::bigint, 0) > {base_cdc_render} OR "
+        f"    COALESCE((snap->>'cdc_slot_errors')::bigint, 0) > {base_cdc_slot} OR "
+        f"    COALESCE((snap->>'cdc_persist_errors')::bigint, 0) > {base_cdc_persist}, "
         "    snap "
         "  ); "
         "END; $$"
@@ -334,8 +345,12 @@ def test_alert_hook_fires_on_rejected_connection():
         "BEGIN "
         "  INSERT INTO _obs_hook_log (is_alert, payload) VALUES ( "
         "    COALESCE((snap->>'connections_rejected')::bigint, 0) > 0 OR "
-        "    COALESCE((snap->>'db_errors')::bigint, 0) > 0 OR "
-        "    COALESCE((snap->>'cdc_errors')::bigint, 0) > 0, "
+        "    COALESCE((snap->>'db_session_errors')::bigint, 0) > 0 OR "
+        "    COALESCE((snap->>'db_message_errors')::bigint, 0) > 0 OR "
+        "    COALESCE((snap->>'db_subscription_errors')::bigint, 0) > 0 OR "
+        "    COALESCE((snap->>'cdc_render_errors')::bigint, 0) > 0 OR "
+        "    COALESCE((snap->>'cdc_slot_errors')::bigint, 0) > 0 OR "
+        "    COALESCE((snap->>'cdc_persist_errors')::bigint, 0) > 0, "
         "    snap "
         "  ); "
         "END; $$"
@@ -388,11 +403,15 @@ _EXPECTED_SNAPSHOT_KEYS = frozenset({
     "connections_current",
     "msgs_received",
     "msgs_sent",
-    "msgs_dropped",
+    "msgs_dropped_queue_full",
     "db_batches_committed",
-    "db_errors",
+    "db_session_errors",
+    "db_message_errors",
+    "db_subscription_errors",
     "cdc_events_processed",
-    "cdc_errors",
+    "cdc_render_errors",
+    "cdc_slot_errors",
+    "cdc_persist_errors",
 })
 
 
@@ -521,8 +540,8 @@ def test_cdc_pipeline_increments_metrics():
 
     Sets up a QoS 0 outbound mapping (fire-and-forget, no pgmqtt_messages
     write), connects a subscriber, INSERTs a row, and asserts both CDC
-    counters increase.  Also verifies cdc_errors and cdc_lag_ms_last are
-    present as observable metric names.
+    counters increase.  Also verifies the CDC error counters and cdc_lag_ms_last
+    are present as observable metric names.
     """
     TABLE = "_obs_cdc_happy"
     TOPIC = "obs/cdc/happy"
@@ -562,10 +581,12 @@ def test_cdc_pipeline_increments_metrics():
             f"before={before_published}, after={after_published}"
         )
 
-        # Verify cdc_errors and cdc_lag_ms_last are accessible metric names
+        # Verify split CDC error counters and lag are accessible metric names
         # (value may be 0 in a healthy run, but the key must be present).
         names = {r[0] for r in run_sql("SELECT metric_name FROM pgmqtt_metrics()")}
-        assert "cdc_errors" in names, "cdc_errors should be a named metric"
+        assert "cdc_render_errors" in names, "cdc_render_errors should be a named metric"
+        assert "cdc_slot_errors" in names, "cdc_slot_errors should be a named metric"
+        assert "cdc_persist_errors" in names, "cdc_persist_errors should be a named metric"
         assert "cdc_lag_ms_last" in names, "cdc_lag_ms_last should be a named metric"
     finally:
         run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{TABLE}', 'default')")
@@ -575,12 +596,12 @@ def test_cdc_pipeline_increments_metrics():
 
 
 def test_cdc_error_increments_counter():
-    """A CDC persist failure increments cdc_errors without crashing the broker.
+    """A CDC persist failure increments cdc_persist_errors without crashing the broker.
 
     Attaches a BEFORE INSERT trigger on pgmqtt_messages that raises an exception,
     then fires a QoS 1 CDC event.  The savepoint wrapper in the broker catches the
     PostgreSQL exception, rolls back the persist subtransaction, and increments
-    cdc_errors.  The background worker must survive — verified by a subsequent
+    cdc_persist_errors.  The background worker must survive — verified by a subsequent
     successful connection.
     """
     TABLE = "_obs_cdc_err"
@@ -611,14 +632,14 @@ def test_cdc_error_increments_counter():
         _mqtt_subscribe(sub, TOPIC)
 
         _wait_for_flush()
-        before = _get_metric("cdc_errors") or 0
+        before = _get_metric("cdc_persist_errors") or 0
 
         run_sql(f"INSERT INTO {TABLE} (v) VALUES ('trigger_me')")
         time.sleep(FLUSH_WAIT)
 
-        after = _get_metric("cdc_errors") or 0
+        after = _get_metric("cdc_persist_errors") or 0
         assert after > before, (
-            f"cdc_errors should have incremented after a persist failure; "
+            f"cdc_persist_errors should have incremented after a persist failure; "
             f"before={before}, after={after}"
         )
 

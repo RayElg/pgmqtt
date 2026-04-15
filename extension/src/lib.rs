@@ -761,12 +761,13 @@ fn pgmqtt_metrics() -> TableIterator<
                     disconnections_clean, disconnections_unclean, wills_fired,
                     sessions_created, sessions_resumed, sessions_expired,
                     msgs_received, msgs_received_qos0, msgs_received_qos1, bytes_received,
-                    msgs_sent, bytes_sent, msgs_dropped,
+                    msgs_sent, bytes_sent, msgs_dropped_queue_full,
                     pubacks_sent, pubacks_received,
                     subscribe_ops, unsubscribe_ops,
-                    cdc_events_processed, cdc_msgs_published, cdc_errors, cdc_lag_ms_last,
+                    cdc_events_processed, cdc_msgs_published,
+                    cdc_render_errors, cdc_slot_errors, cdc_persist_errors, cdc_lag_ms_last,
                     inbound_writes_ok, inbound_writes_failed, inbound_retries, inbound_dead_letters,
-                    db_batches_committed, db_errors
+                    db_batches_committed, db_session_errors, db_message_errors, db_subscription_errors
              FROM pgmqtt_metrics_current
              LIMIT 1",
             None,
@@ -801,21 +802,25 @@ fn pgmqtt_metrics() -> TableIterator<
                 m!("bytes_received",         "bytes",        "Bytes received in PUBLISH payloads");
                 m!("msgs_sent",              "total",        "PUBLISH packets delivered to subscribers");
                 m!("bytes_sent",             "bytes",        "Bytes sent in PUBLISH payloads");
-                m!("msgs_dropped",           "total",        "Messages dropped (queue full or auth)");
+                m!("msgs_dropped_queue_full", "total",       "Messages dropped due to full client queue");
                 m!("pubacks_sent",           "total",        "PUBACK packets sent");
                 m!("pubacks_received",       "total",        "PUBACK packets received from clients");
                 m!("subscribe_ops",          "total",        "SUBSCRIBE operations");
                 m!("unsubscribe_ops",        "total",        "UNSUBSCRIBE operations");
                 m!("cdc_events_processed",   "total",        "WAL events decoded from CDC slot");
                 m!("cdc_msgs_published",     "total",        "Messages emitted from CDC pipeline");
-                m!("cdc_errors",             "total",        "CDC pipeline errors");
+                m!("cdc_render_errors",      "total",        "CDC template render errors");
+                m!("cdc_slot_errors",        "total",        "CDC replication slot errors");
+                m!("cdc_persist_errors",     "total",        "CDC message persist errors");
                 m!("cdc_lag_ms_last",        "milliseconds", "Most recent CDC replication lag");
                 m!("inbound_writes_ok",      "total",        "Successful inbound MQTT-to-DB writes");
                 m!("inbound_writes_failed",  "total",        "Failed inbound MQTT-to-DB writes");
                 m!("inbound_retries",        "total",        "Inbound write retries");
                 m!("inbound_dead_letters",   "total",        "Messages moved to dead-letter table");
                 m!("db_batches_committed",   "total",        "DB session action batches committed");
-                m!("db_errors",              "total",        "DB batch errors");
+                m!("db_session_errors",      "total",        "DB session operation errors");
+                m!("db_message_errors",      "total",        "DB message operation errors");
+                m!("db_subscription_errors", "total",        "DB subscription operation errors");
             }
         }
         Ok::<_, spi::Error>(out)
@@ -954,13 +959,15 @@ fn pgmqtt_prometheus_metrics() -> String {
                 g!(disconnections_clean); g!(disconnections_unclean); g!(wills_fired);
                 g!(sessions_created); g!(sessions_resumed); g!(sessions_expired);
                 g!(msgs_received); g!(msgs_received_qos0); g!(msgs_received_qos1);
-                g!(bytes_received); g!(msgs_sent); g!(bytes_sent); g!(msgs_dropped);
+                g!(bytes_received); g!(msgs_sent); g!(bytes_sent); g!(msgs_dropped_queue_full);
                 g!(pubacks_sent); g!(pubacks_received);
                 g!(subscribe_ops); g!(unsubscribe_ops);
-                g!(cdc_events_processed); g!(cdc_msgs_published); g!(cdc_errors);
+                g!(cdc_events_processed); g!(cdc_msgs_published);
+                g!(cdc_render_errors); g!(cdc_slot_errors); g!(cdc_persist_errors);
                 g!(cdc_lag_ms_last);
                 g!(inbound_writes_ok); g!(inbound_writes_failed); g!(inbound_retries);
-                g!(inbound_dead_letters); g!(db_batches_committed); g!(db_errors);
+                g!(inbound_dead_letters); g!(db_batches_committed);
+                g!(db_session_errors); g!(db_message_errors); g!(db_subscription_errors);
             }
         }
         Ok::<_, spi::Error>(s)

@@ -22,8 +22,12 @@ BEGIN
     INSERT INTO pgmqtt_hook_log (is_alert, payload)
     VALUES (
         COALESCE((snap->>'connections_rejected')::bigint, 0) > 0 OR
-        COALESCE((snap->>'db_errors')::bigint, 0)           > 0 OR
-        COALESCE((snap->>'cdc_errors')::bigint, 0)          > 0,
+        COALESCE((snap->>'db_session_errors')::bigint, 0)      > 0 OR
+        COALESCE((snap->>'db_message_errors')::bigint, 0)      > 0 OR
+        COALESCE((snap->>'db_subscription_errors')::bigint, 0) > 0 OR
+        COALESCE((snap->>'cdc_render_errors')::bigint, 0)      > 0 OR
+        COALESCE((snap->>'cdc_slot_errors')::bigint, 0)        > 0 OR
+        COALESCE((snap->>'cdc_persist_errors')::bigint, 0)     > 0,
         snap
     );
 END;
