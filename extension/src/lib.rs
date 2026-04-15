@@ -1015,15 +1015,10 @@ fn pgmqtt_enable_timescaledb() -> String {
     let result = Spi::connect_mut(|client| {
         // TimescaleDB requires every unique index to include the partition column.
         // The default table has PRIMARY KEY (id); we need PRIMARY KEY (id, snapshot_at).
-        // Drop the old constraint (idempotent via IF EXISTS) then add the composite one.
-        let _ = client.update(
-            "ALTER TABLE pgmqtt_metrics_snapshots \
-             DROP CONSTRAINT IF EXISTS pgmqtt_metrics_snapshots_pkey",
-            None,
-            &[],
-        );
-        // Add composite PK only if one doesn't already exist with snapshot_at
-        let pk_ok = client
+        //
+        // Check whether the composite PK already exists before touching anything,
+        // so we never leave the table without a primary key on failure.
+        let pk_includes_snapshot_at = client
             .select(
                 "SELECT 1 FROM pg_constraint c \
                  JOIN pg_attribute a ON a.attrelid = c.conrelid \
@@ -1035,12 +1030,19 @@ fn pgmqtt_enable_timescaledb() -> String {
             )
             .map(|mut t| t.next().is_some())
             .unwrap_or(false);
-        if !pk_ok {
-            let _ = client.update(
+        if !pk_includes_snapshot_at {
+            // Swap PK atomically: drop old, add new within the same transaction.
+            client.update(
+                "ALTER TABLE pgmqtt_metrics_snapshots \
+                 DROP CONSTRAINT IF EXISTS pgmqtt_metrics_snapshots_pkey",
+                None,
+                &[],
+            )?;
+            client.update(
                 "ALTER TABLE pgmqtt_metrics_snapshots ADD PRIMARY KEY (id, snapshot_at)",
                 None,
                 &[],
-            );
+            )?;
         }
         // Create the hypertable partitioned on snapshot_at (Unix seconds, bigint).
         // chunk_time_interval = 86400 → one chunk per day.

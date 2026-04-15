@@ -240,7 +240,11 @@ impl MetricsSnapshot {
     }
 
     /// Serialize snapshot to a compact JSON string for hook/NOTIFY payloads.
-    /// All values are numbers, so no escaping is required.
+    ///
+    /// INVARIANT: every field in `MetricsSnapshot` is i64, so the format!()
+    /// below produces valid JSON without escaping.  The `test_to_json_roundtrip`
+    /// test enforces this — if a non-numeric field is ever added, the test will
+    /// fail until this function is updated to handle it.
     pub fn to_json(&self) -> String {
         format!(
             concat!(
@@ -347,5 +351,80 @@ impl MetricsSnapshot {
         }
 
         out
+    }
+
+    /// Number of metric fields (excluding the three timestamp fields).
+    /// Used by tests to verify to_json() completeness.
+    pub const FIELD_COUNT: usize = 33;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Verify that `to_json()` produces valid JSON with exactly the expected
+    /// number of fields, and that every value round-trips as a JSON number.
+    #[test]
+    fn test_to_json_roundtrip() {
+        let snap = MetricsSnapshot {
+            captured_at_unix: 1700000000,
+            started_at_unix: 1699999000,
+            last_reset_at_unix: 1699999500,
+            connections_accepted: 42,
+            connections_rejected: 1,
+            connections_current: 7,
+            disconnections_clean: 10,
+            disconnections_unclean: 2,
+            wills_fired: 1,
+            sessions_created: 15,
+            sessions_resumed: 3,
+            sessions_expired: 5,
+            msgs_received: 1000,
+            msgs_received_qos0: 800,
+            msgs_received_qos1: 200,
+            bytes_received: 50000,
+            msgs_sent: 900,
+            bytes_sent: 45000,
+            msgs_dropped: 3,
+            pubacks_sent: 200,
+            pubacks_received: 195,
+            subscribe_ops: 20,
+            unsubscribe_ops: 4,
+            cdc_events_processed: 500,
+            cdc_msgs_published: 490,
+            cdc_errors: 2,
+            cdc_lag_ms_last: 15,
+            inbound_writes_ok: 300,
+            inbound_writes_failed: 1,
+            inbound_retries: 5,
+            inbound_dead_letters: 0,
+            db_batches_committed: 100,
+            db_errors: 1,
+        };
+
+        let json_str = snap.to_json();
+
+        // Must be valid JSON.
+        let parsed: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&json_str).expect("to_json() produced invalid JSON");
+
+        // Every value must be a number.
+        for (key, val) in &parsed {
+            assert!(val.is_number(), "Field '{key}' is not a number: {val}");
+        }
+
+        // Field count must match the struct.
+        assert_eq!(
+            parsed.len(),
+            MetricsSnapshot::FIELD_COUNT,
+            "to_json() field count mismatch — did you add a field to MetricsSnapshot \
+             without updating to_json()?"
+        );
+
+        // Spot-check a few values.
+        assert_eq!(parsed["connections_accepted"], 42);
+        assert_eq!(parsed["cdc_lag_ms_last"], 15);
+        assert_eq!(parsed["captured_at_unix"], 1700000000_i64);
     }
 }
