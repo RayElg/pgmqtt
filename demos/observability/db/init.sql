@@ -2,7 +2,6 @@
 -- Sets up the hook function, alert log, and PostgREST access for all four
 -- observability scenarios: SQL polling, NOTIFY stream, hook function, Grafana.
 
-CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 CREATE EXTENSION IF NOT EXISTS pgmqtt;
 
 -- ─── Scenario 3: Hook function ────────────────────────────────────────────────

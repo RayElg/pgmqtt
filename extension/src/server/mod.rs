@@ -3597,6 +3597,8 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
           db_message_errors=EXCLUDED.db_message_errors,\
           db_subscription_errors=EXCLUDED.db_subscription_errors";
 
+    // $1 = captured_at_unix — same value as UPSERT_SQL's captured_at column,
+    // but pgmqtt_metrics_snapshots calls this column snapshot_at.
     static INSERT_SNAP_SQL: &str = "\
         INSERT INTO pgmqtt_metrics_snapshots \
          (snapshot_at,started_at,last_reset_at,\
@@ -3705,6 +3707,7 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
         will_set: bool,
     }
 
+    let sub_counts = subscriptions::subscription_counts();
     let rows: Vec<ConnRow> = clients
         .iter()
         .map(|(id, client)| {
@@ -3722,7 +3725,7 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                 msgs_sent: client.msgs_sent_count as i64,
                 bytes_received: client.bytes_received_count as i64,
                 bytes_sent: client.bytes_sent_count as i64,
-                subscriptions: subscriptions::subscription_count(id) as i32,
+                subscriptions: sub_counts.get(id.as_str()).copied().unwrap_or(0) as i32,
                 queue_depth: client.session.queue.len() as i32,
                 inflight_count: client.session.inflight.len() as i32,
                 will_set: client.will.is_some(),

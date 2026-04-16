@@ -83,8 +83,16 @@ def _wait_for_flush():
 
 def _get_metric(name: str):
     """Return the integer value of a single named counter from pgmqtt_metrics()."""
-    rows = run_sql(f"SELECT value FROM pgmqtt_metrics() WHERE metric_name = '{name}'")
-    return rows[0][0] if rows else None
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM pgmqtt_metrics() WHERE metric_name = %s", (name,)
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def _connect(client_id: str):

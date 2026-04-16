@@ -738,21 +738,6 @@ fn pgmqtt_metrics() -> TableIterator<
     }
 
     let rows = Spi::connect(|client| {
-        let table_exists = client
-            .select(
-                "SELECT to_regclass('pgmqtt_metrics_current')::text",
-                None,
-                &[],
-            )
-            .ok()
-            .and_then(|mut t| t.next())
-            .and_then(|r| r.get_by_name::<String, _>("to_regclass").ok().flatten())
-            .is_some();
-
-        if !table_exists {
-            return Ok::<Vec<(String, i64, String, String)>, spi::Error>(Vec::new());
-        }
-
         let mut out: Vec<(String, i64, String, String)> = Vec::new();
 
         if let Ok(mut rows) = client.select(
@@ -866,21 +851,6 @@ fn pgmqtt_connections() -> TableIterator<
 
     type Row = (String, String, i64, i64, i32, i64, i64, i64, i64, i32, i32, i32, bool, i64);
     let rows = Spi::connect(|client| {
-        let table_exists = client
-            .select(
-                "SELECT to_regclass('pgmqtt_connections_cache')::text",
-                None,
-                &[],
-            )
-            .ok()
-            .and_then(|mut t| t.next())
-            .and_then(|r| r.get_by_name::<String, _>("to_regclass").ok().flatten())
-            .is_some();
-
-        if !table_exists {
-            return Ok::<Vec<Row>, spi::Error>(Vec::new());
-        }
-
         let mut out: Vec<Row> = Vec::new();
         if let Ok(table) = client.select(
             "SELECT client_id, transport, connected_at_unix, last_activity_at_unix,

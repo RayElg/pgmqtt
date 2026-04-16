@@ -1,5 +1,4 @@
 services:
-  # Base pgmqtt image (no TimescaleDB) — built first, used as base for postgres.
   pgmqtt-base:
     build:
       context: ../../
@@ -7,10 +6,7 @@ services:
     image: pgmqtt-base
 
   postgres:
-    build:
-      context: ./db
-      args:
-        BASE_IMAGE: pgmqtt-base
+    image: pgmqtt-base
     depends_on:
       pgmqtt-base:
         condition: service_started
@@ -24,7 +20,7 @@ services:
     command:
       - "postgres"
       - "-c"
-      - "shared_preload_libraries=timescaledb,pgmqtt"
+      - "shared_preload_libraries=pgmqtt"
       - "-c"
       - "wal_level=logical"
       - "-c"
