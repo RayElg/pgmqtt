@@ -395,16 +395,6 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
     })
 }
 
-/// Return the number of active topic filters for a client.
-pub fn subscription_count(client_id: &str) -> usize {
-    with_state(|state| {
-        state.client_to_filters
-            .get(client_id)
-            .map(|f| f.len())
-            .unwrap_or(0)
-    })
-}
-
 /// Return subscription counts for all clients in a single lock acquisition.
 pub fn subscription_counts() -> std::collections::HashMap<String, usize> {
     with_state(|state| {

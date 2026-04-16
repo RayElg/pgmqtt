@@ -807,10 +807,7 @@ struct MqttClient {
     sub_claims: Vec<String>,
     /// JWT claim-based topic filters for publish authorization.
     pub_claims: Vec<String>,
-    // ── Per-client metrics (written into pgmqtt_connections_cache) ─────────
-    /// "mqtt" | "ws" | "mqtts" | "wss"
     transport_label: &'static str,
-    /// Unix timestamp (seconds) when this client connected.
     connected_at_unix: u64,
     msgs_received_count: u64,
     msgs_sent_count: u64,
@@ -859,6 +856,15 @@ impl MqttClient {
     #[inline]
     fn v5(&self) -> bool {
         mqtt::is_v5(self.protocol_version)
+    }
+
+    #[inline]
+    fn record_msg_sent(&mut self, payload_len: usize) {
+        let m = crate::metrics::get();
+        crate::metrics::inc(&m.msgs_sent);
+        crate::metrics::add(&m.bytes_sent, payload_len as u64);
+        self.msgs_sent_count += 1;
+        self.bytes_sent_count += payload_len as u64;
     }
 }
 
@@ -2147,7 +2153,6 @@ fn finish_connect(
             (false, MqttSession::new())
         }
     });
-    // Record session create/resume metric.
     {
         let m = crate::metrics::get();
         if session_present {
@@ -2183,7 +2188,6 @@ fn finish_connect(
         return;
     }
 
-    // Connection accepted — bump gauges/counters.
     {
         let m = crate::metrics::get();
         crate::metrics::inc(&m.connections_accepted);
@@ -3220,11 +3224,7 @@ fn deliver_messages(
                         if client.transport.write_all(&pkt).is_err() {
                             to_remove.push(sub_id.clone());
                         } else {
-                            let m = crate::metrics::get();
-                            crate::metrics::inc(&m.msgs_sent);
-                            crate::metrics::add(&m.bytes_sent, msg.payload.len() as u64);
-                            client.msgs_sent_count += 1;
-                            client.bytes_sent_count += msg.payload.len() as u64;
+                            client.record_msg_sent(msg.payload.len());
                         }
                     }
                 } else {
@@ -3240,11 +3240,7 @@ fn deliver_messages(
                     if client.transport.write_all(&pkt).is_err() {
                         to_remove.push(sub_id.clone());
                     } else {
-                        let m = crate::metrics::get();
-                        crate::metrics::inc(&m.msgs_sent);
-                        crate::metrics::add(&m.bytes_sent, msg.payload.len() as u64);
-                        client.msgs_sent_count += 1;
-                        client.bytes_sent_count += msg.payload.len() as u64;
+                        client.record_msg_sent(msg.payload.len());
                     }
                 }
             } else {
@@ -3504,7 +3500,7 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
     let json_payload = snap.to_json();
     let captured_at = snap.captured_at_unix;
 
-    // Build the parameterized argument list (33 i64 values).
+    // Build the parameterized argument list (37 i64 values).
     let snap_args: Vec<DatumWithOid> = vec![
         snap.captured_at_unix.into(),
         snap.started_at_unix.into(),
