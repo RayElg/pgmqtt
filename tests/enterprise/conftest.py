@@ -31,7 +31,7 @@ def _enterprise_available() -> tuple[bool, str]:
         set_guc("pgmqtt.license_key", token)
         rows = run_sql("SELECT status FROM pgmqtt_license_status()")
         status = rows[0][0] if rows else None
-        return status == "active", f"broker license status was '{status}' (expected 'active')"
+        return status in ("active", "grace"), f"broker license status was '{status}' (expected 'active' or 'grace')"
     except Exception as e:
         return False, f"probe failed: {e}"
     finally:

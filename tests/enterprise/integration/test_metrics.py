@@ -1,7 +1,7 @@
 """Integration tests for pgmqtt enterprise metrics (observability) feature.
 
 Covers:
-  - License gating (metrics feature required for all four SQL functions)
+  - License gating (metrics feature required for all SQL functions)
   - pgmqtt_metrics() counter content after broker activity
   - pgmqtt_connections() connection cache after connect / disconnect
   - pgmqtt_prometheus_metrics() output format and per-line validity
@@ -9,7 +9,6 @@ Covers:
   - Retention policy cleanup of old snapshot rows
   - Hook function callback on each flush
   - NOTIFY channel delivery on each flush
-  - pgmqtt_enable_timescaledb() informative message in all cases
 """
 
 import json
@@ -131,12 +130,6 @@ def test_prometheus_requires_license():
     with pytest.raises(psycopg2.Error, match="requires an enterprise license"):
         run_sql("SELECT pgmqtt_prometheus_metrics()")
 
-
-def test_enable_timescaledb_requires_license():
-    """pgmqtt_enable_timescaledb() raises an error in community mode."""
-    set_guc("pgmqtt.license_key", "")
-    with pytest.raises(psycopg2.Error, match="requires an enterprise license"):
-        run_sql("SELECT pgmqtt_enable_timescaledb()")
 
 
 # ── Metrics content ───────────────────────────────────────────────────────────
@@ -444,66 +437,10 @@ def test_metrics_gucs_registered():
     assert show("pgmqtt.metrics_snapshot_interval") == str(FLUSH_INTERVAL_SECS)
     assert show("pgmqtt.metrics_connections_cache_interval") == str(FLUSH_INTERVAL_SECS)
     # retention_days is untouched by the fixture
-    assert show("pgmqtt.metrics_retention_days") == "7"
+    assert show("pgmqtt.metrics_retention_days") == "3"
     # String GUCs default to empty
     assert show("pgmqtt.metrics_hook_function") == ""
     assert show("pgmqtt.metrics_notify_channel") == ""
-
-
-# ── TimescaleDB integration ───────────────────────────────────────────────────
-
-
-def test_enable_timescaledb_returns_descriptive_message():
-    """pgmqtt_enable_timescaledb() always returns a non-empty descriptive string.
-
-    When TimescaleDB is absent the function returns an informative message
-    rather than raising an error so callers can branch on the result.
-    """
-    rows = run_sql("SELECT pgmqtt_enable_timescaledb()")
-    assert rows, "pgmqtt_enable_timescaledb() returned no rows"
-    msg = rows[0][0]
-    assert isinstance(msg, str) and msg, "Expected a non-empty string result"
-    expected_prefixes = (
-        "pgmqtt_metrics_snapshots converted",
-        "timescaledb extension is not installed",
-        "timescaledb setup failed",
-    )
-    assert any(msg.startswith(p) for p in expected_prefixes), (
-        f"Unexpected pgmqtt_enable_timescaledb() message: {msg!r}"
-    )
-
-
-def _has_timescaledb() -> bool:
-    try:
-        rows = run_sql("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'")
-        return bool(rows)
-    except Exception:
-        return False
-
-# TODO - lets somehow handle this without the demo image
-@pytest.mark.skipif(
-    not _has_timescaledb(),
-    reason="TimescaleDB extension not installed — run against the observability "
-           "demo image (demos/observability) which bundles TimescaleDB",
-)
-def test_enable_timescaledb_converts_hypertable():
-    """With TimescaleDB installed, the function converts the snapshot table.
-
-    This test is expected to skip when running against the base dev image
-    (docker/Dockerfile), which does not include TimescaleDB.  To exercise it,
-    run the enterprise suite against the observability demo stack
-    (demos/observability/docker-compose.yml) where TimescaleDB is installed.
-    """
-    result = run_sql("SELECT pgmqtt_enable_timescaledb()")
-    assert result
-    assert "hypertable" in result[0][0].lower(), (
-        f"Expected hypertable success message, got: {result[0][0]!r}"
-    )
-    rows = run_sql(
-        "SELECT hypertable_name FROM timescaledb_information.hypertables "
-        "WHERE hypertable_name = 'pgmqtt_metrics_snapshots'"
-    )
-    assert rows, "pgmqtt_metrics_snapshots should be a TimescaleDB hypertable"
 
 
 # ── postgres_exporter integration ─────────────────────────────────────────────

@@ -259,3 +259,4 @@ async function fetchHookLog() {
 }
 fetchHookLog();
 setInterval(fetchHookLog, POLL_MS);
+

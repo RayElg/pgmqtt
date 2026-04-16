@@ -73,7 +73,7 @@ static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.
 static METRICS_SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60);
 /// Days to retain historical metric snapshots. 0 = keep forever.
-static METRICS_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);
+static METRICS_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(3);
 /// How often (seconds) to refresh pgmqtt_connections_cache. 0 = disabled.
 static METRICS_CONNECTIONS_CACHE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(10);
 /// Fully-qualified SQL function called after each snapshot flush: fn(jsonb) → void.
@@ -977,107 +977,14 @@ fn pgmqtt_prometheus_metrics() -> String {
     snap.to_prometheus()
 }
 
-/// Convert `pgmqtt_metrics_snapshots` to a TimescaleDB hypertable, enabling
-/// automatic partitioning and optional compression/retention policies.
-///
-/// Run once after enabling TimescaleDB:
-/// ```sql
-/// SELECT pgmqtt_enable_timescaledb();
-/// ```
-///
-/// Requires an enterprise license with the `metrics` feature and the
-/// `timescaledb` extension to be installed in the current database.
-#[pg_extern]
-fn pgmqtt_enable_timescaledb() -> String {
-    if !crate::license::has_feature(crate::license::Feature::Metrics) {
-        pgrx::error!(
-            "pgmqtt_enable_timescaledb() requires an enterprise license with the 'metrics' feature"
-        );
-    }
-
-    // Check that TimescaleDB is present.
-    let tsdb_present = Spi::connect(|client| {
-        let result = client
-            .select(
-                "SELECT COUNT(*)::int FROM pg_extension WHERE extname = 'timescaledb'",
-                None,
-                &[],
-            )?
-            .first()
-            .get_one::<i32>()?
-            .unwrap_or(0);
-        Ok::<bool, spi::Error>(result > 0)
-    })
-    .unwrap_or(false);
-
-    if !tsdb_present {
-        return "timescaledb extension is not installed in this database".to_string();
-    }
-
-    // pgmqtt_metrics_snapshots uses snapshot_at bigint (unix seconds).
-    // TimescaleDB needs a timestamp column; we add a computed column approach:
-    // wrap the table with a generated timestamptz column via a view, OR convert
-    // snapshot_at to a proper timestamptz. We'll use a thin wrapper view so the
-    // underlying table stays schema-stable.
-    let result = Spi::connect_mut(|client| {
-        // TimescaleDB requires every unique index to include the partition column.
-        // The default table has PRIMARY KEY (id); we need PRIMARY KEY (id, snapshot_at).
-        //
-        // Check whether the composite PK already exists before touching anything,
-        // so we never leave the table without a primary key on failure.
-        let pk_includes_snapshot_at = client
-            .select(
-                "SELECT 1 FROM pg_constraint c \
-                 JOIN pg_attribute a ON a.attrelid = c.conrelid \
-                   AND a.attnum = ANY(c.conkey) \
-                 WHERE c.conrelid = 'pgmqtt_metrics_snapshots'::regclass \
-                   AND c.contype = 'p' AND a.attname = 'snapshot_at'",
-                None,
-                &[],
-            )
-            .map(|mut t| t.next().is_some())
-            .unwrap_or(false);
-        if !pk_includes_snapshot_at {
-            // Swap PK atomically: drop old, add new within the same transaction.
-            client.update(
-                "ALTER TABLE pgmqtt_metrics_snapshots \
-                 DROP CONSTRAINT IF EXISTS pgmqtt_metrics_snapshots_pkey",
-                None,
-                &[],
-            )?;
-            client.update(
-                "ALTER TABLE pgmqtt_metrics_snapshots ADD PRIMARY KEY (id, snapshot_at)",
-                None,
-                &[],
-            )?;
-        }
-        // Create the hypertable partitioned on snapshot_at (Unix seconds, bigint).
-        // chunk_time_interval = 86400 → one chunk per day.
-        client.select(
-            "SELECT create_hypertable('pgmqtt_metrics_snapshots', 'snapshot_at', \
-                                      chunk_time_interval => 86400, \
-                                      if_not_exists => true, \
-                                      migrate_data => true)",
-            None,
-            &[],
-        ).map(|_| ())
-    });
-
-    match result {
-        Ok(()) => "pgmqtt_metrics_snapshots converted to TimescaleDB hypertable (chunk_time_interval = 86400 seconds)".to_string(),
-        Err(e) => format!("timescaledb setup failed: {}", e),
-    }
-}
-
 extension_sql!(
     r#"
     REVOKE EXECUTE ON FUNCTION pgmqtt_metrics() FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pgmqtt_connections() FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pgmqtt_prometheus_metrics() FROM PUBLIC;
-    REVOKE EXECUTE ON FUNCTION pgmqtt_enable_timescaledb() FROM PUBLIC;
     "#,
     name = "revoke_metrics_from_public",
-    requires = [pgmqtt_metrics, pgmqtt_connections, pgmqtt_prometheus_metrics, pgmqtt_enable_timescaledb],
+    requires = [pgmqtt_metrics, pgmqtt_connections, pgmqtt_prometheus_metrics],
 );
 
 // ---------------------------------------------------------------------------
@@ -1243,7 +1150,7 @@ pub unsafe extern "C" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"pgmqtt.metrics_retention_days",
-        c"Days to retain rows in pgmqtt_metrics_snapshots (0 = keep forever)",
+        c"Days to retain rows in pgmqtt_metrics_snapshots (0 = keep forever, default 3)",
         c"",
         &METRICS_RETENTION_DAYS,
         0, 3650,

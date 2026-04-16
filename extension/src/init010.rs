@@ -228,10 +228,9 @@ pub fn init_010() {
 
     // Historical time-series: one row per flush interval, queryable by time range.
     // All timestamps stored as Unix epoch seconds (bigint) for portability.
-    // Compatible with TimescaleDB via `SELECT pgmqtt_enable_timescaledb()`.
     run_sql_or_error(
         "CREATE TABLE IF NOT EXISTS pgmqtt_metrics_snapshots (
-            id                       bigserial PRIMARY KEY,
+            id                       bigserial,
             snapshot_at              bigint NOT NULL,
             started_at               bigint NOT NULL DEFAULT 0,
             last_reset_at            bigint NOT NULL DEFAULT 0,
@@ -269,11 +268,13 @@ pub fn init_010() {
             db_session_errors        bigint NOT NULL DEFAULT 0,
             db_message_errors        bigint NOT NULL DEFAULT 0,
             db_subscription_errors   bigint NOT NULL DEFAULT 0
-        )",
+        ) WITH (fillfactor=100)",
         "create metrics snapshots table",
     );
+    // BRIN is far smaller than B-tree for an append-only time-series table
+    // where snapshot_at increases monotonically with insertion order.
     let _ = Spi::run(
-        "CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_time ON pgmqtt_metrics_snapshots (snapshot_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_time ON pgmqtt_metrics_snapshots USING BRIN (snapshot_at)",
     );
 
     // Per-client connection detail: truncated and rewritten by the background
