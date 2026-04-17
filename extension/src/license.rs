@@ -24,6 +24,7 @@ const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
 pub enum Feature {
     Tls,
     Jwt,
+    Metrics,
 }
 
 impl Feature {
@@ -31,6 +32,7 @@ impl Feature {
         match self {
             Feature::Tls => "tls",
             Feature::Jwt => "jwt",
+            Feature::Metrics => "metrics",
         }
     }
 }
@@ -78,7 +80,7 @@ fn active_public_key() -> &'static [u8; 32] {
 }
 
 /// Known feature names for validation.
-const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "multi_node"];
+const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "multi_node"];
 
 fn validate_license_with_key(token: &str, pubkey_bytes: &[u8; 32]) -> LicenseStatus {
     let token = token.trim();

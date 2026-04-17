@@ -14,3 +14,19 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     # Mount a volume for persistence if we wanted, but not for now.
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+    volumes:
+      - ./docker/postgres_exporter/queries.yaml:/queries.yaml:ro
+    command:
+      - "--extend.query-path=/queries.yaml"
+      - "--disable-default-metrics"
+      - "--disable-settings-metrics"
+    ports:
+      - "${DOCKER_BIND_IP:-127.0.0.1}:9187:9187"
+    depends_on:
+      - postgres
+    restart: unless-stopped

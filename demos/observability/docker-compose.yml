@@ -1,0 +1,134 @@
+services:
+  pgmqtt-base:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    image: pgmqtt-base
+
+  postgres:
+    image: pgmqtt-base
+    depends_on:
+      pgmqtt-base:
+        condition: service_started
+    environment:
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10-obs.sql
+    ports:
+      - "5432:5432"
+      - "1883:1883"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pgmqtt"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "pgmqtt.license_key=${PGMQTT_LICENSE_KEY:-}"
+      - "-c"
+      - "pgmqtt.metrics_snapshot_interval=1"
+      - "-c"
+      - "pgmqtt.metrics_connections_cache_interval=1"
+      - "-c"
+      - "pgmqtt.metrics_notify_channel=pgmqtt_live"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  simulator:
+    build:
+      context: ./simulator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MQTT_HOST: postgres
+      MQTT_PORT: "1883"
+    restart: unless-stopped
+
+  # NOTE: This demo uses the postgres superuser as the anon role for simplicity.
+  # In production, create a dedicated read-only role with access only to the
+  # pgmqtt_metrics/connections functions and the hook_log table.
+  postgrest:
+    image: postgrest/postgrest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://postgres:password@postgres:5432/postgres
+      PGRST_DB_ANON_ROLE: postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_SERVER_CORS_ALLOWED_ORIGINS: "*"
+    ports:
+      - "3000:3000"
+
+  notify-bridge:
+    build:
+      context: ./notify-bridge
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: password
+      PGDATABASE: postgres
+      NOTIFY_CHANNEL: pgmqtt_live
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:password@postgres:5432/postgres?sslmode=disable"
+    volumes:
+      - ./postgres-exporter/queries.yaml:/queries.yaml:ro
+    command:
+      - "--extend.query-path=/queries.yaml"
+      - "--disable-default-metrics"
+      - "--disable-settings-metrics"
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    depends_on:
+      - postgres-exporter
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3002:3000"
+    depends_on:
+      - prometheus
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - postgrest
+      - notify-bridge
+      - grafana

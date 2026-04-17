@@ -395,6 +395,16 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
     })
 }
 
+/// Return subscription counts for all clients in a single lock acquisition.
+pub fn subscription_counts() -> std::collections::HashMap<String, usize> {
+    with_state(|state| {
+        state.client_to_filters
+            .iter()
+            .map(|(id, filters)| (id.clone(), filters.len()))
+            .collect()
+    })
+}
+
 /// Remove all subscriptions for a client (on disconnect).
 pub fn remove_client(client_id: &str) {
     with_state(|state| {

@@ -1,0 +1,2 @@
+ARG BASE_IMAGE=pgmqtt-base
+FROM ${BASE_IMAGE}

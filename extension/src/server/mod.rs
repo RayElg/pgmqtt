@@ -45,6 +45,43 @@ const MAX_QUEUE_SIZE: usize = 50_000;
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
+/// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
+/// savepoint is released; on `Err` (whether a Rust error or a PG longjmp
+/// caught by `catch_others`), the savepoint is rolled back and the error is
+/// returned.  Callers can retry or surface the error without aborting the
+/// enclosing `BackgroundWorker::transaction`.
+fn with_subtransaction<T>(
+    f: impl FnOnce() -> Result<T, pgrx::spi::Error> + std::panic::UnwindSafe,
+) -> Result<T, pgrx::spi::Error> {
+    use pgrx::pg_sys::pg_try::PgTryBuilder;
+    use pgrx::spi;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    unsafe {
+        pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null_mut());
+    }
+    // Track whether catch_others already rolled back (PG longjmp path) so we
+    // don't double-free the subtransaction on the Rust-Err path below.
+    let rolled_back_by_pg = AtomicBool::new(false);
+    let result = PgTryBuilder::new(f)
+        .catch_others(|_caught| {
+            unsafe {
+                pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            }
+            rolled_back_by_pg.store(true, Ordering::Relaxed);
+            // NoAttribute is used as a generic sentinel — callers only check
+            // is_ok()/is_err(), not the specific code.
+            Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
+        })
+        .execute();
+    if result.is_ok() {
+        unsafe { pgrx::pg_sys::ReleaseCurrentSubTransaction(); }
+    } else if !rolled_back_by_pg.load(Ordering::Relaxed) {
+        unsafe { pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction(); }
+    }
+    result
+}
+
 /// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
 ///
 /// After a crash, sessions keep `disconnected_at = NULL` because the broker never
@@ -522,9 +559,14 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     let ok_count = total - err_count;
     if ok_count > 0 {
         log!("pgmqtt inbound: committed {} writes", ok_count);
+        crate::metrics::add(&crate::metrics::get().inbound_writes_ok, ok_count as u64);
     }
     if err_count > 0 {
         log!("pgmqtt inbound: {} writes failed", err_count);
+        crate::metrics::add(
+            &crate::metrics::get().inbound_writes_failed,
+            err_count as u64,
+        );
     }
 }
 
@@ -639,6 +681,7 @@ fn process_inbound_pending() {
                         );
                     }
                     Err(e) => {
+                        crate::metrics::inc(&crate::metrics::get().inbound_writes_failed);
                         handle_inbound_failure(
                             pending.message_id,
                             &pending.mapping_name,
@@ -692,6 +735,7 @@ fn handle_inbound_failure(
             payload,
         );
     } else {
+        crate::metrics::inc(&crate::metrics::get().inbound_retries);
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
             retry_count + 1,
@@ -732,6 +776,7 @@ fn dead_letter_inbound(
     topic: &str,
     payload: &[u8],
 ) {
+    crate::metrics::inc(&crate::metrics::get().inbound_dead_letters);
     log!(
         "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
         message_id,
@@ -799,6 +844,14 @@ struct MqttClient {
     sub_claims: Vec<String>,
     /// JWT claim-based topic filters for publish authorization.
     pub_claims: Vec<String>,
+    transport_label: &'static str,
+    connected_at_unix: u64,
+    msgs_received_count: u64,
+    msgs_sent_count: u64,
+    bytes_received_count: u64,
+    bytes_sent_count: u64,
+    /// Set to true when the client sends a normal DISCONNECT; affects disconnect metrics.
+    clean_disconnect: bool,
     /// Inline session state — avoids global mutex lookup for connected clients.
     session: MqttSession,
 }
@@ -812,6 +865,7 @@ impl MqttClient {
         receive_maximum: u16,
         protocol_version: u8,
         session: MqttSession,
+        transport_label: &'static str,
     ) -> Self {
         Self {
             transport,
@@ -825,6 +879,13 @@ impl MqttClient {
             sub_claims: Vec::new(),
             pub_claims: Vec::new(),
             session,
+            transport_label,
+            connected_at_unix: crate::license::now_secs() as u64,
+            msgs_received_count: 0,
+            msgs_sent_count: 0,
+            bytes_received_count: 0,
+            bytes_sent_count: 0,
+            clean_disconnect: false,
         }
     }
 
@@ -832,6 +893,15 @@ impl MqttClient {
     #[inline]
     fn v5(&self) -> bool {
         mqtt::is_v5(self.protocol_version)
+    }
+
+    #[inline]
+    fn record_msg_sent(&mut self, payload_len: usize) {
+        let m = crate::metrics::get();
+        crate::metrics::inc(&m.msgs_sent);
+        crate::metrics::add(&m.bytes_sent, payload_len as u64);
+        self.msgs_sent_count += 1;
+        self.bytes_sent_count += payload_len as u64;
     }
 }
 
@@ -1077,6 +1147,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
     // Tick counter for throttling low-priority periodic work.
     let mut tick: u64 = 0;
+    // Enterprise metrics flush timers (only active when metrics feature is licensed).
+    let mut last_metrics_flush = std::time::Instant::now();
+    let mut last_connections_flush = std::time::Instant::now();
     while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
         tick = tick.wrapping_add(1);
 
@@ -1099,19 +1172,41 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         let mut publishes = Vec::new();
 
         if let Some(ref listener) = mqtt_listener {
-            accept_mqtt_connections(listener, &mut clients, &mut session_db_actions, &mut publishes);
+            accept_mqtt_connections(
+                listener,
+                &mut clients,
+                &mut session_db_actions,
+                &mut publishes,
+            );
         }
         if let Some(ref listener) = ws_listener {
-            accept_ws_connections(listener, &mut clients, &mut session_db_actions, &mut publishes);
+            accept_ws_connections(
+                listener,
+                &mut clients,
+                &mut session_db_actions,
+                &mut publishes,
+            );
         }
         if let Some(ref listener) = mqtts_listener {
             if let Some(ref cfg) = tls_config {
-                accept_mqtts_connections(listener, cfg, &mut clients, &mut session_db_actions, &mut publishes);
+                accept_mqtts_connections(
+                    listener,
+                    cfg,
+                    &mut clients,
+                    &mut session_db_actions,
+                    &mut publishes,
+                );
             }
         }
         if let Some(ref listener) = wss_listener {
             if let Some(ref cfg) = tls_config {
-                accept_wss_connections(listener, cfg, &mut clients, &mut session_db_actions, &mut publishes);
+                accept_wss_connections(
+                    listener,
+                    cfg,
+                    &mut clients,
+                    &mut session_db_actions,
+                    &mut publishes,
+                );
             }
         }
         poll_mqtt_clients(
@@ -1127,7 +1222,12 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // ── CDC: load mappings, advance slot, drain ring buffer ──
         let cdc_messages = cdc_tick(slot_name);
         if !cdc_messages.is_empty() {
-            deliver_messages(&cdc_messages, &mut clients, &mut publishes, &mut session_db_actions);
+            deliver_messages(
+                &cdc_messages,
+                &mut clients,
+                &mut publishes,
+                &mut session_db_actions,
+            );
         }
 
         // Periodically resend unacked QoS 1 messages
@@ -1143,6 +1243,23 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
         // Execute all collected session DB actions in one transaction
         execute_session_db_actions(session_db_actions);
+
+        // ── Enterprise metrics flush ──────────────────────────────────────────
+        if crate::license::has_feature(crate::license::Feature::Metrics) {
+            let snap_interval = crate::get_metrics_snapshot_interval_guc();
+            if snap_interval > 0 && last_metrics_flush.elapsed().as_secs() >= snap_interval as u64 {
+                let snap = crate::metrics::MetricsSnapshot::capture();
+                flush_metrics_snapshot(&snap);
+                last_metrics_flush = std::time::Instant::now();
+            }
+            let conn_interval = crate::get_metrics_connections_cache_interval_guc();
+            if conn_interval > 0
+                && last_connections_flush.elapsed().as_secs() >= conn_interval as u64
+            {
+                flush_connections_cache(&clients);
+                last_connections_flush = std::time::Instant::now();
+            }
+        }
     }
 
     // Graceful shutdown: send DISCONNECT to all clients, fire will messages,
@@ -1153,9 +1270,10 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
-        let _ = client
-            .transport
-            .write_all(&mqtt::build_disconnect(mqtt::reason::SERVER_SHUTTING_DOWN, client.v5()));
+        let _ = client.transport.write_all(&mqtt::build_disconnect(
+            mqtt::reason::SERVER_SHUTTING_DOWN,
+            client.v5(),
+        ));
 
         // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
         // The client did NOT send a normal DISCONNECT, so the will fires.
@@ -1371,10 +1489,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                         &[],
                     );
                     let mut n = 0usize;
-                    if let Ok(table) = client.select(&advance_query, None, &[]) {
-                        for _ in table {
-                            n += 1;
-                        }
+                    let table = client.select(&advance_query, None, &[])?;
+                    for _ in table {
+                        n += 1;
                     }
                     Ok::<usize, spi::Error>(n)
                 }) {
@@ -1382,10 +1499,15 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                         batch_count = n;
                         if n > 0 {
                             log!("pgmqtt: slot batch fetched {} raw logical messages", n);
+                            crate::metrics::add(
+                                &crate::metrics::get().cdc_events_processed,
+                                n as u64,
+                            );
                         }
                     }
                     Err(e) => {
                         log!("pgmqtt: error advancing slot: {:?} — skipping batch", e);
+                        crate::metrics::inc(&crate::metrics::get().cdc_slot_errors);
                         return (to_publish, batch_count, false);
                     }
                 }
@@ -1496,16 +1618,21 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
 
                                 if rendered.qos > 0 {
                                     // Persist within this transaction — committed atomically
-                                    // with the slot advance above.
-                                    let result = pgrx::spi::Spi::connect_mut(|client| {
-                                        let msg_id = db_action::persist_message(
-                                            client,
-                                            &topic_str,
-                                            &rendered.payload,
-                                            rendered.qos,
-                                            false,
-                                        )?;
-                                        Ok::<_, pgrx::spi::Error>(Some(msg_id))
+                                    // with the slot advance above.  The subtransaction ensures a
+                                    // PostgreSQL error inside persist_message is caught and counted
+                                    // without crashing the background worker; the outer batch still
+                                    // rolls back so events are retried on the next tick.
+                                    let result = with_subtransaction(|| {
+                                        pgrx::spi::Spi::connect_mut(|client| {
+                                            let msg_id = db_action::persist_message(
+                                                client,
+                                                &topic_str,
+                                                &rendered.payload,
+                                                rendered.qos,
+                                                false,
+                                            )?;
+                                            Ok::<_, spi::Error>(Some(msg_id))
+                                        })
                                     });
 
                                     match result {
@@ -1522,6 +1649,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                                 payload: rendered.payload,
                                                 qos: rendered.qos,
                                             });
+                                            crate::metrics::inc(
+                                                &crate::metrics::get().cdc_msgs_published,
+                                            );
                                         }
                                         Err(e) => {
                                             log!(
@@ -1531,6 +1661,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                                 topic_str,
                                                 e
                                             );
+                                            crate::metrics::inc(&crate::metrics::get().cdc_persist_errors);
                                             return (Vec::new(), batch_count, false);
                                         }
                                     }
@@ -1542,6 +1673,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                         payload: rendered.payload,
                                         qos: 0,
                                     });
+                                    crate::metrics::inc(&crate::metrics::get().cdc_msgs_published);
                                 }
 
                                 log!(
@@ -1591,7 +1723,13 @@ fn accept_mqtts_connections(
                 log!("pgmqtt mqtts: new MQTTS connection from {}", addr);
                 match Transport::new_tls(stream, tls_config.clone()) {
                     Ok(transport) => {
-                        handle_new_connection(transport, None, clients, session_db_actions, pending_publishes);
+                        handle_new_connection(
+                            transport,
+                            None,
+                            clients,
+                            session_db_actions,
+                            pending_publishes,
+                        );
                     }
                     Err(e) => {
                         log!("pgmqtt mqtts: TLS handshake failed for {}: {}", addr, e);
@@ -1674,7 +1812,13 @@ fn accept_mqtt_connections(
         match listener.accept() {
             Ok((stream, addr)) => {
                 log!("pgmqtt mqtt: new TCP connection from {}", addr);
-                handle_new_connection(Transport::Raw(stream), None, clients, session_db_actions, pending_publishes);
+                handle_new_connection(
+                    Transport::Raw(stream),
+                    None,
+                    clients,
+                    session_db_actions,
+                    pending_publishes,
+                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -1759,7 +1903,14 @@ fn handle_new_connection(
         match mqtt::parse_packet(&connect_buf, 5) {
             Ok((mqtt::InboundPacket::Connect(connect), _consumed)) => {
                 // Success! Proceed to register the client.
-                finish_connect(transport, connect, ws_jwt, clients, session_db_actions, pending_publishes);
+                finish_connect(
+                    transport,
+                    connect,
+                    ws_jwt,
+                    clients,
+                    session_db_actions,
+                    pending_publishes,
+                );
                 return;
             }
             Ok(_) => {
@@ -1782,8 +1933,11 @@ fn handle_new_connection(
                 // For a malformed packet this may be wrong, so we default to false (v3.1.1)
                 // rather than risk sending a v5-format CONNACK to a v3 client.
                 let err_v5 = connect_buf.get(8).copied() == Some(5);
-                let _ = transport
-                    .write_all(&mqtt::build_connack(false, mqtt::reason::MALFORMED_PACKET, err_v5));
+                let _ = transport.write_all(&mqtt::build_connack(
+                    false,
+                    mqtt::reason::MALFORMED_PACKET,
+                    err_v5,
+                ));
                 return;
             }
         }
@@ -1803,7 +1957,9 @@ fn finish_connect(
     // MQTT 3.1.1 §3.1.3.1: an empty client ID with clean_session=0 MUST be rejected.
     // (v5 permits empty client IDs with auto-assignment regardless of clean_start.)
     if !v5 && packet.client_id.is_empty() && !packet.clean_start {
-        log!("pgmqtt mqtt: MQTT 3.1.1 client sent empty client ID with clean_session=0 — rejecting");
+        log!(
+            "pgmqtt mqtt: MQTT 3.1.1 client sent empty client ID with clean_session=0 — rejecting"
+        );
         let _ = transport.write_all(&mqtt::build_connack(
             false,
             mqtt::reason::CLIENT_IDENTIFIER_NOT_VALID,
@@ -1874,8 +2030,12 @@ fn finish_connect(
                         e
                     );
                     if jwt_required {
-                        let _ = transport
-                            .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
+                        let _ = transport.write_all(&mqtt::build_connack(
+                            false,
+                            mqtt::reason::NOT_AUTHORIZED,
+                            v5,
+                        ));
+                        crate::metrics::inc(&crate::metrics::get().connections_rejected);
                         return;
                     }
                 }
@@ -1886,16 +2046,24 @@ fn finish_connect(
                         "pgmqtt mqtt: JWT required but no token provided for '{}'",
                         client_id
                     );
-                    let _ = transport
-                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
+                    let _ = transport.write_all(&mqtt::build_connack(
+                        false,
+                        mqtt::reason::NOT_AUTHORIZED,
+                        v5,
+                    ));
+                    crate::metrics::inc(&crate::metrics::get().connections_rejected);
                     return;
                 }
             }
             (_, None) => {
                 log!("pgmqtt mqtt: failed to parse JWT public key GUC");
                 if jwt_required {
-                    let _ = transport
-                        .write_all(&mqtt::build_connack(false, mqtt::reason::NOT_AUTHORIZED, v5));
+                    let _ = transport.write_all(&mqtt::build_connack(
+                        false,
+                        mqtt::reason::NOT_AUTHORIZED,
+                        v5,
+                    ));
+                    crate::metrics::inc(&crate::metrics::get().connections_rejected);
                     return;
                 }
             }
@@ -1911,9 +2079,10 @@ fn finish_connect(
             "pgmqtt mqtt: session takeover for '{}', disconnecting old connection",
             client_id
         );
-        let _ = old_client
-            .transport
-            .write_all(&mqtt::build_disconnect(mqtt::reason::SESSION_TAKEN_OVER, old_client.v5()));
+        let _ = old_client.transport.write_all(&mqtt::build_disconnect(
+            mqtt::reason::SESSION_TAKEN_OVER,
+            old_client.v5(),
+        ));
         // Fire the old client's Will (MQTT 5.0 §3.1.3.3: Will is published
         // when the server closes the connection for any reason other than a
         // normal DISCONNECT from the client).
@@ -1957,7 +2126,12 @@ fn finish_connect(
             limit,
             client_id
         );
-        let _ = transport.write_all(&mqtt::build_connack(false, mqtt::reason::QUOTA_EXCEEDED, v5));
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::QUOTA_EXCEEDED,
+            v5,
+        ));
+        crate::metrics::inc(&crate::metrics::get().connections_rejected);
         return;
     }
 
@@ -1980,6 +2154,14 @@ fn finish_connect(
             (false, MqttSession::new())
         }
     });
+    {
+        let m = crate::metrics::get();
+        if session_present {
+            crate::metrics::inc(&m.sessions_resumed);
+        } else {
+            crate::metrics::inc(&m.sessions_created);
+        }
+    }
 
     // Stamp the new connection's properties onto the session.
     session.expiry_interval = packet.session_expiry_interval;
@@ -2000,9 +2182,17 @@ fn finish_connect(
         log!("pgmqtt mqtt: failed to send CONNACK to '{}'", client_id);
         // Put session back so it isn't lost.
         if session_present {
-            with_sessions(|s| { s.insert(client_id.clone(), session); });
+            with_sessions(|s| {
+                s.insert(client_id.clone(), session);
+            });
         }
         return;
+    }
+
+    {
+        let m = crate::metrics::get();
+        crate::metrics::inc(&m.connections_accepted);
+        crate::metrics::inc(&m.connections_current);
     }
 
     // Set non-blocking for ongoing reads
@@ -2017,13 +2207,20 @@ fn finish_connect(
     if session_present {
         // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
         for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
-            to_send.push(mqtt::build_publish(topic, payload, 1, Some(*pid), true, false, v5));
+            to_send.push(mqtt::build_publish(
+                topic,
+                payload,
+                1,
+                Some(*pid),
+                true,
+                false,
+                v5,
+            ));
             // Reset the timer so redeliver_unacked_messages doesn't fire immediately.
             *sent_at = std::time::Instant::now();
         }
         // 2. Drain the pending queue into inflight and add to send list.
-        let inflight_limit =
-            std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
+        let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
         while session.inflight.len() < inflight_limit {
             if let Some(queued) = session.queue.pop_front() {
                 let pid = session.next_packet_id;
@@ -2055,6 +2252,12 @@ fn finish_connect(
         }
     }
 
+    let transport_label: &'static str = match &transport {
+        Transport::Raw(_) => "mqtt",
+        Transport::Ws(_) => "ws",
+        Transport::Tls(_) => "mqtts",
+        Transport::Wss(_) => "wss",
+    };
     let mut mqtt_client = MqttClient::new(
         transport,
         client_id.clone(),
@@ -2063,6 +2266,7 @@ fn finish_connect(
         packet.receive_maximum,
         packet.protocol_version,
         session,
+        transport_label,
     );
     mqtt_client.sub_claims = jwt_sub_claims;
     mqtt_client.pub_claims = jwt_pub_claims;
@@ -2103,11 +2307,19 @@ fn disconnect_client(
     session_db_actions: &mut Vec<SessionDbAction>,
 ) {
     if let Some(mut client) = clients.remove(id) {
+        let m = crate::metrics::get();
+        crate::metrics::dec(&m.connections_current);
+        if client.clean_disconnect {
+            crate::metrics::inc(&m.disconnections_clean);
+        } else {
+            crate::metrics::inc(&m.disconnections_unclean);
+        }
         if let Some(will) = client.will.take() {
             log!(
                 "pgmqtt mqtt: client '{}' disconnected unexpectedly, buffering Will",
                 id
             );
+            crate::metrics::inc(&m.wills_fired);
             pending_publishes.push(PendingPublish {
                 topic: Arc::from(will.topic.as_str()),
                 payload: Arc::from(will.payload),
@@ -2161,9 +2373,10 @@ fn poll_mqtt_clients(
             Ok(n) => {
                 if client.buf.len() + n > MAX_REQUEST_BYTES {
                     log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, MAX_REQUEST_BYTES);
-                    let _ = client
-                        .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
+                    let _ = client.transport.write_all(&mqtt::build_disconnect(
+                        mqtt::reason::MALFORMED_PACKET,
+                        client.v5(),
+                    ));
                     to_remove.push(client_id.clone());
                     continue;
                 }
@@ -2192,9 +2405,10 @@ fn poll_mqtt_clients(
                 Err(mqtt::MqttError::Incomplete) => break,
                 Err(e) => {
                     log!("pgmqtt mqtt: packet error from '{}': {}", client_id, e);
-                    let _ = client
-                        .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
+                    let _ = client.transport.write_all(&mqtt::build_disconnect(
+                        mqtt::reason::MALFORMED_PACKET,
+                        client.v5(),
+                    ));
                     to_remove.push(client_id.clone());
                     break;
                 }
@@ -2217,9 +2431,10 @@ fn poll_mqtt_clients(
                 }
                 Err(e) => {
                     log!("pgmqtt mqtt: parse error from '{}': {}", client_id, e);
-                    let _ = client
-                        .transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::MALFORMED_PACKET, client.v5()));
+                    let _ = client.transport.write_all(&mqtt::build_disconnect(
+                        mqtt::reason::MALFORMED_PACKET,
+                        client.v5(),
+                    ));
                     to_remove.push(client_id.clone());
                     break;
                 }
@@ -2364,6 +2579,7 @@ fn publish_messages_batch(
                         if let Some(client) = clients.get_mut(&p.log_sender) {
                             let puback = mqtt::build_puback(pid);
                             let _ = client.transport.write_all(&puback);
+                            crate::metrics::inc(&crate::metrics::get().pubacks_sent);
                         }
                     }
                 }
@@ -2413,6 +2629,7 @@ fn handle_mqtt_packet(
     let client_id = client.client_id.clone();
     match packet {
         mqtt::InboundPacket::Puback(packet_id) => {
+            crate::metrics::inc(&crate::metrics::get().pubacks_received);
             let res = client.session.inflight.remove(&packet_id);
             if let Some((_, _, msg_id, _)) = res {
                 log!(
@@ -2438,42 +2655,41 @@ fn handle_mqtt_packet(
             let session = &mut client.session;
             let inflight_limit =
                 std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
-            let (next_pkt, db_action) = if session.inflight.len() < inflight_limit
-                && !session.queue.is_empty()
-            {
-                if let Some(queued) = session.queue.pop_front() {
-                    let pid = session.next_packet_id;
-                    session.next_packet_id = session.next_packet_id.wrapping_add(1);
-                    if session.next_packet_id == 0 {
-                        session.next_packet_id = 1;
-                    }
-                    session.inflight.insert(
-                        pid,
+            let (next_pkt, db_action) =
+                if session.inflight.len() < inflight_limit && !session.queue.is_empty() {
+                    if let Some(queued) = session.queue.pop_front() {
+                        let pid = session.next_packet_id;
+                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
+                        if session.next_packet_id == 0 {
+                            session.next_packet_id = 1;
+                        }
+                        session.inflight.insert(
+                            pid,
+                            (
+                                queued.topic.clone(),
+                                queued.payload.clone(),
+                                queued.id,
+                                std::time::Instant::now(),
+                            ),
+                        );
                         (
-                            queued.topic.clone(),
-                            queued.payload.clone(),
-                            queued.id,
-                            std::time::Instant::now(),
-                        ),
-                    );
-                    (
-                        Some(mqtt::build_publish(
-                            &queued.topic,
-                            &queued.payload,
-                            1,
-                            Some(pid),
-                            false,
-                            false,
-                            client.v5(),
-                        )),
-                        queued.id.map(|id| (id, pid)),
-                    )
+                            Some(mqtt::build_publish(
+                                &queued.topic,
+                                &queued.payload,
+                                1,
+                                Some(pid),
+                                false,
+                                false,
+                                client.v5(),
+                            )),
+                            queued.id.map(|id| (id, pid)),
+                        )
+                    } else {
+                        (None, None)
+                    }
                 } else {
                     (None, None)
-                }
-            } else {
-                (None, None)
-            };
+                };
 
             if let Some((msg_id, pid)) = db_action {
                 session_db_actions.push(SessionDbAction::UpdateMessageInflight {
@@ -2489,6 +2705,7 @@ fn handle_mqtt_packet(
             true
         }
         mqtt::InboundPacket::Subscribe(sub) => {
+            crate::metrics::inc(&crate::metrics::get().subscribe_ops);
             let mut reason_codes = Vec::with_capacity(sub.topics.len());
             for (topic_filter, requested_qos) in &sub.topics {
                 // Shared subscriptions are MQTT 5.0 only (§4.8.2).
@@ -2578,35 +2795,41 @@ fn handle_mqtt_packet(
             if !subscribed_filters.is_empty() {
                 // Fetch retained messages with their stored QoS and message_id
                 // (needed to track QoS 1 inflight state).
-                let retained_msgs: Vec<(String, Vec<u8>, u8, i64)> = BackgroundWorker::transaction(|| {
-                    let mut results = Vec::new();
-                    let _ = pgrx::spi::Spi::connect(|spi| {
-                        if let Ok(table) = spi.select(
-                            "SELECT r.topic, m.payload, m.qos, m.id \
+                let retained_msgs: Vec<(String, Vec<u8>, u8, i64)> =
+                    BackgroundWorker::transaction(|| {
+                        let mut results = Vec::new();
+                        let _ = pgrx::spi::Spi::connect(|spi| {
+                            if let Ok(table) = spi.select(
+                                "SELECT r.topic, m.payload, m.qos, m.id \
                              FROM pgmqtt_retained r \
                              JOIN pgmqtt_messages m ON r.message_id = m.id",
-                            None,
-                            &[],
-                        ) {
-                            for row in table {
-                                let topic: String =
-                                    row.get_by_name("topic").ok().flatten().unwrap_or_default();
-                                let payload: Option<Vec<u8>> =
-                                    row.get_by_name("payload").ok().flatten();
-                                let qos: i32 =
-                                    row.get_by_name("qos").ok().flatten().unwrap_or(0);
-                                let msg_id: i64 =
-                                    row.get_by_name("id").ok().flatten().unwrap_or(0);
-                                if !topic.is_empty() {
-                                    results.push((topic, payload.unwrap_or_default(), qos as u8, msg_id));
+                                None,
+                                &[],
+                            ) {
+                                for row in table {
+                                    let topic: String =
+                                        row.get_by_name("topic").ok().flatten().unwrap_or_default();
+                                    let payload: Option<Vec<u8>> =
+                                        row.get_by_name("payload").ok().flatten();
+                                    let qos: i32 =
+                                        row.get_by_name("qos").ok().flatten().unwrap_or(0);
+                                    let msg_id: i64 =
+                                        row.get_by_name("id").ok().flatten().unwrap_or(0);
+                                    if !topic.is_empty() {
+                                        results.push((
+                                            topic,
+                                            payload.unwrap_or_default(),
+                                            qos as u8,
+                                            msg_id,
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        Ok::<_, pgrx::spi::Error>(())
-                    });
-                    Ok::<Vec<(String, Vec<u8>, u8, i64)>, pgrx::spi::Error>(results)
-                })
-                .unwrap_or_default();
+                            Ok::<_, pgrx::spi::Error>(())
+                        });
+                        Ok::<Vec<(String, Vec<u8>, u8, i64)>, pgrx::spi::Error>(results)
+                    })
+                    .unwrap_or_default();
 
                 // MQTT 5.0 §3.3.1.2: retained messages are delivered at
                 // min(message_qos, subscription_granted_qos).
@@ -2639,10 +2862,26 @@ fn handle_mqtt_packet(
                                     message_id: *msg_id,
                                     entries: vec![(client_id.clone(), Some(pid))],
                                 });
-                                let pkt = mqtt::build_publish(topic, payload, 1, Some(pid), false, true, client.v5());
+                                let pkt = mqtt::build_publish(
+                                    topic,
+                                    payload,
+                                    1,
+                                    Some(pid),
+                                    false,
+                                    true,
+                                    client.v5(),
+                                );
                                 let _ = client.transport.write_all(&pkt);
                             } else {
-                                let pkt = mqtt::build_publish(topic, payload, 0, None, false, true, client.v5());
+                                let pkt = mqtt::build_publish(
+                                    topic,
+                                    payload,
+                                    0,
+                                    None,
+                                    false,
+                                    true,
+                                    client.v5(),
+                                );
                                 let _ = client.transport.write_all(&pkt);
                             }
                             break; // deliver each retained message at most once per SUBSCRIBE
@@ -2654,6 +2893,7 @@ fn handle_mqtt_packet(
             true
         }
         mqtt::InboundPacket::Unsubscribe(unsub) => {
+            crate::metrics::inc(&crate::metrics::get().unsubscribe_ops);
             let mut reason_codes = Vec::with_capacity(unsub.topics.len());
             for topic_filter in &unsub.topics {
                 let existed = subscriptions::unsubscribe(&client_id, topic_filter);
@@ -2690,6 +2930,7 @@ fn handle_mqtt_packet(
             );
             if reason_code == mqtt::reason::NORMAL_DISCONNECT {
                 client.will = None;
+                client.clean_disconnect = true;
             }
             // MQTT 5.0 §3.14.2.2.2: client may override Session Expiry Interval at DISCONNECT.
             // However, §3.14.2.2.2 also says: "If the Session Expiry Interval in the CONNECT
@@ -2703,8 +2944,10 @@ fn handle_mqtt_packet(
                         "pgmqtt mqtt: '{}' protocol error: cannot set non-zero session expiry at DISCONNECT when CONNECT had expiry=0",
                         client_id
                     );
-                    let _ = client.transport
-                        .write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR, client.v5()));
+                    let _ = client.transport.write_all(&mqtt::build_disconnect(
+                        mqtt::reason::PROTOCOL_ERROR,
+                        client.v5(),
+                    ));
                 } else {
                     client.session.expiry_interval = new_expiry;
                     session_db_actions.push(SessionDbAction::UpsertSession {
@@ -2717,6 +2960,18 @@ fn handle_mqtt_packet(
             false // signal removal
         }
         mqtt::InboundPacket::Publish(pub_pkt) => {
+            // Track inbound bytes/message counts.
+            {
+                let m = crate::metrics::get();
+                crate::metrics::inc(&m.msgs_received);
+                match pub_pkt.qos {
+                    0 => crate::metrics::inc(&m.msgs_received_qos0),
+                    _ => crate::metrics::inc(&m.msgs_received_qos1),
+                }
+                crate::metrics::add(&m.bytes_received, pub_pkt.payload.len() as u64);
+            }
+            client.msgs_received_count += 1;
+            client.bytes_received_count += pub_pkt.payload.len() as u64;
             // JWT publish authorization
             if !client.pub_claims.is_empty() {
                 let authorized = client
@@ -2732,9 +2987,11 @@ fn handle_mqtt_packet(
                     if pub_pkt.qos == 1 {
                         if let Some(pid) = pub_pkt.packet_id {
                             if client.v5() {
-                                let _ = client.transport.write_all(
-                                    &mqtt::build_puback_with_reason(pid, mqtt::reason::NOT_AUTHORIZED),
-                                );
+                                let _ =
+                                    client.transport.write_all(&mqtt::build_puback_with_reason(
+                                        pid,
+                                        mqtt::reason::NOT_AUTHORIZED,
+                                    ));
                             } else {
                                 let _ = client.transport.write_all(&mqtt::build_puback(pid));
                             }
@@ -2755,8 +3012,10 @@ fn handle_mqtt_packet(
                     client_id,
                     pub_pkt.topic
                 );
-                let _ =
-                    client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::TOPIC_NAME_INVALID, client.v5()));
+                let _ = client.transport.write_all(&mqtt::build_disconnect(
+                    mqtt::reason::TOPIC_NAME_INVALID,
+                    client.v5(),
+                ));
                 return false;
             }
 
@@ -2819,7 +3078,10 @@ fn handle_mqtt_packet(
                 "pgmqtt mqtt: '{}' sent second CONNECT — protocol error",
                 client_id
             );
-            let _ = client.transport.write_all(&mqtt::build_disconnect(mqtt::reason::PROTOCOL_ERROR, client.v5()));
+            let _ = client.transport.write_all(&mqtt::build_disconnect(
+                mqtt::reason::PROTOCOL_ERROR,
+                client.v5(),
+            ));
             false
         }
     }
@@ -2855,6 +3117,12 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
         session_db_actions.push(SessionDbAction::DeleteSession {
             client_id: id.clone(),
         });
+    }
+    if !expired_ids.is_empty() {
+        crate::metrics::add(
+            &crate::metrics::get().sessions_expired,
+            expired_ids.len() as u64,
+        );
     }
 }
 
@@ -2906,6 +3174,7 @@ fn deliver_messages(
                                 sub_id,
                                 MAX_QUEUE_SIZE,
                             );
+                            crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                             to_remove.push(sub_id.clone());
                             continue;
                         }
@@ -2944,15 +3213,35 @@ fn deliver_messages(
                         if msg.id.is_some() {
                             batch_entries.push((sub_id.clone(), Some(pid)));
                         }
-                        let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 1, Some(pid), false, false, client.v5());
+                        let pkt = mqtt::build_publish(
+                            &msg.topic,
+                            &msg.payload,
+                            1,
+                            Some(pid),
+                            false,
+                            false,
+                            client.v5(),
+                        );
                         if client.transport.write_all(&pkt).is_err() {
                             to_remove.push(sub_id.clone());
+                        } else {
+                            client.record_msg_sent(msg.payload.len());
                         }
                     }
                 } else {
-                    let pkt = mqtt::build_publish(&msg.topic, &msg.payload, 0, None, false, false, client.v5());
+                    let pkt = mqtt::build_publish(
+                        &msg.topic,
+                        &msg.payload,
+                        0,
+                        None,
+                        false,
+                        false,
+                        client.v5(),
+                    );
                     if client.transport.write_all(&pkt).is_err() {
                         to_remove.push(sub_id.clone());
+                    } else {
+                        client.record_msg_sent(msg.payload.len());
                     }
                 }
             } else {
@@ -3198,6 +3487,263 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
         pub_claims,
     })
 }
+// ── Enterprise metrics flush functions ───────────────────────────────────────
+
+/// Write the current metrics snapshot to `pgmqtt_metrics_current` and
+/// `pgmqtt_metrics_snapshots`, purge history beyond the retention window,
+/// and fire any configured hook function or NOTIFY channel.
+fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
+    use pgrx::datum::DatumWithOid;
+    use std::sync::OnceLock;
+
+    let retention_days = crate::get_metrics_retention_days_guc();
+    let hook_fn_str = crate::get_metrics_hook_function_guc();
+    let notify_chan_str = crate::get_metrics_notify_channel_guc();
+    let json_payload = snap.to_json();
+    let captured_at = snap.captured_at_unix;
+
+    // CTE that upserts `pgmqtt_metrics_current` and appends a historical row to
+    // `pgmqtt_metrics_snapshots` in a single statement. $1 = captured_at (aliased
+    // to snapshot_at in the archive table); $2..=$N map to SNAPSHOT_COLUMNS.
+    static UPSERT_AND_INSERT_SQL: OnceLock<String> = OnceLock::new();
+    let sql = UPSERT_AND_INSERT_SQL.get_or_init(|| {
+        use crate::metrics::MetricsSnapshot;
+        let cols = MetricsSnapshot::SNAPSHOT_COLUMNS;
+        let col_list = cols.join(",");
+        let vals: Vec<String> = (2..=cols.len() + 1).map(|i| format!("${}", i)).collect();
+        let vals_list = vals.join(",");
+        let sets = cols
+            .iter()
+            .map(|c| format!("{c}=EXCLUDED.{c}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "WITH upsert AS (\
+               INSERT INTO pgmqtt_metrics_current (id,captured_at,{cols}) \
+               VALUES (1,$1,{vals}) \
+               ON CONFLICT (id) DO UPDATE SET captured_at=EXCLUDED.captured_at,{sets} \
+               RETURNING 1\
+             ) \
+             INSERT INTO pgmqtt_metrics_snapshots (snapshot_at,{cols}) \
+             SELECT $1,{vals} FROM upsert",
+            cols = col_list, vals = vals_list, sets = sets,
+        )
+    });
+
+    let values = snap.as_args();
+    let snap_args: Vec<DatumWithOid> = values.iter().map(|v| (*v).into()).collect();
+
+    BackgroundWorker::transaction(move || {
+        let _ = pgrx::spi::Spi::connect_mut(|spi| {
+            if let Err(e) = spi.update(sql, None, &snap_args) {
+                pgrx::log!("pgmqtt metrics: failed to persist metrics snapshot: {}", e);
+            }
+            // Purge snapshots older than the retention window (0 = keep forever)
+            if retention_days > 0 {
+                let cutoff = captured_at - (retention_days as i64 * 86400);
+                let cutoff_args: Vec<DatumWithOid> = vec![cutoff.into()];
+                if let Err(e) = spi.update(
+                    "DELETE FROM pgmqtt_metrics_snapshots WHERE snapshot_at < $1",
+                    None,
+                    &cutoff_args,
+                ) {
+                    pgrx::log!("pgmqtt metrics: failed to purge old snapshots: {}", e);
+                }
+            }
+            // Call hook function if configured.
+            // The GUC is superuser-settable; we still validate that the name
+            // looks like a valid SQL identifier or schema-qualified identifier
+            // (e.g. "my_hook" or "public.my_hook").
+            if !hook_fn_str.is_empty() {
+                let is_valid_ident = |s: &str| -> bool {
+                    !s.is_empty()
+                        && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                        && s.chars()
+                            .all(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                };
+                let name_ok = hook_fn_str.split('.').all(|part| is_valid_ident(part));
+                if name_ok {
+                    let hook_sql = format!("SELECT {}($1::jsonb)", hook_fn_str);
+                    let args: Vec<DatumWithOid> = vec![DatumWithOid::from(json_payload.as_str())];
+                    if let Err(e) = spi.select(&hook_sql, None, &args) {
+                        pgrx::log!("pgmqtt metrics: hook '{}' error: {}", hook_fn_str, e);
+                    }
+                } else {
+                    pgrx::log!(
+                        "pgmqtt metrics: ignoring hook function with unsafe name: '{}'",
+                        hook_fn_str
+                    );
+                }
+            }
+            // Send NOTIFY if a channel name is configured
+            if !notify_chan_str.is_empty() {
+                let args: Vec<DatumWithOid> = vec![
+                    DatumWithOid::from(notify_chan_str.as_str()),
+                    DatumWithOid::from(json_payload.as_str()),
+                ];
+                if let Err(e) = spi.update("SELECT pg_notify($1, $2)", None, &args) {
+                    pgrx::log!(
+                        "pgmqtt metrics: NOTIFY error on channel '{}': {}",
+                        notify_chan_str,
+                        e
+                    );
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
+
+/// Refresh `pgmqtt_connections_cache` from the current in-memory client map.
+///
+/// Uses INSERT ... ON CONFLICT DO UPDATE to upsert live clients, then deletes
+/// stale rows whose `cached_at_unix` wasn't touched this cycle.  This avoids
+/// the dead-tuple churn of DELETE-all + re-INSERT on every flush interval.
+fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
+    use pgrx::datum::DatumWithOid;
+
+    let now_unix = crate::license::now_secs();
+    let now_instant = std::time::Instant::now();
+
+    // Snapshot client data into owned values before the `move` closure.
+    struct ConnRow {
+        client_id: String,
+        transport: &'static str,
+        connected_at_unix: i64,
+        last_activity_unix: i64,
+        keep_alive_secs: i32,
+        msgs_received: i64,
+        msgs_sent: i64,
+        bytes_received: i64,
+        bytes_sent: i64,
+        subscriptions: i32,
+        queue_depth: i32,
+        inflight_count: i32,
+        will_set: bool,
+    }
+
+    let sub_counts = subscriptions::subscription_counts();
+    let rows: Vec<ConnRow> = clients
+        .iter()
+        .map(|(id, client)| {
+            let elapsed_secs = now_instant
+                .checked_duration_since(client.last_received_at)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            ConnRow {
+                client_id: id.clone(),
+                transport: client.transport_label,
+                connected_at_unix: client.connected_at_unix as i64,
+                last_activity_unix: now_unix - elapsed_secs,
+                keep_alive_secs: client.keep_alive as i32,
+                msgs_received: client.msgs_received_count as i64,
+                msgs_sent: client.msgs_sent_count as i64,
+                bytes_received: client.bytes_received_count as i64,
+                bytes_sent: client.bytes_sent_count as i64,
+                subscriptions: sub_counts.get(id.as_str()).copied().unwrap_or(0) as i32,
+                queue_depth: client.session.queue.len() as i32,
+                inflight_count: client.session.inflight.len() as i32,
+                will_set: client.will.is_some(),
+            }
+        })
+        .collect();
+
+    // Pivot row-of-structs into struct-of-Vecs so each column travels as a single
+    // PG array parameter to UNNEST().
+    let mut client_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut transports: Vec<String> = Vec::with_capacity(rows.len());
+    let mut connected_at: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut last_activity: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut keep_alive: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut msgs_received: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut msgs_sent: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut bytes_received: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut bytes_sent: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut subscriptions: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut queue_depth: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut inflight_count: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut will_set: Vec<bool> = Vec::with_capacity(rows.len());
+    for row in rows {
+        client_ids.push(row.client_id);
+        transports.push(row.transport.to_string());
+        connected_at.push(row.connected_at_unix);
+        last_activity.push(row.last_activity_unix);
+        keep_alive.push(row.keep_alive_secs);
+        msgs_received.push(row.msgs_received);
+        msgs_sent.push(row.msgs_sent);
+        bytes_received.push(row.bytes_received);
+        bytes_sent.push(row.bytes_sent);
+        subscriptions.push(row.subscriptions);
+        queue_depth.push(row.queue_depth);
+        inflight_count.push(row.inflight_count);
+        will_set.push(row.will_set);
+    }
+
+    BackgroundWorker::transaction(move || {
+        let _ = pgrx::spi::Spi::connect_mut(|spi| {
+            let upsert_args: Vec<DatumWithOid> = vec![
+                client_ids.into(),
+                transports.into(),
+                connected_at.into(),
+                last_activity.into(),
+                keep_alive.into(),
+                msgs_received.into(),
+                msgs_sent.into(),
+                bytes_received.into(),
+                bytes_sent.into(),
+                subscriptions.into(),
+                queue_depth.into(),
+                inflight_count.into(),
+                will_set.into(),
+                now_unix.into(),
+            ];
+            // One round-trip regardless of client count: every column is a PG array
+            // unrolled by UNNEST.  $14 (cached_at_unix) is broadcast to every row.
+            const UPSERT_SQL: &str = "\
+                INSERT INTO pgmqtt_connections_cache \
+                 (client_id,transport,connected_at_unix,last_activity_at_unix,\
+                  keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
+                  subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
+                 SELECT client_id,transport,connected_at_unix,last_activity_at_unix,\
+                  keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
+                  subscriptions,queue_depth,inflight_count,will_set,$14 \
+                 FROM UNNEST($1::text[],$2::text[],$3::bigint[],$4::bigint[],\
+                  $5::int[],$6::bigint[],$7::bigint[],$8::bigint[],$9::bigint[],\
+                  $10::int[],$11::int[],$12::int[],$13::bool[]) \
+                 AS u(client_id,transport,connected_at_unix,last_activity_at_unix,\
+                      keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
+                      subscriptions,queue_depth,inflight_count,will_set) \
+                 ON CONFLICT (client_id) DO UPDATE SET \
+                  transport=EXCLUDED.transport,\
+                  connected_at_unix=EXCLUDED.connected_at_unix,\
+                  last_activity_at_unix=EXCLUDED.last_activity_at_unix,\
+                  keep_alive_secs=EXCLUDED.keep_alive_secs,\
+                  msgs_received=EXCLUDED.msgs_received,\
+                  msgs_sent=EXCLUDED.msgs_sent,\
+                  bytes_received=EXCLUDED.bytes_received,\
+                  bytes_sent=EXCLUDED.bytes_sent,\
+                  subscriptions=EXCLUDED.subscriptions,\
+                  queue_depth=EXCLUDED.queue_depth,\
+                  inflight_count=EXCLUDED.inflight_count,\
+                  will_set=EXCLUDED.will_set,\
+                  cached_at_unix=EXCLUDED.cached_at_unix";
+            if let Err(e) = spi.update(UPSERT_SQL, None, &upsert_args) {
+                pgrx::log!("pgmqtt metrics: failed to upsert connections cache: {}", e);
+            }
+            // Remove rows for clients that disconnected since the last flush.
+            let stale_args: Vec<DatumWithOid> = vec![now_unix.into()];
+            if let Err(e) = spi.update(
+                "DELETE FROM pgmqtt_connections_cache WHERE cached_at_unix < $1",
+                None,
+                &stale_args,
+            ) {
+                pgrx::log!("pgmqtt metrics: failed to prune stale connections: {}", e);
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

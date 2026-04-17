@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pgmqtt — Observability Demo</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo"><span>pg</span>mqtt Observability</div>
+  </header>
+
+  <p class="blurb">
+    Four ways to consume broker metrics, all driven by the same counter pipeline in PostgreSQL.
+    Switch tabs to see each scenario in action.
+  </p>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="sql">SQL Polling</button>
+    <button class="tab"        data-tab="conns">Connections</button>
+    <button class="tab"        data-tab="stream">Live Stream</button>
+    <button class="tab"        data-tab="hooks">Hook Log</button>
+    <button class="tab"        data-tab="grafana">Grafana</button>
+  </nav>
+
+  <!-- ── Tab 1: SQL Polling ───────────────────────────────────────────── -->
+  <div class="panel active" id="tab-sql">
+    <div class="section-head">
+      <h2>Live Counters</h2>
+      <span class="badge">SELECT * FROM pgmqtt_metrics() via PostgREST</span>
+    </div>
+    <div class="stat-row" id="stat-row"></div>
+    <div class="data-table-wrap">
+      <table id="metrics-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Value</th>
+            <th>Unit</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody id="metrics-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Tab 2: Connections ────────────────────────────────────────────── -->
+  <div class="panel" id="tab-conns">
+    <div class="section-head">
+      <h2>Active Connections</h2>
+      <span class="badge">SELECT * FROM pgmqtt_connections() via PostgREST</span>
+    </div>
+    <div class="data-table-wrap">
+      <table id="conns-table">
+        <thead>
+          <tr>
+            <th>Client ID</th>
+            <th>Transport</th>
+            <th>Connected At</th>
+            <th>Last Activity</th>
+            <th>Keep-Alive</th>
+            <th>Msgs Rx</th>
+            <th>Msgs Tx</th>
+            <th>Queue</th>
+          </tr>
+        </thead>
+        <tbody id="conns-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Tab 3: Live Stream ────────────────────────────────────────────── -->
+  <div class="panel" id="tab-stream">
+    <div class="section-head">
+      <h2>Real-Time Metric Stream</h2>
+      <span class="badge">LISTEN pgmqtt_live → SSE bridge → EventSource</span>
+    </div>
+    <div class="stream-status">
+      <div class="pulse" id="stream-dot"></div>
+      <span id="stream-label">Connecting…</span>
+    </div>
+    <div class="stream-feed" id="stream-feed"></div>
+  </div>
+
+  <!-- ── Tab 4: Hook Log ───────────────────────────────────────────────── -->
+  <div class="panel" id="tab-hooks">
+    <div class="section-head">
+      <h2>Hook Function Log</h2>
+      <span class="badge">public.pgmqtt_alert_hook(snap jsonb) called on each flush</span>
+    </div>
+    <div class="data-table-wrap">
+      <table id="hook-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Alert?</th>
+            <th>Connections</th>
+            <th>Msgs Rx</th>
+            <th>DB Batches</th>
+            <th>Errors</th>
+            <th>Payload</th>
+          </tr>
+        </thead>
+        <tbody id="hook-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Tab 5: Grafana ────────────────────────────────────────────────── -->
+  <div class="panel" id="tab-grafana">
+    <div class="section-head">
+      <h2>Grafana Dashboard</h2>
+      <span class="badge">postgres_exporter → Prometheus → provisioned dashboard</span>
+    </div>
+    <div class="grafana-wrap" id="grafana-wrap">
+      <iframe
+        src="http://localhost:3002/d/pgmqtt-obs?orgId=1&kiosk=tv&refresh=10s"
+        title="pgmqtt Grafana Dashboard"
+        id="grafana-frame"
+      ></iframe>
+    </div>
+  </div>
+
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
