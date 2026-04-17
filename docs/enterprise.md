@@ -341,7 +341,6 @@ The flush interval, retention, and all other behavior are controlled via GUCs (s
 | | `cdc_render_errors` | counter | Template rendering failures (bad mapping config) |
 | | `cdc_slot_errors` | counter | Replication slot I/O errors |
 | | `cdc_persist_errors` | counter | Message persist failures (DB write in CDC path) |
-| | `cdc_lag_ms_last` | gauge | Most recent replication lag in milliseconds |
 | Inbound | `inbound_writes_ok` | counter | Successful MQTT-to-DB writes |
 | | `inbound_writes_failed` | counter | Failed MQTT-to-DB writes |
 | | `inbound_retries` | counter | Write retries |

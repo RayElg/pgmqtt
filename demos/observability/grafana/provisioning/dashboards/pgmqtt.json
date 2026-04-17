@@ -223,11 +223,6 @@
         },
         {
           "datasource": { "uid": "prometheus" },
-          "expr": "pg_pgmqtt_metric_value{metric_name=\"cdc_lag_ms_last\"}",
-          "legendFormat": "CDC lag ms"
-        },
-        {
-          "datasource": { "uid": "prometheus" },
           "expr": "rate(pg_pgmqtt_metric_value{metric_name=\"db_session_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"db_message_errors\"}[$__rate_interval]) + rate(pg_pgmqtt_metric_value{metric_name=\"db_subscription_errors\"}[$__rate_interval])",
           "legendFormat": "DB errors/s"
         },

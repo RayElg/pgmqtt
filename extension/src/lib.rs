@@ -750,7 +750,7 @@ fn pgmqtt_metrics() -> TableIterator<
                     pubacks_sent, pubacks_received,
                     subscribe_ops, unsubscribe_ops,
                     cdc_events_processed, cdc_msgs_published,
-                    cdc_render_errors, cdc_slot_errors, cdc_persist_errors, cdc_lag_ms_last,
+                    cdc_render_errors, cdc_slot_errors, cdc_persist_errors,
                     inbound_writes_ok, inbound_writes_failed, inbound_retries, inbound_dead_letters,
                     db_batches_committed, db_session_errors, db_message_errors, db_subscription_errors
              FROM pgmqtt_metrics_current
@@ -797,7 +797,6 @@ fn pgmqtt_metrics() -> TableIterator<
                 m!("cdc_render_errors",      "total",        "CDC template render errors");
                 m!("cdc_slot_errors",        "total",        "CDC replication slot errors");
                 m!("cdc_persist_errors",     "total",        "CDC message persist errors");
-                m!("cdc_lag_ms_last",        "milliseconds", "Most recent CDC replication lag");
                 m!("inbound_writes_ok",      "total",        "Successful inbound MQTT-to-DB writes");
                 m!("inbound_writes_failed",  "total",        "Failed inbound MQTT-to-DB writes");
                 m!("inbound_retries",        "total",        "Inbound write retries");
@@ -934,7 +933,6 @@ fn pgmqtt_prometheus_metrics() -> String {
                 g!(subscribe_ops); g!(unsubscribe_ops);
                 g!(cdc_events_processed); g!(cdc_msgs_published);
                 g!(cdc_render_errors); g!(cdc_slot_errors); g!(cdc_persist_errors);
-                g!(cdc_lag_ms_last);
                 g!(inbound_writes_ok); g!(inbound_writes_failed); g!(inbound_retries);
                 g!(inbound_dead_letters); g!(db_batches_committed);
                 g!(db_session_errors); g!(db_message_errors); g!(db_subscription_errors);

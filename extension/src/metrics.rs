@@ -3,7 +3,7 @@
 //! The BGW periodically flushes snapshots to `pgmqtt_metrics_current` /
 //! `pgmqtt_metrics_snapshots`, which SQL accessor functions query.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Broker-level metric counters (lock-free atomics, `Relaxed` ordering).
@@ -46,7 +46,6 @@ pub struct BrokerMetrics {
     pub cdc_render_errors: AtomicU64,
     pub cdc_slot_errors: AtomicU64,
     pub cdc_persist_errors: AtomicU64,
-    pub cdc_lag_ms_last: AtomicI64, // gauge, milliseconds
 
     // Inbound pipeline (MQTT -> DB)
     pub inbound_writes_ok: AtomicU64,
@@ -94,7 +93,6 @@ impl BrokerMetrics {
             cdc_render_errors:      AtomicU64::new(0),
             cdc_slot_errors:        AtomicU64::new(0),
             cdc_persist_errors:     AtomicU64::new(0),
-            cdc_lag_ms_last:        AtomicI64::new(0),
             inbound_writes_ok:      AtomicU64::new(0),
             inbound_writes_failed:  AtomicU64::new(0),
             inbound_retries:        AtomicU64::new(0),
@@ -115,19 +113,19 @@ pub fn get() -> &'static BrokerMetrics {
     METRICS.get_or_init(BrokerMetrics::new)
 }
 
-#[inline(always)]
+#[inline]
 pub fn inc(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-#[inline(always)]
+#[inline]
 pub fn add(counter: &AtomicU64, n: u64) {
     if n > 0 {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn dec(counter: &AtomicU64) {
     counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(1))
@@ -164,7 +162,6 @@ pub struct MetricsSnapshot {
     pub cdc_render_errors:       i64,
     pub cdc_slot_errors:         i64,
     pub cdc_persist_errors:      i64,
-    pub cdc_lag_ms_last:         i64,
     pub inbound_writes_ok:       i64,
     pub inbound_writes_failed:   i64,
     pub inbound_retries:         i64,
@@ -207,7 +204,6 @@ impl MetricsSnapshot {
             cdc_render_errors:      m.cdc_render_errors.load(Ordering::Relaxed) as i64,
             cdc_slot_errors:        m.cdc_slot_errors.load(Ordering::Relaxed) as i64,
             cdc_persist_errors:     m.cdc_persist_errors.load(Ordering::Relaxed) as i64,
-            cdc_lag_ms_last:        m.cdc_lag_ms_last.load(Ordering::Relaxed),
             inbound_writes_ok:      m.inbound_writes_ok.load(Ordering::Relaxed) as i64,
             inbound_writes_failed:  m.inbound_writes_failed.load(Ordering::Relaxed) as i64,
             inbound_retries:        m.inbound_retries.load(Ordering::Relaxed) as i64,
@@ -233,7 +229,7 @@ impl MetricsSnapshot {
                 r#""pubacks_sent":{ps},"pubacks_received":{pr},"#,
                 r#""subscribe_ops":{so},"unsubscribe_ops":{uo},"#,
                 r#""cdc_events_processed":{cep},"cdc_msgs_published":{cmp},"#,
-                r#""cdc_render_errors":{cre},"cdc_slot_errors":{cse},"cdc_persist_errors":{cpe},"cdc_lag_ms_last":{cl},"#,
+                r#""cdc_render_errors":{cre},"cdc_slot_errors":{cse},"cdc_persist_errors":{cpe},"#,
                 r#""inbound_writes_ok":{iwo},"inbound_writes_failed":{iwf},"inbound_retries":{ir},"inbound_dead_letters":{idl},"#,
                 r#""db_batches_committed":{dbc},"db_session_errors":{dse},"db_message_errors":{dme},"db_subscription_errors":{dsue}}}"#,
             ),
@@ -265,7 +261,6 @@ impl MetricsSnapshot {
             cre  = self.cdc_render_errors,
             cse  = self.cdc_slot_errors,
             cpe  = self.cdc_persist_errors,
-            cl   = self.cdc_lag_ms_last,
             iwo  = self.inbound_writes_ok,
             iwf  = self.inbound_writes_failed,
             ir   = self.inbound_retries,
@@ -275,6 +270,44 @@ impl MetricsSnapshot {
             dme  = self.db_message_errors,
             dsue = self.db_subscription_errors,
         )
+    }
+
+    /// Column list for `pgmqtt_metrics_current` / `pgmqtt_metrics_snapshots`
+    /// after their respective timestamp column (`captured_at` / `snapshot_at`).
+    /// Order matches [`MetricsSnapshot::as_args`] and the DDL in [`crate::init010`].
+    pub const SNAPSHOT_COLUMNS: &'static [&'static str] = &[
+        "started_at", "last_reset_at",
+        "connections_accepted", "connections_rejected", "connections_current",
+        "disconnections_clean", "disconnections_unclean", "wills_fired",
+        "sessions_created", "sessions_resumed", "sessions_expired",
+        "msgs_received", "msgs_received_qos0", "msgs_received_qos1", "bytes_received",
+        "msgs_sent", "bytes_sent", "msgs_dropped_queue_full",
+        "pubacks_sent", "pubacks_received",
+        "subscribe_ops", "unsubscribe_ops",
+        "cdc_events_processed", "cdc_msgs_published",
+        "cdc_render_errors", "cdc_slot_errors", "cdc_persist_errors",
+        "inbound_writes_ok", "inbound_writes_failed", "inbound_retries", "inbound_dead_letters",
+        "db_batches_committed", "db_session_errors", "db_message_errors", "db_subscription_errors",
+    ];
+
+    /// Values in the same order as [`Self::SNAPSHOT_COLUMNS`], prefixed with
+    /// `captured_at_unix` (which the timestamp column of each table points at).
+    pub fn as_args(&self) -> [i64; Self::FIELD_COUNT] {
+        [
+            self.captured_at_unix,
+            self.started_at_unix, self.last_reset_at_unix,
+            self.connections_accepted, self.connections_rejected, self.connections_current,
+            self.disconnections_clean, self.disconnections_unclean, self.wills_fired,
+            self.sessions_created, self.sessions_resumed, self.sessions_expired,
+            self.msgs_received, self.msgs_received_qos0, self.msgs_received_qos1, self.bytes_received,
+            self.msgs_sent, self.bytes_sent, self.msgs_dropped_queue_full,
+            self.pubacks_sent, self.pubacks_received,
+            self.subscribe_ops, self.unsubscribe_ops,
+            self.cdc_events_processed, self.cdc_msgs_published,
+            self.cdc_render_errors, self.cdc_slot_errors, self.cdc_persist_errors,
+            self.inbound_writes_ok, self.inbound_writes_failed, self.inbound_retries, self.inbound_dead_letters,
+            self.db_batches_committed, self.db_session_errors, self.db_message_errors, self.db_subscription_errors,
+        ]
     }
 
     pub fn to_prometheus(&self) -> String {
@@ -305,7 +338,6 @@ impl MetricsSnapshot {
             ("pgmqtt_cdc_render_errors_total",      "counter", self.cdc_render_errors,      "CDC template render errors"),
             ("pgmqtt_cdc_slot_errors_total",        "counter", self.cdc_slot_errors,        "CDC replication slot errors"),
             ("pgmqtt_cdc_persist_errors_total",     "counter", self.cdc_persist_errors,     "CDC message persist errors"),
-            ("pgmqtt_cdc_lag_milliseconds",         "gauge",   self.cdc_lag_ms_last,        "Most recent CDC replication lag in ms"),
             ("pgmqtt_inbound_writes_ok_total",      "counter", self.inbound_writes_ok,      "Successful inbound MQTT-to-DB writes"),
             ("pgmqtt_inbound_writes_failed_total",  "counter", self.inbound_writes_failed,  "Failed inbound MQTT-to-DB writes"),
             ("pgmqtt_inbound_retries_total",        "counter", self.inbound_retries,        "Inbound write retries"),
@@ -337,7 +369,7 @@ impl MetricsSnapshot {
         out
     }
 
-    pub const FIELD_COUNT: usize = 37;
+    pub const FIELD_COUNT: usize = 36;
 }
 
 #[cfg(test)]
@@ -376,7 +408,6 @@ mod tests {
             cdc_render_errors: 1,
             cdc_slot_errors: 0,
             cdc_persist_errors: 1,
-            cdc_lag_ms_last: 15,
             inbound_writes_ok: 300,
             inbound_writes_failed: 1,
             inbound_retries: 5,
@@ -404,7 +435,6 @@ mod tests {
         );
 
         assert_eq!(parsed["connections_accepted"], 42);
-        assert_eq!(parsed["cdc_lag_ms_last"], 15);
         assert_eq!(parsed["captured_at_unix"], 1700000000_i64);
     }
 }

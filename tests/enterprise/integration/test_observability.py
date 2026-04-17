@@ -540,8 +540,8 @@ def test_cdc_pipeline_increments_metrics():
 
     Sets up a QoS 0 outbound mapping (fire-and-forget, no pgmqtt_messages
     write), connects a subscriber, INSERTs a row, and asserts both CDC
-    counters increase.  Also verifies the CDC error counters and cdc_lag_ms_last
-    are present as observable metric names.
+    counters increase.  Also verifies the CDC error counters are present
+    as observable metric names.
     """
     TABLE = "_obs_cdc_happy"
     TOPIC = "obs/cdc/happy"
@@ -581,13 +581,12 @@ def test_cdc_pipeline_increments_metrics():
             f"before={before_published}, after={after_published}"
         )
 
-        # Verify split CDC error counters and lag are accessible metric names
+        # Verify split CDC error counters are accessible metric names
         # (value may be 0 in a healthy run, but the key must be present).
         names = {r[0] for r in run_sql("SELECT metric_name FROM pgmqtt_metrics()")}
         assert "cdc_render_errors" in names, "cdc_render_errors should be a named metric"
         assert "cdc_slot_errors" in names, "cdc_slot_errors should be a named metric"
         assert "cdc_persist_errors" in names, "cdc_persist_errors should be a named metric"
-        assert "cdc_lag_ms_last" in names, "cdc_lag_ms_last should be a named metric"
     finally:
         run_sql(f"SELECT pgmqtt_remove_outbound_mapping('public', '{TABLE}', 'default')")
         time.sleep(2)  # allow the broker to process the mapping removal from WAL

@@ -45,6 +45,43 @@ const MAX_QUEUE_SIZE: usize = 50_000;
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
+/// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
+/// savepoint is released; on `Err` (whether a Rust error or a PG longjmp
+/// caught by `catch_others`), the savepoint is rolled back and the error is
+/// returned.  Callers can retry or surface the error without aborting the
+/// enclosing `BackgroundWorker::transaction`.
+fn with_subtransaction<T>(
+    f: impl FnOnce() -> Result<T, pgrx::spi::Error> + std::panic::UnwindSafe,
+) -> Result<T, pgrx::spi::Error> {
+    use pgrx::pg_sys::pg_try::PgTryBuilder;
+    use pgrx::spi;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    unsafe {
+        pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null_mut());
+    }
+    // Track whether catch_others already rolled back (PG longjmp path) so we
+    // don't double-free the subtransaction on the Rust-Err path below.
+    let rolled_back_by_pg = AtomicBool::new(false);
+    let result = PgTryBuilder::new(f)
+        .catch_others(|_caught| {
+            unsafe {
+                pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            }
+            rolled_back_by_pg.store(true, Ordering::Relaxed);
+            // NoAttribute is used as a generic sentinel — callers only check
+            // is_ok()/is_err(), not the specific code.
+            Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
+        })
+        .execute();
+    if result.is_ok() {
+        unsafe { pgrx::pg_sys::ReleaseCurrentSubTransaction(); }
+    } else if !rolled_back_by_pg.load(Ordering::Relaxed) {
+        unsafe { pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction(); }
+    }
+    result
+}
+
 /// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
 ///
 /// After a crash, sessions keep `disconnected_at = NULL` because the broker never
@@ -1313,7 +1350,6 @@ const CDC_BATCH_SIZE: usize = 256;
 fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
     use crate::ring_buffer;
     use crate::topic_map;
-    use pgrx::pg_sys::pg_try::PgTryBuilder;
     use pgrx::spi::{self, Spi};
 
     // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
@@ -1582,22 +1618,11 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
 
                                 if rendered.qos > 0 {
                                     // Persist within this transaction — committed atomically
-                                    // with the slot advance above.
-                                    //
-                                    // Use a subtransaction (savepoint) so that a PostgreSQL
-                                    // error inside persist_message is caught and counted
-                                    // without crashing the background worker.  On error the
-                                    // subtransaction is rolled back and we return an Err so
-                                    // the outer batch rolls back too (events are retried).
-                                    unsafe {
-                                        pgrx::pg_sys::BeginInternalSubTransaction(
-                                            std::ptr::null_mut(),
-                                        );
-                                    }
-                                    // Track whether catch_others already rolled back
-                                    // the subtransaction (PG longjmp error path).
-                                    let pg_error_caught = std::sync::atomic::AtomicBool::new(false);
-                                    let result = PgTryBuilder::new(|| {
+                                    // with the slot advance above.  The subtransaction ensures a
+                                    // PostgreSQL error inside persist_message is caught and counted
+                                    // without crashing the background worker; the outer batch still
+                                    // rolls back so events are retried on the next tick.
+                                    let result = with_subtransaction(|| {
                                         pgrx::spi::Spi::connect_mut(|client| {
                                             let msg_id = db_action::persist_message(
                                                 client,
@@ -1608,31 +1633,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                             )?;
                                             Ok::<_, spi::Error>(Some(msg_id))
                                         })
-                                    })
-                                    .catch_others(|_caught| {
-                                        unsafe {
-                                            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                                        }
-                                        pg_error_caught
-                                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                                        // NoAttribute is used as a generic sentinel — the caller
-                                        // only checks is_ok()/is_err(), not the specific code.
-                                        Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
-                                    })
-                                    .execute();
-                                    if result.is_ok() {
-                                        unsafe {
-                                            pgrx::pg_sys::ReleaseCurrentSubTransaction();
-                                        }
-                                    } else if !pg_error_caught
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        // Rust-level Err (SPI error without longjmp) —
-                                        // subtransaction is still open.
-                                        unsafe {
-                                            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                                        }
-                                    }
+                                    });
 
                                     match result {
                                         Ok(msg_id) => {
@@ -3493,6 +3494,7 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
 /// and fire any configured hook function or NOTIFY channel.
 fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
     use pgrx::datum::DatumWithOid;
+    use std::sync::OnceLock;
 
     let retention_days = crate::get_metrics_retention_days_guc();
     let hook_fn_str = crate::get_metrics_hook_function_guc();
@@ -3500,124 +3502,41 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
     let json_payload = snap.to_json();
     let captured_at = snap.captured_at_unix;
 
-    // Build the parameterized argument list (37 i64 values).
-    let snap_args: Vec<DatumWithOid> = vec![
-        snap.captured_at_unix.into(),
-        snap.started_at_unix.into(),
-        snap.last_reset_at_unix.into(),
-        snap.connections_accepted.into(),
-        snap.connections_rejected.into(),
-        snap.connections_current.into(),
-        snap.disconnections_clean.into(),
-        snap.disconnections_unclean.into(),
-        snap.wills_fired.into(),
-        snap.sessions_created.into(),
-        snap.sessions_resumed.into(),
-        snap.sessions_expired.into(),
-        snap.msgs_received.into(),
-        snap.msgs_received_qos0.into(),
-        snap.msgs_received_qos1.into(),
-        snap.bytes_received.into(),
-        snap.msgs_sent.into(),
-        snap.bytes_sent.into(),
-        snap.msgs_dropped_queue_full.into(),
-        snap.pubacks_sent.into(),
-        snap.pubacks_received.into(),
-        snap.subscribe_ops.into(),
-        snap.unsubscribe_ops.into(),
-        snap.cdc_events_processed.into(),
-        snap.cdc_msgs_published.into(),
-        snap.cdc_render_errors.into(),
-        snap.cdc_slot_errors.into(),
-        snap.cdc_persist_errors.into(),
-        snap.cdc_lag_ms_last.into(),
-        snap.inbound_writes_ok.into(),
-        snap.inbound_writes_failed.into(),
-        snap.inbound_retries.into(),
-        snap.inbound_dead_letters.into(),
-        snap.db_batches_committed.into(),
-        snap.db_session_errors.into(),
-        snap.db_message_errors.into(),
-        snap.db_subscription_errors.into(),
-    ];
+    // CTE that upserts `pgmqtt_metrics_current` and appends a historical row to
+    // `pgmqtt_metrics_snapshots` in a single statement. $1 = captured_at (aliased
+    // to snapshot_at in the archive table); $2..=$N map to SNAPSHOT_COLUMNS.
+    static UPSERT_AND_INSERT_SQL: OnceLock<String> = OnceLock::new();
+    let sql = UPSERT_AND_INSERT_SQL.get_or_init(|| {
+        use crate::metrics::MetricsSnapshot;
+        let cols = MetricsSnapshot::SNAPSHOT_COLUMNS;
+        let col_list = cols.join(",");
+        let vals: Vec<String> = (2..=cols.len() + 1).map(|i| format!("${}", i)).collect();
+        let vals_list = vals.join(",");
+        let sets = cols
+            .iter()
+            .map(|c| format!("{c}=EXCLUDED.{c}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "WITH upsert AS (\
+               INSERT INTO pgmqtt_metrics_current (id,captured_at,{cols}) \
+               VALUES (1,$1,{vals}) \
+               ON CONFLICT (id) DO UPDATE SET captured_at=EXCLUDED.captured_at,{sets} \
+               RETURNING 1\
+             ) \
+             INSERT INTO pgmqtt_metrics_snapshots (snapshot_at,{cols}) \
+             SELECT $1,{vals} FROM upsert",
+            cols = col_list, vals = vals_list, sets = sets,
+        )
+    });
 
-    static UPSERT_SQL: &str = "\
-        INSERT INTO pgmqtt_metrics_current \
-         (id,captured_at,started_at,last_reset_at,\
-          connections_accepted,connections_rejected,connections_current,\
-          disconnections_clean,disconnections_unclean,wills_fired,\
-          sessions_created,sessions_resumed,sessions_expired,\
-          msgs_received,msgs_received_qos0,msgs_received_qos1,bytes_received,\
-          msgs_sent,bytes_sent,msgs_dropped_queue_full,\
-          pubacks_sent,pubacks_received,subscribe_ops,unsubscribe_ops,\
-          cdc_events_processed,cdc_msgs_published,\
-          cdc_render_errors,cdc_slot_errors,cdc_persist_errors,cdc_lag_ms_last,\
-          inbound_writes_ok,inbound_writes_failed,inbound_retries,inbound_dead_letters,\
-          db_batches_committed,db_session_errors,db_message_errors,db_subscription_errors) \
-         VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,\
-          $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37) \
-         ON CONFLICT (id) DO UPDATE SET \
-          captured_at=EXCLUDED.captured_at,started_at=EXCLUDED.started_at,\
-          last_reset_at=EXCLUDED.last_reset_at,\
-          connections_accepted=EXCLUDED.connections_accepted,\
-          connections_rejected=EXCLUDED.connections_rejected,\
-          connections_current=EXCLUDED.connections_current,\
-          disconnections_clean=EXCLUDED.disconnections_clean,\
-          disconnections_unclean=EXCLUDED.disconnections_unclean,\
-          wills_fired=EXCLUDED.wills_fired,\
-          sessions_created=EXCLUDED.sessions_created,\
-          sessions_resumed=EXCLUDED.sessions_resumed,\
-          sessions_expired=EXCLUDED.sessions_expired,\
-          msgs_received=EXCLUDED.msgs_received,\
-          msgs_received_qos0=EXCLUDED.msgs_received_qos0,\
-          msgs_received_qos1=EXCLUDED.msgs_received_qos1,\
-          bytes_received=EXCLUDED.bytes_received,\
-          msgs_sent=EXCLUDED.msgs_sent,bytes_sent=EXCLUDED.bytes_sent,\
-          msgs_dropped_queue_full=EXCLUDED.msgs_dropped_queue_full,\
-          pubacks_sent=EXCLUDED.pubacks_sent,\
-          pubacks_received=EXCLUDED.pubacks_received,\
-          subscribe_ops=EXCLUDED.subscribe_ops,\
-          unsubscribe_ops=EXCLUDED.unsubscribe_ops,\
-          cdc_events_processed=EXCLUDED.cdc_events_processed,\
-          cdc_msgs_published=EXCLUDED.cdc_msgs_published,\
-          cdc_render_errors=EXCLUDED.cdc_render_errors,\
-          cdc_slot_errors=EXCLUDED.cdc_slot_errors,\
-          cdc_persist_errors=EXCLUDED.cdc_persist_errors,\
-          cdc_lag_ms_last=EXCLUDED.cdc_lag_ms_last,\
-          inbound_writes_ok=EXCLUDED.inbound_writes_ok,\
-          inbound_writes_failed=EXCLUDED.inbound_writes_failed,\
-          inbound_retries=EXCLUDED.inbound_retries,\
-          inbound_dead_letters=EXCLUDED.inbound_dead_letters,\
-          db_batches_committed=EXCLUDED.db_batches_committed,\
-          db_session_errors=EXCLUDED.db_session_errors,\
-          db_message_errors=EXCLUDED.db_message_errors,\
-          db_subscription_errors=EXCLUDED.db_subscription_errors";
-
-    // $1 = captured_at_unix — same value as UPSERT_SQL's captured_at column,
-    // but pgmqtt_metrics_snapshots calls this column snapshot_at.
-    static INSERT_SNAP_SQL: &str = "\
-        INSERT INTO pgmqtt_metrics_snapshots \
-         (snapshot_at,started_at,last_reset_at,\
-          connections_accepted,connections_rejected,connections_current,\
-          disconnections_clean,disconnections_unclean,wills_fired,\
-          sessions_created,sessions_resumed,sessions_expired,\
-          msgs_received,msgs_received_qos0,msgs_received_qos1,bytes_received,\
-          msgs_sent,bytes_sent,msgs_dropped_queue_full,\
-          pubacks_sent,pubacks_received,subscribe_ops,unsubscribe_ops,\
-          cdc_events_processed,cdc_msgs_published,\
-          cdc_render_errors,cdc_slot_errors,cdc_persist_errors,cdc_lag_ms_last,\
-          inbound_writes_ok,inbound_writes_failed,inbound_retries,inbound_dead_letters,\
-          db_batches_committed,db_session_errors,db_message_errors,db_subscription_errors) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,\
-          $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)";
+    let values = snap.as_args();
+    let snap_args: Vec<DatumWithOid> = values.iter().map(|v| (*v).into()).collect();
 
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|spi| {
-            if let Err(e) = spi.update(UPSERT_SQL, None, &snap_args) {
-                pgrx::log!("pgmqtt metrics: failed to upsert metrics_current: {}", e);
-            }
-            if let Err(e) = spi.update(INSERT_SNAP_SQL, None, &snap_args) {
-                pgrx::log!("pgmqtt metrics: failed to insert metrics snapshot: {}", e);
+            if let Err(e) = spi.update(sql, None, &snap_args) {
+                pgrx::log!("pgmqtt metrics: failed to persist metrics snapshot: {}", e);
             }
             // Purge snapshots older than the retention window (0 = keep forever)
             if retention_days > 0 {
@@ -3729,73 +3648,87 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
         })
         .collect();
 
+    // Pivot row-of-structs into struct-of-Vecs so each column travels as a single
+    // PG array parameter to UNNEST().
+    let mut client_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut transports: Vec<String> = Vec::with_capacity(rows.len());
+    let mut connected_at: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut last_activity: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut keep_alive: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut msgs_received: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut msgs_sent: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut bytes_received: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut bytes_sent: Vec<i64> = Vec::with_capacity(rows.len());
+    let mut subscriptions: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut queue_depth: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut inflight_count: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut will_set: Vec<bool> = Vec::with_capacity(rows.len());
+    for row in rows {
+        client_ids.push(row.client_id);
+        transports.push(row.transport.to_string());
+        connected_at.push(row.connected_at_unix);
+        last_activity.push(row.last_activity_unix);
+        keep_alive.push(row.keep_alive_secs);
+        msgs_received.push(row.msgs_received);
+        msgs_sent.push(row.msgs_sent);
+        bytes_received.push(row.bytes_received);
+        bytes_sent.push(row.bytes_sent);
+        subscriptions.push(row.subscriptions);
+        queue_depth.push(row.queue_depth);
+        inflight_count.push(row.inflight_count);
+        will_set.push(row.will_set);
+    }
+
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|spi| {
-            // Upsert live clients in batches of 50.
-            const BATCH: usize = 50;
-            const COLS: usize = 14;
-            for chunk in rows.chunks(BATCH) {
-                let mut values_clauses = Vec::with_capacity(chunk.len());
-                let mut args: Vec<DatumWithOid> = Vec::with_capacity(chunk.len() * COLS);
-                for (i, row) in chunk.iter().enumerate() {
-                    let base = i * COLS + 1;
-                    values_clauses.push(format!(
-                        "(${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
-                        base,
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                        base + 7,
-                        base + 8,
-                        base + 9,
-                        base + 10,
-                        base + 11,
-                        base + 12,
-                        base + 13,
-                    ));
-                    args.push(row.client_id.as_str().into());
-                    args.push(row.transport.into());
-                    args.push(row.connected_at_unix.into());
-                    args.push(row.last_activity_unix.into());
-                    args.push(row.keep_alive_secs.into());
-                    args.push(row.msgs_received.into());
-                    args.push(row.msgs_sent.into());
-                    args.push(row.bytes_received.into());
-                    args.push(row.bytes_sent.into());
-                    args.push(row.subscriptions.into());
-                    args.push(row.queue_depth.into());
-                    args.push(row.inflight_count.into());
-                    args.push(row.will_set.into());
-                    args.push(now_unix.into());
-                }
-                let query = format!(
-                    "INSERT INTO pgmqtt_connections_cache \
-                     (client_id,transport,connected_at_unix,last_activity_at_unix,\
+            let upsert_args: Vec<DatumWithOid> = vec![
+                client_ids.into(),
+                transports.into(),
+                connected_at.into(),
+                last_activity.into(),
+                keep_alive.into(),
+                msgs_received.into(),
+                msgs_sent.into(),
+                bytes_received.into(),
+                bytes_sent.into(),
+                subscriptions.into(),
+                queue_depth.into(),
+                inflight_count.into(),
+                will_set.into(),
+                now_unix.into(),
+            ];
+            // One round-trip regardless of client count: every column is a PG array
+            // unrolled by UNNEST.  $14 (cached_at_unix) is broadcast to every row.
+            const UPSERT_SQL: &str = "\
+                INSERT INTO pgmqtt_connections_cache \
+                 (client_id,transport,connected_at_unix,last_activity_at_unix,\
+                  keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
+                  subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
+                 SELECT client_id,transport,connected_at_unix,last_activity_at_unix,\
+                  keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
+                  subscriptions,queue_depth,inflight_count,will_set,$14 \
+                 FROM UNNEST($1::text[],$2::text[],$3::bigint[],$4::bigint[],\
+                  $5::int[],$6::bigint[],$7::bigint[],$8::bigint[],$9::bigint[],\
+                  $10::int[],$11::int[],$12::int[],$13::bool[]) \
+                 AS u(client_id,transport,connected_at_unix,last_activity_at_unix,\
                       keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
-                      subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
-                     VALUES {} \
-                     ON CONFLICT (client_id) DO UPDATE SET \
-                      transport=EXCLUDED.transport,\
-                      connected_at_unix=EXCLUDED.connected_at_unix,\
-                      last_activity_at_unix=EXCLUDED.last_activity_at_unix,\
-                      keep_alive_secs=EXCLUDED.keep_alive_secs,\
-                      msgs_received=EXCLUDED.msgs_received,\
-                      msgs_sent=EXCLUDED.msgs_sent,\
-                      bytes_received=EXCLUDED.bytes_received,\
-                      bytes_sent=EXCLUDED.bytes_sent,\
-                      subscriptions=EXCLUDED.subscriptions,\
-                      queue_depth=EXCLUDED.queue_depth,\
-                      inflight_count=EXCLUDED.inflight_count,\
-                      will_set=EXCLUDED.will_set,\
-                      cached_at_unix=EXCLUDED.cached_at_unix",
-                    values_clauses.join(",")
-                );
-                if let Err(e) = spi.update(&query, None, &args) {
-                    pgrx::log!("pgmqtt metrics: failed to upsert connections batch: {}", e);
-                }
+                      subscriptions,queue_depth,inflight_count,will_set) \
+                 ON CONFLICT (client_id) DO UPDATE SET \
+                  transport=EXCLUDED.transport,\
+                  connected_at_unix=EXCLUDED.connected_at_unix,\
+                  last_activity_at_unix=EXCLUDED.last_activity_at_unix,\
+                  keep_alive_secs=EXCLUDED.keep_alive_secs,\
+                  msgs_received=EXCLUDED.msgs_received,\
+                  msgs_sent=EXCLUDED.msgs_sent,\
+                  bytes_received=EXCLUDED.bytes_received,\
+                  bytes_sent=EXCLUDED.bytes_sent,\
+                  subscriptions=EXCLUDED.subscriptions,\
+                  queue_depth=EXCLUDED.queue_depth,\
+                  inflight_count=EXCLUDED.inflight_count,\
+                  will_set=EXCLUDED.will_set,\
+                  cached_at_unix=EXCLUDED.cached_at_unix";
+            if let Err(e) = spi.update(UPSERT_SQL, None, &upsert_args) {
+                pgrx::log!("pgmqtt metrics: failed to upsert connections cache: {}", e);
             }
             // Remove rows for clients that disconnected since the last flush.
             let stale_args: Vec<DatumWithOid> = vec![now_unix.into()];
