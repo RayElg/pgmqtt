@@ -709,7 +709,9 @@ fn process_inbound_pending() {
         }
     }
 
-    log!("pgmqtt inbound: processed {} pending rows", rows.len());
+    if !rows.is_empty() {
+        log!("pgmqtt inbound: processed {} pending rows", rows.len());
+    }
 }
 
 /// Classify an SPI write failure and either retry or dead-letter.
@@ -1300,7 +1302,12 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             // Flush subscriber outbox — AFTER commit.
             flush_outbox(outbox, &mut clients, &mut post_commit_publishes, &mut post_actions);
 
-            // Send PUBACKs to publishers — AFTER commit.
+            // Process inbound_pending rows inserted by this tick's merged transaction.
+            // Must run before sending PUBACKs so target-table writes are committed
+            // before the publisher receives confirmation.
+            process_inbound_pending();
+
+            // Send PUBACKs to publishers — AFTER commit and inbound writes.
             for (pub_id, pid) in pubacks {
                 if let Some(c) = clients.get_mut(&pub_id) {
                     let _ = c.transport.write_all(&mqtt::build_puback(pid));
