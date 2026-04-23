@@ -15,3 +15,7 @@ __pycache__/
 venv/
 
 .env
+
+# Profiling
+tools/profiling/out/
+tools/profiling/FlameGraph/
