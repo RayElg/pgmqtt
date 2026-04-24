@@ -13,8 +13,10 @@ This document covers the enterprise-only features of pgmqtt: **license managemen
 - [TLS (MQTTS / WSS)](#tls-mqtts--wss)
 - [Port Management](#port-management)
 - [Observability & Metrics](#observability--metrics)
-- [GUC Reference](#guc-reference)
 - [SQL Functions](#sql-functions)
+
+> All pgmqtt GUCs — enterprise and community — are documented in
+> [configuration.md](configuration.md).
 
 ---
 
@@ -310,7 +312,7 @@ The background worker maintains atomic counters that are periodically flushed to
 - **`pgmqtt_metrics_current`** — single-row table with the latest snapshot (upserted each flush).
 - **`pgmqtt_metrics_snapshots`** — append-only time-series, one row per flush interval.
 
-The flush interval, retention, and all other behavior are controlled via GUCs (see [GUC Reference](#guc-reference)).
+The flush interval, retention, and all other behavior are controlled via GUCs (see [configuration.md — Observability / Metrics](configuration.md#observability--metrics-enterprise)).
 
 ### Available Counters
 
@@ -422,35 +424,6 @@ LISTEN pgmqtt_metrics;
 ```
 
 Each notification payload is a JSON object with all counter values.
-
----
-
-## GUC Reference
-
-All GUCs are superuser-only and reloadable via `SELECT pg_reload_conf()` (no restart required).
-
-| GUC | Type | Default | Description |
-|-----|------|---------|-------------|
-| `pgmqtt.license_key` | string | `""` | Signed enterprise license token |
-| `pgmqtt.jwt_public_key` | string | `""` | Ed25519 public key (base64url or PEM) |
-| `pgmqtt.jwt_required` | bool | `false` | Require JWT for all MQTT connections |
-| `pgmqtt.jwt_required_ws` | bool | `false` | Require JWT for WebSocket connections only |
-| `pgmqtt.mqtt_port` | int | `1883` | MQTT TCP listener port |
-| `pgmqtt.ws_port` | int | `9001` | MQTT-over-WebSocket listener port |
-| `pgmqtt.mqtts_port` | int | `8883` | MQTTS (TCP + TLS) listener port |
-| `pgmqtt.wss_port` | int | `9002` | WSS (WebSocket + TLS) listener port |
-| `pgmqtt.mqtt_enabled` | bool | `true` | Enable plain MQTT TCP listener |
-| `pgmqtt.ws_enabled` | bool | `true` | Enable plain MQTT WebSocket listener |
-| `pgmqtt.mqtts_enabled` | bool | `false` | Enable MQTTS listener (requires `tls_cert_file` / `tls_key_file`) |
-| `pgmqtt.wss_enabled` | bool | `false` | Enable WSS listener (requires `tls_cert_file` / `tls_key_file`) |
-| `pgmqtt.tls_cert_file` | string | `""` | Path to PEM certificate file for TLS listeners |
-| `pgmqtt.tls_key_file` | string | `""` | Path to PEM private key file for TLS listeners |
-| `pgmqtt.max_client_buffer_kb` | int | `64` | Per-client receive buffer limit in KiB (range 16–16384); connections that exceed this are disconnected |
-| `pgmqtt.metrics_snapshot_interval` | int | `60` | Seconds between metric flushes (0 = disabled) |
-| `pgmqtt.metrics_retention_days` | int | `3` | Days to retain snapshot rows (0 = keep forever) |
-| `pgmqtt.metrics_connections_cache_interval` | int | `10` | Seconds between connection cache refreshes (0 = disabled) |
-| `pgmqtt.metrics_hook_function` | string | `""` | SQL function called after each flush: `schema.func(jsonb)` |
-| `pgmqtt.metrics_notify_channel` | string | `""` | NOTIFY channel for JSON snapshots (empty = disabled) |
 
 ---
 

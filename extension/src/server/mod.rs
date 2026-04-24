@@ -31,7 +31,8 @@ const LATCH_INTERVAL: Duration = Duration::from_millis(80);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Stack-allocated scratch buffer for a single read() call per client per tick.
-const READ_BUF_SIZE: usize = 65536;
+// Client per-read chunk size is configurable via `pgmqtt.client_read_buf_kb`
+// (see `crate::get_client_read_buf_bytes`). Sized dynamically per tick.
 
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
@@ -580,7 +581,7 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
 /// Each pending row is processed in its own transaction so a single
 /// failure doesn't block the rest of the batch.
 fn process_inbound_pending() {
-    const BATCH_SIZE: i64 = 50;
+    let batch_size: i64 = crate::get_inbound_batch_size();
     const MAX_RETRIES: i32 = 10;
 
     // Step 1: read a batch of pending rows (read-only transaction)
@@ -604,7 +605,7 @@ fn process_inbound_pending() {
                  ORDER BY p.next_retry_at ASC \
                  LIMIT $1",
                 None,
-                &[BATCH_SIZE.into()],
+                &[batch_size.into()],
             ) {
                 for row in table {
                     let message_id: i64 = row.get_by_name("message_id").ok().flatten().unwrap_or(0);
@@ -1394,16 +1395,14 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     log!("pgmqtt mqtt+cdc: shutdown complete");
 }
 
-/// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
-///
-/// Each batch is one atomic PostgreSQL transaction: the replication slot LSN
-/// only advances when **all** QOS ≥ 1 messages from that batch have been
-/// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
-/// cost if a batch fails; larger values reduce per-batch transaction overhead.
-const CDC_BATCH_SIZE: usize = 256;
-
 /// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
 /// batches, persisting QOS ≥ 1 messages within the same transaction.
+///
+/// The per-batch size is configurable via `pgmqtt.cdc_batch_size`. Each batch
+/// is one atomic PostgreSQL transaction: the replication slot LSN only
+/// advances when **all** QOS ≥ 1 messages from that batch have been durably
+/// inserted into `pgmqtt_messages`. Smaller values reduce retry cost on batch
+/// failure; larger values amortize per-batch transaction / fdatasync overhead.
 ///
 /// Returns all rendered messages ready for delivery. The caller is responsible
 /// for passing them to `deliver_messages`.
@@ -1429,6 +1428,10 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
     use crate::ring_buffer;
     use crate::topic_map;
     use pgrx::spi::{self, Spi};
+
+    // Snapshot the GUC once per tick so the inner drain loop is consistent
+    // even if the config is reloaded mid-tick.
+    let cdc_batch_size: usize = crate::get_cdc_batch_size();
 
     // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
     //
@@ -1545,7 +1548,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                 let mut to_publish: Vec<MqttMessage> = Vec::new();
                 let mut batch_count: usize = 0;
 
-                // ── Step 1: advance the slot by at most CDC_BATCH_SIZE events ──
+                // ── Step 1: advance the slot by at most cdc_batch_size events ──
                 //
                 // The output plugin (pg_decode_change) fires synchronously for each
                 // row, pushing a ChangeEvent into ring_buffer.  Because this runs
@@ -1553,7 +1556,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                 // confirmed_flush_lsn only moves forward on COMMIT.
                 let advance_query = format!(
                     "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
-                    slot_name, CDC_BATCH_SIZE
+                    slot_name, cdc_batch_size
                 );
                 match Spi::connect(|client| {
                     // Suppress PostgreSQL's "starting logical decoding" LOG messages
@@ -1781,7 +1784,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
         }
 
         // Stop when the batch was smaller than the limit — WAL fully drained.
-        if batch_count < CDC_BATCH_SIZE {
+        if batch_count < cdc_batch_size {
             break;
         }
     }
@@ -2439,9 +2442,14 @@ fn poll_mqtt_clients(
 ) {
     let mut to_remove = Vec::new();
 
+    // One heap buffer reused across all clients this tick. Size comes from
+    // `pgmqtt.client_read_buf_kb`; clamped against `pgmqtt.max_client_buffer_kb`
+    // so a full read can't trip the overflow guard below.
+    let read_buf_size = crate::get_client_read_buf_bytes();
+    let mut tmp: Vec<u8> = vec![0u8; read_buf_size];
+
     for (client_id, client) in clients.iter_mut() {
         // Try to read data
-        let mut tmp = [0u8; READ_BUF_SIZE];
         match client.transport.read(&mut tmp) {
             Ok(0) => {
                 log!("pgmqtt mqtt: client '{}' disconnected (EOF)", client_id);
