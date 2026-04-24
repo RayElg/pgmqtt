@@ -83,6 +83,9 @@ static METRICS_HOOK_FUNCTION: GucSetting<Option<CString>> =
 static METRICS_NOTIFY_CHANNEL: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+/// Maximum per-client receive buffer in KiB before the connection is dropped.
+static MAX_CLIENT_BUFFER_KB: GucSetting<i32> = GucSetting::<i32>::new(64);
+
 // ---------------------------------------------------------------------------
 // GUC accessors
 // ---------------------------------------------------------------------------
@@ -133,6 +136,10 @@ pub fn get_metrics_notify_channel_guc() -> String {
         .get()
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+pub fn get_max_client_buffer_bytes() -> usize {
+    (MAX_CLIENT_BUFFER_KB.get().max(1) as usize) * 1024
 }
 
 pub struct PortConfig {
@@ -1147,6 +1154,16 @@ pub unsafe extern "C" fn _PG_init() {
         c"PostgreSQL NOTIFY channel for streaming metric snapshots as JSON (empty = disabled)",
         c"",
         &METRICS_NOTIFY_CHANNEL,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.max_client_buffer_kb",
+        c"Per-client receive buffer limit in KiB; connections exceeding this are dropped (default 64)",
+        c"",
+        &MAX_CLIENT_BUFFER_KB,
+        16,
+        16384,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

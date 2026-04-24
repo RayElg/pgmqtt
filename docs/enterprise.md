@@ -445,6 +445,7 @@ All GUCs are superuser-only and reloadable via `SELECT pg_reload_conf()` (no res
 | `pgmqtt.wss_enabled` | bool | `false` | Enable WSS listener (requires `tls_cert_file` / `tls_key_file`) |
 | `pgmqtt.tls_cert_file` | string | `""` | Path to PEM certificate file for TLS listeners |
 | `pgmqtt.tls_key_file` | string | `""` | Path to PEM private key file for TLS listeners |
+| `pgmqtt.max_client_buffer_kb` | int | `64` | Per-client receive buffer limit in KiB (range 16–16384); connections that exceed this are disconnected |
 | `pgmqtt.metrics_snapshot_interval` | int | `60` | Seconds between metric flushes (0 = disabled) |
 | `pgmqtt.metrics_retention_days` | int | `3` | Days to retain snapshot rows (0 = keep forever) |
 | `pgmqtt.metrics_connections_cache_interval` | int | `10` | Seconds between connection cache refreshes (0 = disabled) |

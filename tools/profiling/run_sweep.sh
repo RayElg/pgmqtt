@@ -17,6 +17,7 @@
 #   --duration  60                 seconds per run       (default: 60)
 #   --profilers "cpu offcpu"       profiler types        (default: cpu)
 #                                  offcpu requires sudo + bpftrace
+#   --buffer-kb 256                pgmqtt.max_client_buffer_kb for the sweep (default: 256)
 #
 # Example — sweep QoS modes at two rates, CPU only:
 #   tools/profiling/run_sweep.sh --modes "qos0 qos1" --rates "500 1000"
@@ -38,6 +39,7 @@ PUBS=4
 SUBS=4
 DURATION=60
 PROFILERS=(cpu)
+BUFFER_KB=256
 
 # ---------- arg parsing ----------
 while [[ $# -gt 0 ]]; do
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --pubs)      PUBS="$2";     shift 2 ;;
         --subs)      SUBS="$2";     shift 2 ;;
         --duration)  DURATION="$2"; shift 2 ;;
+        --buffer-kb) BUFFER_KB="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -64,7 +67,7 @@ RESULT_LINES=()
 extract_throughput() {
     local log="$1"
     if [[ -f "$log" ]]; then
-        grep -E '^\[loadgen\] (elapsed|inbound:)' "$log" | tail -1
+        grep -E '^\[loadgen\] (elapsed|inbound:)' "$log" | tail -1 || echo "(crashed — no summary)"
     else
         echo "(no log)"
     fi
@@ -127,11 +130,24 @@ printf "        rates     : %s\n"  "${RATES[*]}"
 printf "        pubs/subs : %s/%s\n" "$PUBS" "$SUBS"
 printf "        duration  : %ss\n" "$DURATION"
 printf "        profilers : %s\n"  "${PROFILERS[*]}"
+printf "        buffer    : %s KiB\n" "$BUFFER_KB"
 printf "        artifacts : %s\n"  "$SWEEP_DIR"
 # Rough estimate: duration + ~12s overhead per run, + 5s pause between.
 EST=$(( TOTAL * (DURATION + 17) ))
 printf "        est. time : ~%dm%02ds\n" $(( EST / 60 )) $(( EST % 60 ))
 echo "$SEP"
+
+# Apply buffer GUC for the duration of the sweep; restore on exit.
+PG_CONTAINER="$(docker ps --filter name=pgmqtt-enterprise-postgres-1 --format '{{.Names}}' | head -1)"
+_psql() { docker exec "$PG_CONTAINER" psql -U postgres -tAc "$1" 2>/dev/null; }
+ORIG_BUFFER_KB="$(_psql "SELECT current_setting('pgmqtt.max_client_buffer_kb', true)" || echo 64)"
+if _psql "ALTER SYSTEM SET pgmqtt.max_client_buffer_kb = ${BUFFER_KB}" > /dev/null 2>&1 \
+   && _psql "SELECT pg_reload_conf()" > /dev/null 2>&1; then
+    echo "[sweep] pgmqtt.max_client_buffer_kb set to ${BUFFER_KB} KiB (was ${ORIG_BUFFER_KB})"
+    trap '_psql "ALTER SYSTEM SET pgmqtt.max_client_buffer_kb = ${ORIG_BUFFER_KB}" > /dev/null 2>&1; _psql "SELECT pg_reload_conf()" > /dev/null 2>&1; echo "[sweep] pgmqtt.max_client_buffer_kb restored to ${ORIG_BUFFER_KB}"' EXIT
+else
+    echo "[sweep] WARNING: could not set pgmqtt.max_client_buffer_kb (GUC may not exist in running server — redeploy?). Continuing with current setting."
+fi
 
 n=0
 for mode in "${MODES[@]}"; do

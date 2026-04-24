@@ -28,10 +28,23 @@ from test_utils import run_sql
 NUM_MESSAGES = 200
 TOPIC = "perf/test"
 
+# Saturation-test sizes. Chosen so each run exceeds the broker's per-tick batch
+# latency (~10-50ms) by >10x — otherwise elapsed time is dominated by connect
+# setup and the measured rate is noise rather than a real ceiling.
+#
+# Ceilings observed on the profiling sweep (2026-04, 4p4s @ 128B):
+#   QoS0 sub fan-out : ~11.7k msg/s  (CPU-bound in flush_outbox write_all)
+#   QoS1 pipelined   : ~2.8k msg/s   (WAL-bound: fdatasync per tick commit)
+#   CDC fan-out      : ~15.4k msg/s  (matches INSERT rate × n_subs)
+QOS0_SAT_N = 5000      # ~450ms @ 11k/s
+QOS1_SAT_N = 2000      # ~700ms @ 2.8k/s
+QOS0_FANOUT_SUBS = 4   # stresses flush_outbox serial write loop
+QOS1_MULTI_PUB = 4     # exercises WAL contention on the inline INSERT
+
 
 def _print_result(name, count, duration):
     rate = count / duration if duration > 0 else 0
-    print(f"  PERF | {name:<30} | {count:>5} msgs | {duration:>6.2f}s | {rate:>8.1f} msg/s")
+    print(f"  PERF | {name:<30} | {count:>6} msgs | {duration:>6.2f}s | {rate:>8.1f} msg/s")
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +53,12 @@ def _print_result(name, count, duration):
 
 @pytest.mark.slow
 def test_published_qos0_throughput():
-    """Throughput: 200 QoS 0 client-published messages."""
-    payload = b"perf qos0"
+    """Saturation: 1 pub → 1 sub, QoS 0, QOS0_SAT_N messages back-to-back.
+
+    Measures the single-subscriber fan-out ceiling. The test is sized so
+    elapsed time is dominated by broker work, not socket setup.
+    """
+    payload = b"x" * 128  # match profiling sweep payload size
 
     s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s_sub.connect((MQTT_HOST, MQTT_PORT))
@@ -56,27 +73,97 @@ def test_published_qos0_throughput():
     recv_packet(s_pub)
 
     start = time.time()
-    for _ in range(NUM_MESSAGES):
+    for i in range(QOS0_SAT_N):
         s_pub.sendall(create_publish_packet(TOPIC, payload, qos=0))
-    s_pub.close()
+        # Yield every 500 msgs so the broker can drain the read buffer before
+        # it exceeds pgmqtt.max_client_buffer_kb and disconnects us.
+        if (i + 1) % 500 == 0:
+            time.sleep(0.005)
 
     received = 0
-    while received < NUM_MESSAGES:
-        pkt = recv_packet(s_sub, timeout=2.0)
+    while received < QOS0_SAT_N:
+        pkt = recv_packet(s_sub, timeout=10.0)
         if not pkt:
             break
         received += 1
 
     elapsed = time.time() - start
-    _print_result("Published QoS 0", received, elapsed)
-    assert received >= NUM_MESSAGES * 0.95, f"Too many dropped: {received}/{NUM_MESSAGES}"
+    _print_result("Published QoS 0 (saturation)", received, elapsed)
+    s_pub.close()
     s_sub.close()
+    # QoS 0 is at-most-once; minor drops under saturation are spec-compliant.
+    assert received >= QOS0_SAT_N * 0.90, f"Excessive drops: {received}/{QOS0_SAT_N}"
+
+
+@pytest.mark.slow
+def test_published_qos0_fanout_throughput():
+    """Saturation fan-out: 1 pub → N subs, QoS 0.
+
+    Exercises flush_outbox's per-subscriber write loop. The bottleneck is the
+    serial write_all over each subscriber's TCP send buffer, so aggregate
+    sub throughput should scale ~N× until the broker event loop saturates.
+    """
+    payload = b"x" * 128
+    n_subs = QOS0_FANOUT_SUBS
+
+    subs = []
+    for i in range(n_subs):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((MQTT_HOST, MQTT_PORT))
+        s.sendall(create_connect_packet(f"perf_q0_fanout_sub_{i}", clean_start=True))
+        recv_packet(s)
+        s.sendall(create_subscribe_packet(1, TOPIC, qos=0))
+        recv_packet(s)
+        subs.append(s)
+
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("perf_q0_fanout_pub", clean_start=True))
+    recv_packet(s_pub)
+
+    results = [0] * n_subs
+
+    def sub_drain(idx, sock):
+        count = 0
+        while count < QOS0_SAT_N:
+            pkt = recv_packet(sock, timeout=15.0)
+            if not pkt:
+                break
+            count += 1
+        results[idx] = count
+
+    threads = [threading.Thread(target=sub_drain, args=(i, s)) for i, s in enumerate(subs)]
+    for t in threads:
+        t.start()
+
+    start = time.time()
+    for i in range(QOS0_SAT_N):
+        s_pub.sendall(create_publish_packet(TOPIC, payload, qos=0))
+        if (i + 1) % 500 == 0:
+            time.sleep(0.005)
+
+    for t in threads:
+        t.join(timeout=30.0)
+    elapsed = time.time() - start
+
+    total = sum(results)
+    expected = QOS0_SAT_N * n_subs
+    _print_result(f"QoS 0 fan-out ({n_subs} subs)", total, elapsed)
+    s_pub.close()
+    for s in subs:
+        s.close()
+    assert total >= expected * 0.90, f"Excessive drops: {total}/{expected}"
 
 
 @pytest.mark.slow
 def test_published_qos1_pipelined_throughput():
-    """Throughput: 200 QoS 1 pipelined (send all, then collect ACKs)."""
-    payload = b"perf qos1 pipe"
+    """Saturation: 1 pub (pipelined) → 1 sub, QoS 1.
+
+    Pipelines all publishes before collecting PUBACKs so throughput is
+    bounded by broker commit rate, not client round-trip.
+    """
+    payload = b"x" * 128
+    n = QOS1_SAT_N
 
     s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s_sub.connect((MQTT_HOST, MQTT_PORT))
@@ -89,8 +176,8 @@ def test_published_qos1_pipelined_throughput():
 
     def sub_thread():
         count = 0
-        while count < NUM_MESSAGES:
-            pkt = recv_packet(s_sub, timeout=10.0)
+        while count < n:
+            pkt = recv_packet(s_sub, timeout=15.0)
             if not pkt:
                 break
             try:
@@ -111,22 +198,101 @@ def test_published_qos1_pipelined_throughput():
     recv_packet(s_pub)
 
     start = time.time()
-    for i in range(NUM_MESSAGES):
-        s_pub.sendall(create_publish_packet(TOPIC, payload, qos=1, packet_id=i + 1))
+    for i in range(n):
+        s_pub.sendall(create_publish_packet(TOPIC, payload, qos=1, packet_id=(i % 65535) + 1))
+        if (i + 1) % 500 == 0:
+            time.sleep(0.005)
 
     acks = 0
-    while acks < NUM_MESSAGES:
-        ack = recv_packet(s_pub, timeout=5.0)
+    while acks < n:
+        ack = recv_packet(s_pub, timeout=15.0)
         if not ack:
             break
         acks += 1
-    s_pub.close()
 
-    t.join()
+    t.join(timeout=30.0)
     elapsed = time.time() - start
     _print_result("Published QoS 1 (pipelined)", results["count"], elapsed)
-    assert results["count"] == NUM_MESSAGES
+    s_pub.close()
     s_sub.close()
+    assert acks == n, f"Only {acks}/{n} PUBACKs"
+    assert results["count"] == n, f"Sub got {results['count']}/{n}"
+
+
+@pytest.mark.slow
+def test_published_qos1_multi_pub_throughput():
+    """Saturation: N parallel pubs → 1 sub, QoS 1.
+
+    Multiple publishers exercise WAL-commit contention on the inline
+    persist_message INSERT. Each publisher pipelines a share of QOS1_SAT_N
+    messages; aggregate ACK rate is the broker's sustained commit ceiling.
+    """
+    payload = b"x" * 128
+    n_pubs = QOS1_MULTI_PUB
+    per_pub = QOS1_SAT_N // n_pubs
+    total = per_pub * n_pubs
+
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet("perf_q1m_sub", clean_start=True))
+    recv_packet(s_sub)
+    s_sub.sendall(create_subscribe_packet(1, TOPIC, qos=1))
+    recv_packet(s_sub)
+
+    sub_result = {"count": 0}
+
+    def sub_thread():
+        count = 0
+        while count < total:
+            pkt = recv_packet(s_sub, timeout=20.0)
+            if not pkt:
+                break
+            try:
+                _, _, _, _, _, pid, _ = validate_publish(pkt)
+                if pid:
+                    s_sub.sendall(create_puback_packet(pid))
+                count += 1
+            except Exception:
+                break
+        sub_result["count"] = count
+
+    ack_counts = [0] * n_pubs
+
+    def pub_thread(idx):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((MQTT_HOST, MQTT_PORT))
+        s.sendall(create_connect_packet(f"perf_q1m_pub_{idx}", clean_start=True))
+        recv_packet(s)
+        for i in range(per_pub):
+            s.sendall(create_publish_packet(TOPIC, payload, qos=1, packet_id=(i % 65535) + 1))
+            if (i + 1) % 500 == 0:
+                time.sleep(0.005)
+        acks = 0
+        while acks < per_pub:
+            pkt = recv_packet(s, timeout=20.0)
+            if not pkt:
+                break
+            acks += 1
+        ack_counts[idx] = acks
+        s.close()
+
+    t_sub = threading.Thread(target=sub_thread)
+    t_sub.start()
+
+    start = time.time()
+    pubs = [threading.Thread(target=pub_thread, args=(i,)) for i in range(n_pubs)]
+    for t in pubs:
+        t.start()
+    for t in pubs:
+        t.join(timeout=60.0)
+    t_sub.join(timeout=60.0)
+    elapsed = time.time() - start
+
+    acks_total = sum(ack_counts)
+    _print_result(f"QoS 1 multi-pub ({n_pubs} pubs)", acks_total, elapsed)
+    s_sub.close()
+    assert acks_total == total, f"Only {acks_total}/{total} PUBACKs across pubs"
+    assert sub_result["count"] == total, f"Sub got {sub_result['count']}/{total}"
 
 
 # ---------------------------------------------------------------------------

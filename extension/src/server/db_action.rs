@@ -119,6 +119,16 @@ pub fn execute_session_db_actions_inner(
     let mut insert_batch: Vec<(i64, String, Option<u16>)> = Vec::new(); // (msg_id, client_id, packet_id)
     let mut delete_batch: Vec<(String, i64)> = Vec::new();
     let mut update_batch: Vec<(String, i64, u16)> = Vec::new();
+    // Deferred until after insert_batch: if a subscriber hits the queue-full limit in the
+    // same tick that messages are queued for it, DeleteSession and InsertMessageBatch both
+    // land in the same transaction.  InsertMessageBatch is already deferred; DeleteSession
+    // must be too — otherwise the FK on pgmqtt_sessions is violated when insert_batch runs.
+    let mut delete_sessions: Vec<String> = Vec::new();
+    // Track client_ids that were upserted in this transaction. clean_start=true emits
+    // DeleteSession before UpsertSession for the same client_id; since DeleteSession is
+    // deferred, it would otherwise delete the session that UpsertSession just created and
+    // cascade-delete its subscriptions. Skip the delete if the session was re-established.
+    let mut upserted_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for action in actions {
         match action {
@@ -144,6 +154,8 @@ pub fn execute_session_db_actions_inner(
                 ) {
                     crate::metrics::inc(&m.db_session_errors);
                     pgrx::log!("pgmqtt: failed to upsert session '{}': {}", client_id, e);
+                } else {
+                    upserted_sessions.insert(client_id);
                 }
             }
             SessionDbAction::MarkDisconnected { client_id } => {
@@ -158,19 +170,7 @@ pub fn execute_session_db_actions_inner(
                 }
             }
             SessionDbAction::DeleteSession { client_id } => {
-                let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-                if let Err(e) = client.update(
-                    "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
-                    None,
-                    &args,
-                ) {
-                    crate::metrics::inc(&m.db_session_errors);
-                    pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
-                }
-                // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
-                // rows. Messages that now have no remaining session_messages are cleaned up
-                // by the DeleteMessage action when each subscriber ACKs. A global sweep
-                // here would race with InsertMessageBatch in the same transaction.
+                delete_sessions.push(client_id);
             }
             // Collected below; all messages in the tick are inserted together.
             SessionDbAction::InsertMessageBatch { message_id, entries } => {
@@ -250,6 +250,25 @@ pub fn execute_session_db_actions_inner(
         if let Err(e) = client.update(&q, None, &args) {
             crate::metrics::inc(&m.db_message_errors);
             pgrx::log!("pgmqtt: batch insert session_messages failed: {}", e);
+        }
+    }
+
+    // Delete sessions after insert_batch so the FK on pgmqtt_sessions is satisfied.
+    // CASCADE handles their pgmqtt_session_messages rows.
+    // Skip any client_id that was re-established via UpsertSession in this same tick
+    // (clean_start=true path emits DeleteSession before UpsertSession for the same client).
+    for client_id in delete_sessions {
+        if upserted_sessions.contains(&client_id) {
+            continue;
+        }
+        let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
+        if let Err(e) = client.update(
+            "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
+            None,
+            &args,
+        ) {
+            crate::metrics::inc(&m.db_session_errors);
+            pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
         }
     }
 

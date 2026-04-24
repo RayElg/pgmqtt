@@ -30,8 +30,8 @@ const LATCH_INTERVAL: Duration = Duration::from_millis(80);
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum bytes to read from a client request.
-const MAX_REQUEST_BYTES: usize = 65536;
+/// Stack-allocated scratch buffer for a single read() call per client per tick.
+const READ_BUF_SIZE: usize = 65536;
 
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
@@ -872,7 +872,7 @@ impl MqttClient {
         Self {
             transport,
             client_id,
-            buf: Vec::with_capacity(MAX_REQUEST_BYTES),
+            buf: Vec::with_capacity(crate::get_max_client_buffer_bytes()),
             will,
             keep_alive,
             last_received_at: std::time::Instant::now(),
@@ -1260,13 +1260,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         if !transient_publishes.is_empty() {
             let transient_msgs: Vec<MqttMessage> = transient_publishes
                 .into_iter()
-                .map(|p| {
-                    log!(
-                        "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
-                        p.log_sender, p.topic
-                    );
-                    MqttMessage { id: None, topic: p.topic, payload: p.payload, qos: 0 }
-                })
+                .map(|p| MqttMessage { id: None, topic: p.topic, payload: p.payload, qos: 0 })
                 .collect();
             let mut transient_cascade = Vec::new();
             deliver_messages(
@@ -2003,7 +1997,7 @@ fn handle_new_connection(
             }
             Err(mqtt::MqttError::Incomplete) => {
                 // Keep reading
-                if connect_buf.len() > MAX_REQUEST_BYTES {
+                if connect_buf.len() > crate::get_max_client_buffer_bytes() {
                     log!("pgmqtt mqtt: CONNECT packet too large");
                     return;
                 }
@@ -2447,7 +2441,7 @@ fn poll_mqtt_clients(
 
     for (client_id, client) in clients.iter_mut() {
         // Try to read data
-        let mut tmp = [0u8; MAX_REQUEST_BYTES];
+        let mut tmp = [0u8; READ_BUF_SIZE];
         match client.transport.read(&mut tmp) {
             Ok(0) => {
                 log!("pgmqtt mqtt: client '{}' disconnected (EOF)", client_id);
@@ -2455,8 +2449,9 @@ fn poll_mqtt_clients(
                 continue;
             }
             Ok(n) => {
-                if client.buf.len() + n > MAX_REQUEST_BYTES {
-                    log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, MAX_REQUEST_BYTES);
+                let max_buf = crate::get_max_client_buffer_bytes();
+                if client.buf.len() + n > max_buf {
+                    log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, max_buf);
                     let _ = client.transport.write_all(&mqtt::build_disconnect(
                         mqtt::reason::MALFORMED_PACKET,
                         client.v5(),
@@ -2580,10 +2575,6 @@ fn publish_and_execute_db_work(
         pgrx::spi::Spi::connect_mut(|spi| {
             // Phase 1: persist each QoS ≥ 1 / retained message and collect msg_ids.
             for p in &persistent_publishes {
-                log!(
-                    "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                    p.log_sender, p.topic, p.qos
-                );
                 if p.retain && p.payload.is_empty() {
                     // Empty-payload retain = "clear retained" — no message row needed.
                     let topic_ref: &str = &p.topic;
