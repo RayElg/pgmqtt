@@ -30,8 +30,9 @@ const LATCH_INTERVAL: Duration = Duration::from_millis(80);
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum bytes to read from a client request.
-const MAX_REQUEST_BYTES: usize = 65536;
+/// Stack-allocated scratch buffer for a single read() call per client per tick.
+// Client per-read chunk size is configurable via `pgmqtt.client_read_buf_kb`
+// (see `crate::get_client_read_buf_bytes`). Sized dynamically per tick.
 
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
@@ -580,7 +581,7 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
 /// Each pending row is processed in its own transaction so a single
 /// failure doesn't block the rest of the batch.
 fn process_inbound_pending() {
-    const BATCH_SIZE: i64 = 50;
+    let batch_size: i64 = crate::get_inbound_batch_size();
     const MAX_RETRIES: i32 = 10;
 
     // Step 1: read a batch of pending rows (read-only transaction)
@@ -604,7 +605,7 @@ fn process_inbound_pending() {
                  ORDER BY p.next_retry_at ASC \
                  LIMIT $1",
                 None,
-                &[BATCH_SIZE.into()],
+                &[batch_size.into()],
             ) {
                 for row in table {
                     let message_id: i64 = row.get_by_name("message_id").ok().flatten().unwrap_or(0);
@@ -709,7 +710,9 @@ fn process_inbound_pending() {
         }
     }
 
-    log!("pgmqtt inbound: processed {} pending rows", rows.len());
+    if !rows.is_empty() {
+        log!("pgmqtt inbound: processed {} pending rows", rows.len());
+    }
 }
 
 /// Classify an SPI write failure and either retry or dead-letter.
@@ -870,7 +873,7 @@ impl MqttClient {
         Self {
             transport,
             client_id,
-            buf: Vec::with_capacity(MAX_REQUEST_BYTES),
+            buf: Vec::with_capacity(crate::get_max_client_buffer_bytes()),
             will,
             keep_alive,
             last_received_at: std::time::Instant::now(),
@@ -902,6 +905,15 @@ impl MqttClient {
         crate::metrics::add(&m.bytes_sent, payload_len as u64);
         self.msgs_sent_count += 1;
         self.bytes_sent_count += payload_len as u64;
+    }
+
+    #[inline]
+    fn record_msgs_sent(&mut self, count: u64, payload_bytes: u64) {
+        let m = crate::metrics::get();
+        crate::metrics::add(&m.msgs_sent, count);
+        crate::metrics::add(&m.bytes_sent, payload_bytes);
+        self.msgs_sent_count += count;
+        self.bytes_sent_count += payload_bytes;
     }
 }
 
@@ -1233,7 +1245,35 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Periodically resend unacked QoS 1 messages
         redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
 
-        publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
+        // Split publishes: transient (QoS 0, no retain) need no DB write; persistent
+        // (QoS ≥ 1 or retain) are merged into the tick transaction below.
+        let mut persistent_publishes: Vec<PendingPublish> = Vec::new();
+        let mut transient_publishes: Vec<PendingPublish> = Vec::new();
+        for p in publishes {
+            if p.qos > 0 || p.retain {
+                persistent_publishes.push(p);
+            } else {
+                transient_publishes.push(p);
+            }
+        }
+
+        // Deliver transient (QoS 0, no retain) immediately — no transaction needed.
+        if !transient_publishes.is_empty() {
+            let transient_msgs: Vec<MqttMessage> = transient_publishes
+                .into_iter()
+                .map(|p| MqttMessage { id: None, topic: p.topic, payload: p.payload, qos: 0 })
+                .collect();
+            let mut transient_cascade = Vec::new();
+            deliver_messages(
+                &transient_msgs,
+                &mut clients,
+                &mut transient_cascade,
+                &mut session_db_actions,
+            );
+            if !transient_cascade.is_empty() {
+                publish_messages_batch(transient_cascade, &mut clients, &mut session_db_actions);
+            }
+        }
 
         // Virtual subscriber: process QoS 1 inbound-pending messages
         process_inbound_pending();
@@ -1241,8 +1281,47 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Sweep sessions whose Session Expiry Interval has elapsed
         sweep_expired_sessions(&mut session_db_actions);
 
-        // Execute all collected session DB actions in one transaction
-        execute_session_db_actions(session_db_actions);
+        // ── Merged tick transaction ───────────────────────────────────────────────
+        // Persist QoS ≥ 1 messages + plan delivery + all session mutations in ONE
+        // WAL commit (was two separate BackgroundWorker::transaction calls).
+        // TCP delivery and PUBACKs happen AFTER commit to preserve QoS 1 durability.
+        let mut post_commit_publishes: Vec<PendingPublish> = Vec::new();
+        if let Some((outbox, pubacks)) = publish_and_execute_db_work(
+            persistent_publishes,
+            session_db_actions,
+            &mut clients,
+            &mut post_commit_publishes,
+        ) {
+            let mut post_actions: Vec<SessionDbAction> = Vec::new();
+
+            // Flush subscriber outbox — AFTER commit.
+            flush_outbox(outbox, &mut clients, &mut post_commit_publishes, &mut post_actions);
+
+            // Process inbound_pending rows inserted by this tick's merged transaction.
+            // Must run before sending PUBACKs so target-table writes are committed
+            // before the publisher receives confirmation.
+            process_inbound_pending();
+
+            // Send PUBACKs to publishers — AFTER commit and inbound writes.
+            for (pub_id, pid) in pubacks {
+                if let Some(c) = clients.get_mut(&pub_id) {
+                    let _ = c.transport.write_all(&mqtt::build_puback(pid));
+                    crate::metrics::inc(&crate::metrics::get().pubacks_sent);
+                }
+            }
+
+            // Handle Will messages or disconnect cleanup from post-commit delivery failures.
+            if !post_commit_publishes.is_empty() {
+                publish_messages_batch(
+                    std::mem::take(&mut post_commit_publishes),
+                    &mut clients,
+                    &mut post_actions,
+                );
+            }
+            if !post_actions.is_empty() {
+                execute_session_db_actions(post_actions);
+            }
+        }
 
         // ── Enterprise metrics flush ──────────────────────────────────────────
         if crate::license::has_feature(crate::license::Feature::Metrics) {
@@ -1316,16 +1395,14 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     log!("pgmqtt mqtt+cdc: shutdown complete");
 }
 
-/// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
-///
-/// Each batch is one atomic PostgreSQL transaction: the replication slot LSN
-/// only advances when **all** QOS ≥ 1 messages from that batch have been
-/// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
-/// cost if a batch fails; larger values reduce per-batch transaction overhead.
-const CDC_BATCH_SIZE: usize = 256;
-
 /// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
 /// batches, persisting QOS ≥ 1 messages within the same transaction.
+///
+/// The per-batch size is configurable via `pgmqtt.cdc_batch_size`. Each batch
+/// is one atomic PostgreSQL transaction: the replication slot LSN only
+/// advances when **all** QOS ≥ 1 messages from that batch have been durably
+/// inserted into `pgmqtt_messages`. Smaller values reduce retry cost on batch
+/// failure; larger values amortize per-batch transaction / fdatasync overhead.
 ///
 /// Returns all rendered messages ready for delivery. The caller is responsible
 /// for passing them to `deliver_messages`.
@@ -1351,6 +1428,10 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
     use crate::ring_buffer;
     use crate::topic_map;
     use pgrx::spi::{self, Spi};
+
+    // Snapshot the GUC once per tick so the inner drain loop is consistent
+    // even if the config is reloaded mid-tick.
+    let cdc_batch_size: usize = crate::get_cdc_batch_size();
 
     // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
     //
@@ -1467,7 +1548,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                 let mut to_publish: Vec<MqttMessage> = Vec::new();
                 let mut batch_count: usize = 0;
 
-                // ── Step 1: advance the slot by at most CDC_BATCH_SIZE events ──
+                // ── Step 1: advance the slot by at most cdc_batch_size events ──
                 //
                 // The output plugin (pg_decode_change) fires synchronously for each
                 // row, pushing a ChangeEvent into ring_buffer.  Because this runs
@@ -1475,7 +1556,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                 // confirmed_flush_lsn only moves forward on COMMIT.
                 let advance_query = format!(
                     "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
-                    slot_name, CDC_BATCH_SIZE
+                    slot_name, cdc_batch_size
                 );
                 match Spi::connect(|client| {
                     // Suppress PostgreSQL's "starting logical decoding" LOG messages
@@ -1703,7 +1784,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
         }
 
         // Stop when the batch was smaller than the limit — WAL fully drained.
-        if batch_count < CDC_BATCH_SIZE {
+        if batch_count < cdc_batch_size {
             break;
         }
     }
@@ -1919,7 +2000,7 @@ fn handle_new_connection(
             }
             Err(mqtt::MqttError::Incomplete) => {
                 // Keep reading
-                if connect_buf.len() > MAX_REQUEST_BYTES {
+                if connect_buf.len() > crate::get_max_client_buffer_bytes() {
                     log!("pgmqtt mqtt: CONNECT packet too large");
                     return;
                 }
@@ -2361,9 +2442,14 @@ fn poll_mqtt_clients(
 ) {
     let mut to_remove = Vec::new();
 
+    // One heap buffer reused across all clients this tick. Size comes from
+    // `pgmqtt.client_read_buf_kb`; clamped against `pgmqtt.max_client_buffer_kb`
+    // so a full read can't trip the overflow guard below.
+    let read_buf_size = crate::get_client_read_buf_bytes();
+    let mut tmp: Vec<u8> = vec![0u8; read_buf_size];
+
     for (client_id, client) in clients.iter_mut() {
         // Try to read data
-        let mut tmp = [0u8; MAX_REQUEST_BYTES];
         match client.transport.read(&mut tmp) {
             Ok(0) => {
                 log!("pgmqtt mqtt: client '{}' disconnected (EOF)", client_id);
@@ -2371,8 +2457,9 @@ fn poll_mqtt_clients(
                 continue;
             }
             Ok(n) => {
-                if client.buf.len() + n > MAX_REQUEST_BYTES {
-                    log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, MAX_REQUEST_BYTES);
+                let max_buf = crate::get_max_client_buffer_bytes();
+                if client.buf.len() + n > max_buf {
+                    log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, max_buf);
                     let _ = client.transport.write_all(&mqtt::build_disconnect(
                         mqtt::reason::MALFORMED_PACKET,
                         client.v5(),
@@ -2463,6 +2550,102 @@ fn poll_mqtt_clients(
     to_remove.dedup();
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
+    }
+}
+
+/// Persist QoS ≥ 1 messages, plan delivery, and execute ALL session mutations in ONE
+/// PostgreSQL transaction — one WAL fdatasync instead of two per tick.
+///
+/// Behavioral invariant: QoS 1 messages are durably committed before TCP delivery.
+/// The returned outbox and puback list must be flushed by the caller AFTER this
+/// function returns (after commit). Returns `None` if the transaction failed.
+///
+/// In-memory session state (inflight, next_packet_id) is mutated inside the transaction
+/// by `plan_deliver`. On the rare SPI failure the BGW is in an error state anyway, so
+/// the inconsistency is acceptable.
+fn publish_and_execute_db_work(
+    persistent_publishes: Vec<PendingPublish>,
+    session_db_actions: Vec<SessionDbAction>,
+    clients: &mut HashMap<String, MqttClient>,
+    pending_publishes: &mut Vec<PendingPublish>,
+) -> Option<(HashMap<String, (Vec<u8>, u64, u64)>, Vec<(String, u16)>)> {
+    if persistent_publishes.is_empty() && session_db_actions.is_empty() {
+        return Some((HashMap::new(), Vec::new()));
+    }
+
+    let mut outbox: HashMap<String, (Vec<u8>, u64, u64)> = HashMap::new();
+    let mut pubacks: Vec<(String, u16)> = Vec::new();
+    let mut inner_actions: Vec<SessionDbAction> = Vec::new();
+    let mut to_deliver: Vec<MqttMessage> = Vec::new();
+    let mut all_actions = session_db_actions;
+
+    let result = BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
+        pgrx::spi::Spi::connect_mut(|spi| {
+            // Phase 1: persist each QoS ≥ 1 / retained message and collect msg_ids.
+            for p in &persistent_publishes {
+                if p.retain && p.payload.is_empty() {
+                    // Empty-payload retain = "clear retained" — no message row needed.
+                    let topic_ref: &str = &p.topic;
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![topic_ref.into()];
+                    spi.update("DELETE FROM pgmqtt_retained WHERE topic = $1", None, &args)?;
+                } else {
+                    let msg_id = db_action::persist_message(
+                        spi, &p.topic, &p.payload, p.qos, p.retain,
+                    )?;
+                    if p.retain {
+                        let topic_ref: &str = &p.topic;
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![topic_ref.into(), msg_id.into()];
+                        spi.update(
+                            "INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
+                             ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id",
+                            None, &args,
+                        )?;
+                    }
+                    for mapping_name in &p.inbound_mappings {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![msg_id.into(), mapping_name.as_ref().into()];
+                        spi.update(
+                            "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
+                             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            None, &args,
+                        )?;
+                    }
+                    to_deliver.push(MqttMessage {
+                        id: Some(msg_id),
+                        topic: p.topic.clone(),
+                        payload: p.payload.clone(),
+                        qos: p.qos,
+                    });
+                    if p.qos == 1 {
+                        if let Some(pid) = p.packet_id {
+                            pubacks.push((p.log_sender.clone(), pid));
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: plan delivery — assigns packet IDs, updates session inflight/queue,
+            // populates outbox with wire bytes, and pushes InsertMessageBatch actions.
+            plan_deliver(&to_deliver, clients, pending_publishes, &mut inner_actions, &mut outbox);
+
+            // Phase 3: execute all session mutations in one bulk pass (PUBACK deletes,
+            // inflight promotions, session upserts, AND the new InsertMessageBatch rows).
+            all_actions.extend(inner_actions.drain(..));
+            db_action::execute_session_db_actions_inner(
+                spi,
+                std::mem::take(&mut all_actions),
+            )
+        })
+    }));
+
+    match result {
+        Ok(_) => Some((outbox, pubacks)),
+        Err(e) => {
+            crate::metrics::inc(&crate::metrics::get().db_session_errors);
+            pgrx::log!("pgmqtt: merged tick transaction failed: {}", e);
+            None
+        }
     }
 }
 
@@ -2632,12 +2815,6 @@ fn handle_mqtt_packet(
             crate::metrics::inc(&crate::metrics::get().pubacks_received);
             let res = client.session.inflight.remove(&packet_id);
             if let Some((_, _, msg_id, _)) = res {
-                log!(
-                    "pgmqtt mqtt: '{}' acked packet_id={} (msg_id={:?})",
-                    client_id,
-                    packet_id,
-                    msg_id
-                );
                 if let Some(id) = msg_id {
                     session_db_actions.push(SessionDbAction::DeleteMessage {
                         client_id: client_id.clone(),
@@ -2764,12 +2941,6 @@ fn handle_mqtt_packet(
                         qos: granted,
                     });
                 }
-                log!(
-                    "pgmqtt mqtt: '{}' subscribed to '{}' (QoS {})",
-                    client_id,
-                    topic_filter,
-                    granted
-                );
             }
             let suback = mqtt::build_suback(sub.packet_id, &reason_codes, client.v5());
             if client.transport.write_all(&suback).is_err() {
@@ -2906,11 +3077,6 @@ fn handle_mqtt_packet(
                 } else {
                     mqtt::reason::NO_SUBSCRIPTION_EXISTED
                 });
-                log!(
-                    "pgmqtt mqtt: '{}' unsubscribed from '{}'",
-                    client_id,
-                    topic_filter
-                );
             }
             let unsuback = mqtt::build_unsuback(unsub.packet_id, &reason_codes, client.v5());
             if client.transport.write_all(&unsuback).is_err() {
@@ -3126,36 +3292,23 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
     }
 }
 
-/// Deliver a batch of messages to matching subscribers.
+/// Plan delivery of a batch of messages: assign packet IDs, update session inflight/queue,
+/// and populate `outbox` with per-client wire bytes. Does NOT write to the network.
 ///
-/// Used by both the CDC path (via `cdc_tick` return value) and the client
-/// PUBLISH path (via `publish_messages_batch`).
-fn deliver_messages(
+/// After this returns, the caller should commit any open transaction and then call
+/// `flush_outbox` to send the bytes — preserving the QoS 1 durability guarantee.
+fn plan_deliver(
     messages: &[MqttMessage],
     clients: &mut HashMap<String, MqttClient>,
     pending_publishes: &mut Vec<PendingPublish>,
     session_db_actions: &mut Vec<SessionDbAction>,
+    outbox: &mut HashMap<String, (Vec<u8>, u64, u64)>,
 ) {
-    if messages.is_empty() {
-        return;
-    }
-
-    log!("pgmqtt: publishing {} messages to clients", messages.len());
-
     let connected: std::collections::HashSet<String> = clients.keys().cloned().collect();
-    let mut to_remove = Vec::new();
+    let mut to_remove: Vec<String> = Vec::new();
 
     for msg in messages {
         let subscriber_ids = subscriptions::match_topic(&msg.topic, &connected);
-        if subscriber_ids.is_empty() {
-            log!(
-                "pgmqtt: no subscribers for topic='{}' (active_filters={:?})",
-                msg.topic,
-                subscriptions::active_filters()
-            );
-        }
-
-        // Batch database actions by message_id to minimize writes
         let mut batch_entries: Vec<(String, Option<u16>)> = Vec::new();
 
         for (sub_id, granted_qos) in &subscriber_ids {
@@ -3222,11 +3375,10 @@ fn deliver_messages(
                             false,
                             client.v5(),
                         );
-                        if client.transport.write_all(&pkt).is_err() {
-                            to_remove.push(sub_id.clone());
-                        } else {
-                            client.record_msg_sent(msg.payload.len());
-                        }
+                        let entry = outbox.entry(sub_id.clone()).or_insert_with(|| (Vec::new(), 0, 0));
+                        entry.0.extend_from_slice(&pkt);
+                        entry.1 += 1;
+                        entry.2 += msg.payload.len() as u64;
                     }
                 } else {
                     let pkt = mqtt::build_publish(
@@ -3238,11 +3390,10 @@ fn deliver_messages(
                         false,
                         client.v5(),
                     );
-                    if client.transport.write_all(&pkt).is_err() {
-                        to_remove.push(sub_id.clone());
-                    } else {
-                        client.record_msg_sent(msg.payload.len());
-                    }
+                    let entry = outbox.entry(sub_id.clone()).or_insert_with(|| (Vec::new(), 0, 0));
+                    entry.0.extend_from_slice(&pkt);
+                    entry.1 += 1;
+                    entry.2 += msg.payload.len() as u64;
                 }
             } else {
                 // ── Disconnected client with persistent session: queue for later ──
@@ -3265,7 +3416,6 @@ fn deliver_messages(
             }
         }
 
-        // Execute batch insert if there are entries for this message
         if !batch_entries.is_empty() {
             if let Some(msg_id) = msg.id {
                 session_db_actions.push(SessionDbAction::InsertMessageBatch {
@@ -3276,9 +3426,54 @@ fn deliver_messages(
         }
     }
 
+    // Handle queue-full disconnects (will messages queued in pending_publishes).
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
     }
+}
+
+/// Write a pre-built delivery outbox to the network. One syscall per client.
+///
+/// Write failures disconnect the client (firing its Will message). Called after any
+/// open transaction has committed so QoS 1 bytes only hit the wire after persistence.
+fn flush_outbox(
+    outbox: HashMap<String, (Vec<u8>, u64, u64)>,
+    clients: &mut HashMap<String, MqttClient>,
+    pending_publishes: &mut Vec<PendingPublish>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    let mut to_remove: Vec<String> = Vec::new();
+    for (sub_id, (buf, msg_count, payload_bytes)) in outbox {
+        if let Some(client) = clients.get_mut(&sub_id) {
+            if client.transport.write_all(&buf).is_err() {
+                to_remove.push(sub_id);
+            } else {
+                client.record_msgs_sent(msg_count, payload_bytes);
+            }
+        }
+    }
+    for id in to_remove {
+        disconnect_client(&id, clients, pending_publishes, session_db_actions);
+    }
+}
+
+/// Deliver a batch of messages to matching subscribers.
+///
+/// Used by the CDC path and by `publish_messages_batch` (cascade / transient path).
+/// For the hot client-PUBLISH path, `publish_and_execute_db_work` calls `plan_deliver`
+/// and `flush_outbox` separately so TCP writes happen after the merged transaction commits.
+fn deliver_messages(
+    messages: &[MqttMessage],
+    clients: &mut HashMap<String, MqttClient>,
+    pending_publishes: &mut Vec<PendingPublish>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let mut outbox: HashMap<String, (Vec<u8>, u64, u64)> = HashMap::new();
+    plan_deliver(messages, clients, pending_publishes, session_db_actions, &mut outbox);
+    flush_outbox(outbox, clients, pending_publishes, session_db_actions);
 }
 
 /// Periodic check for unacked QoS 1 messages and redelivery.

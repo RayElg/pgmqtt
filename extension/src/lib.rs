@@ -83,6 +83,23 @@ static METRICS_HOOK_FUNCTION: GucSetting<Option<CString>> =
 static METRICS_NOTIFY_CHANNEL: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+/// Maximum per-client receive buffer in KiB before the connection is dropped.
+static MAX_CLIENT_BUFFER_KB: GucSetting<i32> = GucSetting::<i32>::new(1024);
+
+/// Per-read() chunk size in KiB for client sockets. Sizes the batch the broker
+/// drains from each client per tick. Must be ≤ `max_client_buffer_kb`.
+static CLIENT_READ_BUF_KB: GucSetting<i32> = GucSetting::<i32>::new(256);
+
+/// Max rows drained from `pgmqtt_inbound_pending` per tick. Each row is
+/// processed in its own subtransaction, so very large values can stretch a
+/// tick past the latch interval and stall other work.
+static INBOUND_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(200);
+
+/// Max WAL events consumed per CDC tick (atomic transaction). Larger values
+/// amortize the per-commit fdatasync cost; memory grows linearly with the
+/// ring-buffer population during the tick.
+static CDC_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2048);
+
 // ---------------------------------------------------------------------------
 // GUC accessors
 // ---------------------------------------------------------------------------
@@ -133,6 +150,26 @@ pub fn get_metrics_notify_channel_guc() -> String {
         .get()
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+pub fn get_max_client_buffer_bytes() -> usize {
+    (MAX_CLIENT_BUFFER_KB.get().max(1) as usize) * 1024
+}
+
+/// Per-read chunk size, clamped to `max_client_buffer_kb` so a full read can
+/// never be rejected by the buffer-overflow guard in `poll_mqtt_clients`.
+pub fn get_client_read_buf_bytes() -> usize {
+    let read_kb = CLIENT_READ_BUF_KB.get().max(1) as usize;
+    let max_kb = MAX_CLIENT_BUFFER_KB.get().max(1) as usize;
+    read_kb.min(max_kb) * 1024
+}
+
+pub fn get_inbound_batch_size() -> i64 {
+    INBOUND_BATCH_SIZE.get().max(1) as i64
+}
+
+pub fn get_cdc_batch_size() -> usize {
+    CDC_BATCH_SIZE.get().max(1) as usize
 }
 
 pub struct PortConfig {
@@ -1147,6 +1184,46 @@ pub unsafe extern "C" fn _PG_init() {
         c"PostgreSQL NOTIFY channel for streaming metric snapshots as JSON (empty = disabled)",
         c"",
         &METRICS_NOTIFY_CHANNEL,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.max_client_buffer_kb",
+        c"Per-client receive buffer limit in KiB; connections exceeding this are dropped (default 1024)",
+        c"",
+        &MAX_CLIENT_BUFFER_KB,
+        16,
+        16384,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.client_read_buf_kb",
+        c"Bytes drained from each client socket per broker tick, in KiB (default 256). Clamped at runtime to pgmqtt.max_client_buffer_kb.",
+        c"",
+        &CLIENT_READ_BUF_KB,
+        4,
+        16384,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.inbound_batch_size",
+        c"Max pgmqtt_inbound_pending rows processed per tick (default 200). Each row commits in its own subtransaction.",
+        c"",
+        &INBOUND_BATCH_SIZE,
+        1,
+        10000,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.cdc_batch_size",
+        c"Max WAL events consumed per CDC batch transaction (default 2048). Larger values amortize WAL-commit cost; smaller values reduce retry scope on failure.",
+        c"",
+        &CDC_BATCH_SIZE,
+        32,
+        65536,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

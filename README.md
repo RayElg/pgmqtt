@@ -54,6 +54,10 @@ mosquitto_pub -h localhost -t 'sensor/site-1/temperature' -m '{"temperature": 22
 - `extension/`: Rust source code for the PostgreSQL extension (pgrx).
 - `docker/`: Dockerfiles and environment setups for development and testing.
 - `docs/`: User and developer documentation.
+  - [`docs/configuration.md`](docs/configuration.md): All `pgmqtt.*` GUCs (performance, TLS, JWT, metrics, licensing).
+  - [`docs/enterprise.md`](docs/enterprise.md): Enterprise feature reference (licensing, JWT, TLS, metrics).
+  - [`docs/interfaces.md`](docs/interfaces.md): SQL-callable functions and configuration tables.
+  - [`docs/limitations.md`](docs/limitations.md): Current behavioral gaps vs. MQTT 5.0.
 - `scripts/`: Utility scripts for building and packaging.
   - `scripts/build_package.sh`: Script to build distributable tarballs.
 - `tests/`: Test suites.
