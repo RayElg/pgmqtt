@@ -44,6 +44,11 @@ const QUEUE_WARNING_THRESHOLD: usize = 10_000;
 /// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
 const MAX_QUEUE_SIZE: usize = 50_000;
 
+/// Per-client cap on bytes buffered in `MqttClient::pending_write`. A non-blocking
+/// write that returns WouldBlock leaves remainder bytes here for the next tick;
+/// if the buffer grows past this cap, the consumer is too slow and we disconnect.
+const MAX_PENDING_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
 // Individual db_* functions were refactored into execute_session_db_actions.
 
 /// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
@@ -578,8 +583,12 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
 /// table write, and on success removes the pending row and cleans up
 /// the message if no other references remain.
 ///
-/// Each pending row is processed in its own transaction so a single
-/// failure doesn't block the rest of the batch.
+/// All rows in the batch share one outer transaction (single fdatasync at
+/// commit). Each row runs inside its own savepoint via `with_subtransaction`
+/// so a single failed write rolls back only that row's writes — successful
+/// rows still commit together. Failures (retry / dead-letter bookkeeping)
+/// are deferred until after the batch commit so they don't poison the
+/// happy-path transaction.
 fn process_inbound_pending() {
     let batch_size: i64 = crate::get_inbound_batch_size();
     const MAX_RETRIES: i32 = 10;
@@ -591,6 +600,24 @@ fn process_inbound_pending() {
         retry_count: i32,
         topic: String,
         payload: Vec<u8>,
+    }
+
+    enum DeferredFailure {
+        WriteError {
+            message_id: i64,
+            mapping_name: String,
+            retry_count: i32,
+            error: pgrx::spi::Error,
+            topic: String,
+            payload: Vec<u8>,
+        },
+        NoMapping {
+            message_id: i64,
+            mapping_name: String,
+            retry_count: i32,
+            topic: String,
+            payload: Vec<u8>,
+        },
     }
 
     let rows: Vec<PendingRow> = BackgroundWorker::transaction(|| {
@@ -636,17 +663,31 @@ fn process_inbound_pending() {
         return;
     }
 
-    // Step 2: process each row in its own transaction
-    for pending in &rows {
-        let matches = inbound_map::try_match(&pending.topic, &pending.payload);
-        let target_match = matches
-            .into_iter()
-            .find(|(_, m)| m.mapping_name.as_ref() == pending.mapping_name);
+    // Step 2: batch-process the happy path in one outer transaction. The
+    // closure owns the accumulators so it doesn't capture &mut across the
+    // unwind-safe boundary required by `BackgroundWorker::transaction`.
+    let (processed_ok, deferred): (u64, Vec<DeferredFailure>) =
+        BackgroundWorker::transaction(|| {
+            let mut processed_ok = 0u64;
+            let mut deferred: Vec<DeferredFailure> = Vec::new();
+            for pending in &rows {
+                let matches = inbound_map::try_match(&pending.topic, &pending.payload);
+                let target_match = matches
+                    .into_iter()
+                    .find(|(_, m)| m.mapping_name.as_ref() == pending.mapping_name);
 
-        match target_match {
-            Some((_, match_result)) => {
-                // Attempt the table write
-                let write_ok = BackgroundWorker::transaction(|| {
+                let Some((_, match_result)) = target_match else {
+                    deferred.push(DeferredFailure::NoMapping {
+                        message_id: pending.message_id,
+                        mapping_name: pending.mapping_name.clone(),
+                        retry_count: pending.retry_count,
+                        topic: pending.topic.clone(),
+                        payload: pending.payload.clone(),
+                    });
+                    continue;
+                };
+
+                let row_result = with_subtransaction(|| {
                     pgrx::spi::Spi::connect_mut(|client| {
                         let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result
                             .values
@@ -657,8 +698,6 @@ fn process_inbound_pending() {
                             })
                             .collect();
                         client.update(&*match_result.sql, None, &spi_args)?;
-
-                        // Success: remove pending row and clean up message
                         client.update(
                             "DELETE FROM pgmqtt_inbound_pending \
                              WHERE message_id = $1 AND mapping_name = $2",
@@ -673,45 +712,71 @@ fn process_inbound_pending() {
                     })
                 });
 
-                match write_ok {
-                    Ok(()) => {
-                        log!(
-                            "pgmqtt inbound: processed message {} for mapping '{}'",
-                            pending.message_id,
-                            pending.mapping_name,
-                        );
-                    }
+                match row_result {
+                    Ok(()) => processed_ok += 1,
                     Err(e) => {
                         crate::metrics::inc(&crate::metrics::get().inbound_writes_failed);
-                        handle_inbound_failure(
-                            pending.message_id,
-                            &pending.mapping_name,
-                            pending.retry_count,
-                            &e,
-                            MAX_RETRIES,
-                            &pending.topic,
-                            &pending.payload,
-                        );
+                        deferred.push(DeferredFailure::WriteError {
+                            message_id: pending.message_id,
+                            mapping_name: pending.mapping_name.clone(),
+                            retry_count: pending.retry_count,
+                            error: e,
+                            topic: pending.topic.clone(),
+                            payload: pending.payload.clone(),
+                        });
                     }
                 }
             }
-            None => {
-                // Mapping was removed since the message was published —
-                // dead-letter immediately (not retryable).
+            (processed_ok, deferred)
+        });
+
+    // Step 3: handle failures one-by-one (each opens its own short txn for the
+    // retry-state UPDATE or dead-letter insert).
+    for f in deferred {
+        match f {
+            DeferredFailure::WriteError {
+                message_id,
+                mapping_name,
+                retry_count,
+                error,
+                topic,
+                payload,
+            } => {
+                handle_inbound_failure(
+                    message_id,
+                    &mapping_name,
+                    retry_count,
+                    &error,
+                    MAX_RETRIES,
+                    &topic,
+                    &payload,
+                );
+            }
+            DeferredFailure::NoMapping {
+                message_id,
+                mapping_name,
+                retry_count,
+                topic,
+                payload,
+            } => {
                 dead_letter_inbound(
-                    pending.message_id,
-                    &pending.mapping_name,
-                    pending.retry_count,
+                    message_id,
+                    &mapping_name,
+                    retry_count,
                     "mapping no longer exists",
-                    &pending.topic,
-                    &pending.payload,
+                    &topic,
+                    &payload,
                 );
             }
         }
     }
 
-    if !rows.is_empty() {
-        log!("pgmqtt inbound: processed {} pending rows", rows.len());
+    if processed_ok > 0 || !rows.is_empty() {
+        log!(
+            "pgmqtt inbound: processed {}/{} pending rows",
+            processed_ok,
+            rows.len(),
+        );
     }
 }
 
@@ -857,6 +922,11 @@ struct MqttClient {
     clean_disconnect: bool,
     /// Inline session state — avoids global mutex lookup for connected clients.
     session: MqttSession,
+    /// Bytes that couldn't be written this tick because the socket returned
+    /// WouldBlock. Drained on subsequent ticks so a transient slow consumer
+    /// doesn't get disconnected and so partial-packet writes can't corrupt
+    /// the client's MQTT framing. Capped by `MAX_PENDING_WRITE_BYTES`.
+    pending_write: Vec<u8>,
 }
 
 impl MqttClient {
@@ -889,6 +959,7 @@ impl MqttClient {
             bytes_received_count: 0,
             bytes_sent_count: 0,
             clean_disconnect: false,
+            pending_write: Vec::new(),
         }
     }
 
@@ -3432,10 +3503,18 @@ fn plan_deliver(
     }
 }
 
-/// Write a pre-built delivery outbox to the network. One syscall per client.
+/// Write a pre-built delivery outbox to the network.
 ///
-/// Write failures disconnect the client (firing its Will message). Called after any
-/// open transaction has committed so QoS 1 bytes only hit the wire after persistence.
+/// Sockets are non-blocking, so a slow consumer's full kernel send buffer surfaces
+/// as `WouldBlock`. Rather than disconnect the client (which previously corrupted
+/// throughput under bursty fan-out), we append new bytes to the client's
+/// `pending_write` buffer and drain as much as the socket will accept this tick;
+/// the remainder waits for the next tick. The buffer is capped at
+/// `MAX_PENDING_WRITE_BYTES` — sustained slow consumers still get disconnected.
+///
+/// Real I/O errors (broken pipe, reset, EOF) still disconnect immediately. Called
+/// after any open transaction has committed so QoS 1 bytes only hit the wire after
+/// persistence.
 fn flush_outbox(
     outbox: HashMap<String, (Vec<u8>, u64, u64)>,
     clients: &mut HashMap<String, MqttClient>,
@@ -3443,18 +3522,83 @@ fn flush_outbox(
     session_db_actions: &mut Vec<SessionDbAction>,
 ) {
     let mut to_remove: Vec<String> = Vec::new();
+
+    // Phase 1: append new outbox bytes to each client's pending_write and credit
+    // the messages as sent (they're owned by the buffer now and will eventually
+    // hit the wire — counting them at delivery time avoids stuttering metrics).
     for (sub_id, (buf, msg_count, payload_bytes)) in outbox {
         if let Some(client) = clients.get_mut(&sub_id) {
-            if client.transport.write_all(&buf).is_err() {
-                to_remove.push(sub_id);
-            } else {
-                client.record_msgs_sent(msg_count, payload_bytes);
-            }
+            client.pending_write.extend_from_slice(&buf);
+            client.record_msgs_sent(msg_count, payload_bytes);
         }
     }
+
+    // Phase 2: drain every client that has bytes pending. Only the clients with
+    // backpressure or a fresh outbox visit pay a syscall here.
+    for (client_id, client) in clients.iter_mut() {
+        if client.pending_write.is_empty() {
+            continue;
+        }
+        match drain_pending_write(&mut client.transport, &mut client.pending_write) {
+            DrainResult::Complete | DrainResult::Partial => {
+                if client.pending_write.len() > MAX_PENDING_WRITE_BYTES {
+                    pgrx::log!(
+                        "pgmqtt: client '{}' slow consumer (pending_write {} > {} bytes). Disconnecting.",
+                        client_id,
+                        client.pending_write.len(),
+                        MAX_PENDING_WRITE_BYTES,
+                    );
+                    to_remove.push(client_id.clone());
+                }
+            }
+            DrainResult::Error => to_remove.push(client_id.clone()),
+        }
+    }
+
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
     }
+}
+
+/// Outcome of draining a client's pending_write buffer.
+enum DrainResult {
+    /// Entire buffer was written; buffer is now empty.
+    Complete,
+    /// Socket returned WouldBlock; some bytes (possibly zero) were written and
+    /// the rest remain in the buffer for the next tick.
+    Partial,
+    /// Real I/O error (broken pipe, reset, etc.) — caller should disconnect.
+    Error,
+}
+
+/// Write as much of `buf` to `transport` as the socket will accept without
+/// blocking. Bytes successfully written are removed from `buf`; on WouldBlock
+/// the remaining bytes stay for the next tick. Returns `Error` only on real
+/// I/O failure.
+fn drain_pending_write(transport: &mut Transport, buf: &mut Vec<u8>) -> DrainResult {
+    use std::io::{ErrorKind, Write};
+    let mut written = 0;
+    while written < buf.len() {
+        match transport.write(&buf[written..]) {
+            Ok(0) => {
+                // Write returning 0 with non-zero buffer means EOF — disconnect.
+                buf.drain(..written);
+                return DrainResult::Error;
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                buf.drain(..written);
+                return DrainResult::Partial;
+            }
+            Err(_) => {
+                buf.drain(..written);
+                return DrainResult::Error;
+            }
+        }
+    }
+    buf.clear();
+    DrainResult::Complete
 }
 
 /// Deliver a batch of messages to matching subscribers.
