@@ -5,6 +5,7 @@ use std::time::Duration;
 mod ffi_safe;
 pub mod inbound_map;
 mod init010;
+mod init020;
 pub mod license;
 pub mod metrics;
 mod mqtt;
@@ -69,6 +70,32 @@ static JWT_PUBLIC_KEY: GucSetting<Option<CString>> =
 static JWT_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+// Performance tuning GUCs
+/// BGW poll interval in milliseconds. Lower values reduce pub/sub latency at
+/// the cost of more frequent (but cheap) wakeups.  Default 5 ms.
+static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
+/// Hard cap on each client's accumulated inbound byte buffer between ticks.
+/// Publishers that produce faster than this can be consumed per tick are
+/// disconnected.  Default 262144 (256 KiB).
+static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(262144);
+/// Run cdc_tick every N ticks (1 = every tick, 16 ≈ 80 ms at 5 ms tick).
+/// Default 1 preserves original behaviour; raise to reduce CDC overhead when
+/// CDC replication latency requirements are relaxed.
+static CDC_EVERY_N_TICKS: GucSetting<i32> = GucSetting::<i32>::new(1);
+/// Gate verbose per-message and per-CDC-event log output.  Default false.
+/// When false, hot-path pgrx::log! calls that fire on every PUBLISH/PUBACK/
+/// CDC event are suppressed, eliminating elog(LOG) overhead on those paths.
+static DEBUG_LOG: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Use SET LOCAL synchronous_commit = off for session/delivery-tracking writes.
+/// Eliminates per-commit fdatasync on pgmqtt_messages and pgmqtt_session_messages
+/// writes at the cost of up to wal_writer_delay (200 ms) of delivery-state loss
+/// on a Postgres crash.  QoS 1 message durability (the PUBACK guarantee) is NOT
+/// affected — pgmqtt_messages is written in a separate transaction that always
+/// commits synchronously.  What can be lost: which subscribers have already been
+/// sent a copy, so surviving subscribers may receive duplicate deliveries on
+/// broker restart.  Default false (safe, synchronous).
+static ASYNC_SESSION_WRITES: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 // Observability GUCs (enterprise: metrics feature)
 /// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.
 static METRICS_SNAPSHOT_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(60);
@@ -86,6 +113,26 @@ static METRICS_NOTIFY_CHANNEL: GucSetting<Option<CString>> =
 // ---------------------------------------------------------------------------
 // GUC accessors
 // ---------------------------------------------------------------------------
+
+pub fn get_tick_interval_ms_guc() -> i32 {
+    TICK_INTERVAL_MS.get().max(1)
+}
+
+pub fn get_max_client_buffer_bytes_guc() -> usize {
+    MAX_CLIENT_BUFFER_BYTES.get().max(65536) as usize
+}
+
+pub fn get_cdc_every_n_ticks_guc() -> u64 {
+    CDC_EVERY_N_TICKS.get().max(1) as u64
+}
+
+pub fn get_async_session_writes_guc() -> bool {
+    ASYNC_SESSION_WRITES.get()
+}
+
+pub fn get_debug_log_guc() -> bool {
+    DEBUG_LOG.get()
+}
 
 pub fn get_license_key_guc() -> String {
     LICENSE_KEY
@@ -183,6 +230,7 @@ pub fn get_tls_key_file_guc() -> String {
 
 fn ensure_tables_exist() {
     init010::init_010();
+    init020::init_020();
 }
 
 /// Register a CDC → MQTT outbound topic mapping (persisted to DB table).
@@ -1150,6 +1198,54 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.tick_interval_ms",
+        c"BGW poll interval in milliseconds (1-1000, default 5)",
+        c"",
+        &TICK_INTERVAL_MS,
+        1,
+        1000,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.max_client_buffer_bytes",
+        c"Hard cap on each client's accumulated inbound buffer in bytes (65536-16777216, default 262144)",
+        c"",
+        &MAX_CLIENT_BUFFER_BYTES,
+        65536,
+        16777216,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.cdc_every_n_ticks",
+        c"Run CDC slot read every N ticks (1 = every tick; 16 ≈ 80 ms at the 5 ms default tick interval)",
+        c"",
+        &CDC_EVERY_N_TICKS,
+        1,
+        1000,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.debug_log",
+        c"Enable verbose per-message and per-CDC-event log output (default off; suppresses hot-path elog overhead)",
+        c"",
+        &DEBUG_LOG,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.async_session_writes",
+        c"Use SET LOCAL synchronous_commit = off for session/delivery-tracking writes (default off). \
+          Eliminates per-commit fdatasync overhead. On crash, surviving subscribers may receive duplicate \
+          QoS 1 deliveries; message durability (PUBACK guarantee) is unaffected.",
+        c"",
+        &ASYNC_SESSION_WRITES,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
     // Database name for the MQTT+CDC worker
     let db_name = "postgres";
     let db_name_cstr = std::ffi::CString::new(db_name)
@@ -1327,7 +1423,9 @@ unsafe extern "C-unwind" fn pg_decode_change(
     // Extract column data from the tuple (only for user tables).
     let columns = extract_columns(relation, change);
 
-    pgrx::log!("pgmqtt: CDC event: {} on {}.{}", op, schema_name, rel_name);
+    if crate::get_debug_log_guc() {
+        pgrx::log!("pgmqtt: CDC event: {} on {}.{}", op, schema_name, rel_name);
+    }
 
     ring_buffer::push(ring_buffer::RingEvent::Data(ring_buffer::ChangeEvent {
         op,
