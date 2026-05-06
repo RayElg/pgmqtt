@@ -1205,7 +1205,6 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     // Wall-clock timers for periodic tasks — their frequency must stay stable
     // regardless of tick rate (pgmqtt.tick_interval_ms).
     let mut last_inbound_reload = std::time::Instant::now();
-    let mut last_inbound_pending = std::time::Instant::now();
     let mut last_session_sweep = std::time::Instant::now();
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
@@ -1298,11 +1297,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
         publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
 
-        // Virtual subscriber: process QoS 1 inbound-pending messages (~100 ms)
-        if last_inbound_pending.elapsed() >= Duration::from_millis(100) {
-            process_inbound_pending();
-            last_inbound_pending = std::time::Instant::now();
-        }
+        // Virtual subscriber: drain QoS 1 inbound-pending rows every tick so
+        // that callers receive durable delivery (row in target table) in the
+        // same tick as the PUBACK.  The SELECT is a no-op when the table is
+        // empty, so per-tick overhead is negligible.
+        process_inbound_pending();
 
         // Sweep sessions whose Session Expiry Interval has elapsed (~500 ms)
         if last_session_sweep.elapsed() >= Duration::from_millis(500) {
