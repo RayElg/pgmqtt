@@ -11,6 +11,7 @@ pub mod metrics;
 mod mqtt;
 mod ring_buffer;
 mod server;
+mod statements;
 mod subscriptions;
 mod topic_map;
 mod websocket;

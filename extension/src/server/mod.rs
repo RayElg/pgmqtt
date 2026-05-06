@@ -25,7 +25,10 @@ use std::time::Duration;
 static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the BGW latch wakes to poll for connections.
-const LATCH_INTERVAL: Duration = Duration::from_millis(80);
+/// Reads the `pgmqtt.tick_interval_ms` GUC at runtime.
+fn latch_interval() -> Duration {
+    Duration::from_millis(crate::get_tick_interval_ms_guc() as u64)
+}
 
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -42,6 +45,8 @@ const QUEUE_WARNING_THRESHOLD: usize = 10_000;
 /// Hard cap on the per-client pending queue.  Clients that exceed this are
 /// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
 const MAX_QUEUE_SIZE: usize = 50_000;
+
+
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
@@ -854,6 +859,9 @@ struct MqttClient {
     clean_disconnect: bool,
     /// Inline session state — avoids global mutex lookup for connected clients.
     session: MqttSession,
+    /// Outbound bytes that could not be written in a previous tick (WouldBlock).
+    /// Drained at the start of each tick before new messages are delivered.
+    write_buf: Vec<u8>,
 }
 
 impl MqttClient {
@@ -886,6 +894,7 @@ impl MqttClient {
             bytes_received_count: 0,
             bytes_sent_count: 0,
             clean_disconnect: false,
+            write_buf: Vec::new(),
         }
     }
 
@@ -902,6 +911,47 @@ impl MqttClient {
         crate::metrics::add(&m.bytes_sent, payload_len as u64);
         self.msgs_sent_count += 1;
         self.bytes_sent_count += payload_len as u64;
+    }
+
+    /// Drain `write_buf` into the transport. Returns `false` on a fatal write
+    /// error (caller must disconnect the client); returns `true` if the buffer
+    /// is empty or if writing stalled again (WouldBlock — retry next tick).
+    fn flush_write_buf(&mut self) -> bool {
+        use std::io::Write;
+        let mut pos = 0;
+        while pos < self.write_buf.len() {
+            match self.transport.write(&self.write_buf[pos..]) {
+                Ok(0) => return false,
+                Ok(n) => pos += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return false,
+            }
+        }
+        self.write_buf.drain(..pos);
+        true
+    }
+
+    /// Write `data` to the transport, buffering any bytes that could not be
+    /// sent immediately (WouldBlock).  Returns `Err(())` on a fatal error.
+    fn try_write(&mut self, data: &[u8]) -> Result<(), ()> {
+        use std::io::Write;
+        if !self.write_buf.is_empty() {
+            self.write_buf.extend_from_slice(data);
+            return Ok(());
+        }
+        let mut pos = 0;
+        while pos < data.len() {
+            match self.transport.write(&data[pos..]) {
+                Ok(0) => return Err(()),
+                Ok(n) => pos += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.write_buf.extend_from_slice(&data[pos..]);
+                    return Ok(());
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -925,7 +975,7 @@ pub fn run_http(port: u16) {
 
     log!("pgmqtt http: listening on {}", addr);
 
-    while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
+    while BackgroundWorker::wait_latch(Some(latch_interval())) {
         if BackgroundWorker::sighup_received() {
             log!("pgmqtt http: SIGHUP received");
             unsafe {
@@ -1035,6 +1085,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     db_mark_sessions_disconnected_on_startup();
     db_load_sessions_on_startup();
     load_inbound_mappings();
+
+    // Prepare session-lifetime hot-path SQL plans (P-7).
+    BackgroundWorker::transaction(|| {
+        crate::statements::prepare_hot_path_statements();
+    });
 
     // Bind MQTT TCP listener (optional)
     let mqtt_listener = if ports.mqtt_enabled {
@@ -1147,10 +1202,15 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
     // Tick counter for throttling low-priority periodic work.
     let mut tick: u64 = 0;
+    // Wall-clock timers for periodic tasks — their frequency must stay stable
+    // regardless of tick rate (pgmqtt.tick_interval_ms).
+    let mut last_inbound_reload = std::time::Instant::now();
+    let mut last_inbound_pending = std::time::Instant::now();
+    let mut last_session_sweep = std::time::Instant::now();
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
     let mut last_connections_flush = std::time::Instant::now();
-    while BackgroundWorker::wait_latch(Some(LATCH_INTERVAL)) {
+    while BackgroundWorker::wait_latch(Some(latch_interval())) {
         tick = tick.wrapping_add(1);
 
         if BackgroundWorker::sighup_received() {
@@ -1160,10 +1220,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             }
         }
 
-        // Reload inbound mappings every ~500ms (6 ticks) to reduce idle
-        // transaction overhead while staying responsive to config changes.
-        if tick % 6 == 0 {
+        // Reload inbound mappings every ~500 ms to reduce idle transaction
+        // overhead while staying responsive to config changes.
+        if last_inbound_reload.elapsed() >= Duration::from_millis(500) {
             load_inbound_mappings();
+            last_inbound_reload = std::time::Instant::now();
         }
 
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
@@ -1219,15 +1280,17 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
         execute_inbound_writes(pending_inbound_writes);
 
-        // ── CDC: load mappings, advance slot, drain ring buffer ──
-        let cdc_messages = cdc_tick(slot_name);
-        if !cdc_messages.is_empty() {
-            deliver_messages(
-                &cdc_messages,
-                &mut clients,
-                &mut publishes,
-                &mut session_db_actions,
-            );
+        // ── CDC: advance slot, drain ring buffer (throttled by GUC) ──
+        if tick % crate::get_cdc_every_n_ticks_guc() == 0 {
+            let cdc_messages = cdc_tick(slot_name);
+            if !cdc_messages.is_empty() {
+                deliver_messages(
+                    &cdc_messages,
+                    &mut clients,
+                    &mut publishes,
+                    &mut session_db_actions,
+                );
+            }
         }
 
         // Periodically resend unacked QoS 1 messages
@@ -1235,11 +1298,17 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
         publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
 
-        // Virtual subscriber: process QoS 1 inbound-pending messages
-        process_inbound_pending();
+        // Virtual subscriber: process QoS 1 inbound-pending messages (~100 ms)
+        if last_inbound_pending.elapsed() >= Duration::from_millis(100) {
+            process_inbound_pending();
+            last_inbound_pending = std::time::Instant::now();
+        }
 
-        // Sweep sessions whose Session Expiry Interval has elapsed
-        sweep_expired_sessions(&mut session_db_actions);
+        // Sweep sessions whose Session Expiry Interval has elapsed (~500 ms)
+        if last_session_sweep.elapsed() >= Duration::from_millis(500) {
+            sweep_expired_sessions(&mut session_db_actions);
+            last_session_sweep = std::time::Instant::now();
+        }
 
         // Execute all collected session DB actions in one transaction
         execute_session_db_actions(session_db_actions);
@@ -2280,7 +2349,7 @@ fn finish_connect(
         );
         if let Some(client) = clients.get_mut(&client_id) {
             for pkt in to_send {
-                let _ = client.transport.write_all(&pkt);
+                let _ = client.try_write(&pkt);
             }
         }
     }
@@ -2360,37 +2429,53 @@ fn poll_mqtt_clients(
     pending_inbound_writes: &mut Vec<inbound_map::PendingInboundWrite>,
 ) {
     let mut to_remove = Vec::new();
+    let max_inbound_buf = crate::get_max_client_buffer_bytes_guc();
 
     for (client_id, client) in clients.iter_mut() {
-        // Try to read data
-        let mut tmp = [0u8; MAX_REQUEST_BYTES];
-        match client.transport.read(&mut tmp) {
-            Ok(0) => {
-                log!("pgmqtt mqtt: client '{}' disconnected (EOF)", client_id);
-                to_remove.push(client_id.clone());
-                continue;
+        // Flush any bytes buffered from the previous tick before reading.
+        if !client.flush_write_buf() {
+            to_remove.push(client_id.clone());
+            continue;
+        }
+
+        // Drain-loop read: pull all available bytes from the socket in 64 KiB
+        // chunks until WouldBlock, bounded by max_client_buffer_bytes (P-2).
+        // When the cap is reached we stop reading; excess data stays in the
+        // kernel TCP buffer and is consumed on the next tick.
+        let mut skip_processing = false;
+        loop {
+            // Stop reading if we've accumulated enough for this tick.
+            if client.buf.len() >= max_inbound_buf {
+                break;
             }
-            Ok(n) => {
-                if client.buf.len() + n > MAX_REQUEST_BYTES {
-                    log!("pgmqtt mqtt: client '{}' exceeded max buffer size ({} bytes). Disconnecting.", client_id, MAX_REQUEST_BYTES);
-                    let _ = client.transport.write_all(&mqtt::build_disconnect(
-                        mqtt::reason::MALFORMED_PACKET,
-                        client.v5(),
-                    ));
+            let mut tmp = [0u8; MAX_REQUEST_BYTES];
+            match client.transport.read(&mut tmp) {
+                Ok(0) => {
+                    // EOF: client closed the connection. Mark for removal but
+                    // still process any packets already buffered — the FIN
+                    // arrives after the last data segment.
+                    log!("pgmqtt mqtt: client '{}' disconnected (EOF)", client_id);
                     to_remove.push(client_id.clone());
-                    continue;
+                    break;
                 }
-                client.buf.extend_from_slice(&tmp[..n]);
-                client.last_received_at = std::time::Instant::now();
+                Ok(n) => {
+                    client.buf.extend_from_slice(&tmp[..n]);
+                    client.last_received_at = std::time::Instant::now();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break; // No more data available this tick
+                }
+                Err(e) => {
+                    // Read error: data may be corrupt, skip packet processing.
+                    log!("pgmqtt mqtt: read error from '{}': {}", client_id, e);
+                    to_remove.push(client_id.clone());
+                    skip_processing = true;
+                    break;
+                }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available, continue
-            }
-            Err(e) => {
-                log!("pgmqtt mqtt: read error from '{}': {}", client_id, e);
-                to_remove.push(client_id.clone());
-                continue;
-            }
+        }
+        if skip_processing {
+            continue;
         }
 
         // Process all complete packets in the buffer
@@ -2548,12 +2633,14 @@ fn publish_messages_batch(
                         }
                     }
 
-                    log!(
-                        "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                        p.log_sender,
-                        p.topic,
-                        p.qos
-                    );
+                    if crate::get_debug_log_guc() {
+                        log!(
+                            "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
+                            p.log_sender,
+                            p.topic,
+                            p.qos
+                        );
+                    }
                     to_publish.push(MqttMessage {
                         id: msg_id_opt,
                         topic: p.topic.clone(),
@@ -2632,12 +2719,14 @@ fn handle_mqtt_packet(
             crate::metrics::inc(&crate::metrics::get().pubacks_received);
             let res = client.session.inflight.remove(&packet_id);
             if let Some((_, _, msg_id, _)) = res {
-                log!(
-                    "pgmqtt mqtt: '{}' acked packet_id={} (msg_id={:?})",
-                    client_id,
-                    packet_id,
-                    msg_id
-                );
+                if crate::get_debug_log_guc() {
+                    log!(
+                        "pgmqtt mqtt: '{}' acked packet_id={} (msg_id={:?})",
+                        client_id,
+                        packet_id,
+                        msg_id
+                    );
+                }
                 if let Some(id) = msg_id {
                     session_db_actions.push(SessionDbAction::DeleteMessage {
                         client_id: client_id.clone(),
@@ -3169,11 +3258,13 @@ fn deliver_messages(
                 if delivery_qos == 1 {
                     if session.inflight.len() >= inflight_limit {
                         if session.queue.len() >= MAX_QUEUE_SIZE {
-                            pgrx::log!(
-                                "pgmqtt: client '{}' queue hit hard limit ({} messages). Disconnecting.",
-                                sub_id,
-                                MAX_QUEUE_SIZE,
-                            );
+                            if crate::get_debug_log_guc() {
+                                pgrx::log!(
+                                    "pgmqtt: client '{}' queue hit hard limit ({} messages). Disconnecting.",
+                                    sub_id,
+                                    MAX_QUEUE_SIZE,
+                                );
+                            }
                             crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                             to_remove.push(sub_id.clone());
                             continue;
@@ -3222,10 +3313,17 @@ fn deliver_messages(
                             false,
                             client.v5(),
                         );
-                        if client.transport.write_all(&pkt).is_err() {
+                        if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                            pgrx::log!(
+                                "pgmqtt: client '{}' write buffer full (QoS 1). Disconnecting.",
+                                sub_id
+                            );
                             to_remove.push(sub_id.clone());
                         } else {
-                            client.record_msg_sent(msg.payload.len());
+                            match client.try_write(&pkt) {
+                                Ok(()) => client.record_msg_sent(msg.payload.len()),
+                                Err(()) => { to_remove.push(sub_id.clone()); }
+                            }
                         }
                     }
                 } else {
@@ -3238,10 +3336,14 @@ fn deliver_messages(
                         false,
                         client.v5(),
                     );
-                    if client.transport.write_all(&pkt).is_err() {
-                        to_remove.push(sub_id.clone());
+                    if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                        // QoS 0 is at-most-once: drop rather than disconnect.
+                        crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                     } else {
-                        client.record_msg_sent(msg.payload.len());
+                        match client.try_write(&pkt) {
+                            Ok(()) => client.record_msg_sent(msg.payload.len()),
+                            Err(()) => { to_remove.push(sub_id.clone()); }
+                        }
                     }
                 }
             } else {
@@ -3306,7 +3408,7 @@ fn redeliver_unacked_messages(
         if let Some(client) = clients.get_mut(&cid) {
             log!("pgmqtt mqtt: redelivering packet_id={} to '{}'", pid, cid);
             let pkt = mqtt::build_publish(&topic, &payload, 1, Some(pid), true, false, client.v5());
-            if client.transport.write_all(&pkt).is_err() {
+            if client.try_write(&pkt).is_err() {
                 to_remove.push(cid);
             }
         }
