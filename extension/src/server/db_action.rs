@@ -116,13 +116,7 @@ pub enum SessionDbAction {
 /// next poll loop). This guarantees at-least-once semantics.
 ///
 /// Hot-path queries use session-level prepared statements created by
-/// `crate::statements::prepare_hot_path_statements()` at BGW startup (P-7).
-/// These skip parse + plan phases entirely since plans persist for the
-/// BGW process lifetime.
-///
-/// **P-9:** When `pgmqtt.async_session_writes` is enabled, `SET LOCAL
-/// synchronous_commit = off` is issued at the start of the transaction to
-/// eliminate per-commit fdatasync on session-tracking writes.
+/// `crate::statements::prepare_hot_path_statements()` at BGW startup.
 pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     if actions.is_empty() {
         return;
@@ -131,15 +125,6 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
             let m = crate::metrics::get();
-
-            // P-9: opt-in async WAL commit for session-tracking writes.
-            if crate::get_async_session_writes_guc() {
-                let _ = client.update(
-                    "SET LOCAL synchronous_commit = off",
-                    None,
-                    &[],
-                );
-            }
 
             for action in actions {
                 match action {

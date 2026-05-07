@@ -1086,7 +1086,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     db_load_sessions_on_startup();
     load_inbound_mappings();
 
-    // Prepare session-lifetime hot-path SQL plans (P-7).
+    // Prepare session-lifetime hot-path SQL plans.
     BackgroundWorker::transaction(|| {
         crate::statements::prepare_hot_path_statements();
     });
@@ -2438,7 +2438,7 @@ fn poll_mqtt_clients(
         }
 
         // Drain-loop read: pull all available bytes from the socket in 64 KiB
-        // chunks until WouldBlock, bounded by max_client_buffer_bytes (P-2).
+        // chunks until WouldBlock, bounded by max_client_buffer_bytes.
         // When the cap is reached we stop reading; excess data stays in the
         // kernel TCP buffer and is consumed on the next tick.
         let mut skip_processing = false;
