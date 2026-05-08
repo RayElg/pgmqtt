@@ -426,7 +426,7 @@ Each notification payload is a JSON object with all counter values.
 
 ## GUC Reference
 
-See **[configuration.md](configuration.md)** for the full GUC reference, including the performance-tuning settings (`tick_interval_ms`, `cdc_every_n_ticks`, `async_session_writes`, `max_client_buffer_bytes`, `debug_log`) added in recent releases.
+See **[configuration.md](configuration.md)** for the full GUC reference, including the performance-tuning settings (`tick_interval_ms`, `cdc_every_n_ticks`, `max_client_buffer_bytes`, `debug_log`) added in recent releases.
 
 ---
 

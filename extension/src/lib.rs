@@ -75,10 +75,11 @@ static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// BGW poll interval in milliseconds. Lower values reduce pub/sub latency at
 /// the cost of more frequent (but cheap) wakeups.  Default 5 ms.
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
-/// Hard cap on each client's accumulated inbound byte buffer between ticks.
-/// Publishers that produce faster than this can be consumed per tick are
-/// disconnected.  Default 262144 (256 KiB).
-static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(262144);
+/// Per-client socket buffer cap in bytes.  Applied in both directions:
+/// inbound (stop reading a publisher once this many bytes are buffered) and
+/// outbound (disconnect a QoS-1 subscriber / drop a QoS-0 message once the
+/// write buffer reaches this size).  Default 262144 (256 KiB).
+static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1048576);
 /// Run cdc_tick every N ticks (1 = every tick, 16 ≈ 80 ms at 5 ms tick).
 /// Default 1 preserves original behaviour; raise to reduce CDC overhead when
 /// CDC replication latency requirements are relaxed.
@@ -1197,7 +1198,7 @@ pub unsafe extern "C" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"pgmqtt.max_client_buffer_bytes",
-        c"Hard cap on each client's accumulated inbound buffer in bytes (65536-16777216, default 262144)",
+        c"Per-client socket buffer cap in bytes, applied to both inbound reads and outbound writes (65536-16777216, default 262144)",
         c"",
         &MAX_CLIENT_BUFFER_BYTES,
         65536,
