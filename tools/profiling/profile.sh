@@ -7,7 +7,7 @@
 #      up inside a docker container).
 #   2. Starts a user-supplied workload command in the background.
 #   3. Records samples for `--duration` seconds.  On-CPU samples come from
-#      `perf record`; off-CPU samples come from a `bpftrace` script attached
+#      `perf record`; off-CPU samples come from bpftrace (offcpu.bt) attached
 #      to `sched_switch`.  Both can run simultaneously against the same PID.
 #   4. Waits for the workload, then renders one flamegraph per profiler.
 #
@@ -36,13 +36,11 @@
 #   --flamegraph-dir <p>   Path to brendangregg/FlameGraph clone.
 #                          Default: <script>/FlameGraph.
 #   --symfs <path>         --symfs argument passed to `perf script`.  Use
-#                          this when binaries live in a container or chroot;
-#                          mirror the in-container paths under this directory.
+#                          this when binaries live in a container or chroot.
 #                          When --container is set and --symfs is not, the
 #                          script auto-builds a symfs at <out-dir>/symfs by
-#                          copying the target process's mapped binaries
-#                          (Postgres + extension shared libraries) out of the
-#                          container.  Pass --no-symfs to disable.
+#                          copying the target process's mapped binaries out of
+#                          the container.  Pass --no-symfs to disable.
 #   --no-symfs             Skip auto-building a symfs.
 #   --title <text>         Flamegraph title.  Default: derived from label.
 #   --warmup <seconds>     Wait this long after starting the workload before
@@ -56,11 +54,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 WORKLOAD=""
 PID=""
@@ -78,8 +76,11 @@ TITLE=""
 WARMUP=2
 BPFTRACE_DOCKER=false
 BPFTRACE_IMAGE="pgmqtt-profiler:latest"
+
+# Set by record_* functions; referenced by cleanup and wait_for_profilers.
+PERF_PID=""
+BPFTRACE_PID=""
 BT_CONTAINER=""
-BT_SCRIPT=""
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -92,67 +93,70 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --workload)         WORKLOAD="$2"; shift 2 ;;
-        --pid)              PID="$2"; shift 2 ;;
-        --pid-pattern)      PID_PATTERN="$2"; shift 2 ;;
-        --container)        CONTAINER="$2"; shift 2 ;;
-        --mode)             MODE="$2"; shift 2 ;;
-        --duration)         DURATION="$2"; shift 2 ;;
-        --frequency)        FREQUENCY="$2"; shift 2 ;;
-        --label)            LABEL="$2"; shift 2 ;;
-        --out-dir)          OUT_DIR="$2"; shift 2 ;;
-        --flamegraph-dir)   FG_DIR="$2"; shift 2 ;;
-        --symfs)            SYMFS="$2"; shift 2 ;;
-        --no-symfs)         NO_SYMFS=true; shift ;;
-        --title)            TITLE="$2"; shift 2 ;;
-        --warmup)           WARMUP="$2"; shift 2 ;;
-        --bpftrace-docker)  BPFTRACE_DOCKER=true; shift ;;
+        --workload)         WORKLOAD="$2";       shift 2 ;;
+        --pid)              PID="$2";            shift 2 ;;
+        --pid-pattern)      PID_PATTERN="$2";    shift 2 ;;
+        --container)        CONTAINER="$2";      shift 2 ;;
+        --mode)             MODE="$2";           shift 2 ;;
+        --duration)         DURATION="$2";       shift 2 ;;
+        --frequency)        FREQUENCY="$2";      shift 2 ;;
+        --label)            LABEL="$2";          shift 2 ;;
+        --out-dir)          OUT_DIR="$2";        shift 2 ;;
+        --flamegraph-dir)   FG_DIR="$2";         shift 2 ;;
+        --symfs)            SYMFS="$2";          shift 2 ;;
+        --no-symfs)         NO_SYMFS=true;       shift   ;;
+        --title)            TITLE="$2";          shift 2 ;;
+        --warmup)           WARMUP="$2";         shift 2 ;;
+        --bpftrace-docker)  BPFTRACE_DOCKER=true; shift  ;;
         --bpftrace-image)   BPFTRACE_IMAGE="$2"; shift 2 ;;
         -h|--help)          usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
 done
 
-if [[ -z "$WORKLOAD" ]]; then
-    echo "error: --workload is required" >&2
-    usage 1
-fi
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+[[ -z "$WORKLOAD" ]] && { echo "error: --workload is required" >&2; usage 1; }
 
 case "$MODE" in
     cpu|offcpu|both) ;;
     *) echo "error: --mode must be cpu, offcpu, or both" >&2; exit 1 ;;
 esac
 
-if [[ -z "$LABEL" ]]; then
-    LABEL="$(date +%Y%m%d-%H%M%S)"
-fi
-
-if [[ -z "$TITLE" ]]; then
-    TITLE="$LABEL"
-fi
+[[ -z "$LABEL" ]] && LABEL="$(date +%Y%m%d-%H%M%S)"
+[[ -z "$TITLE" ]] && TITLE="$LABEL"
 
 if [[ ! -d "$FG_DIR" ]]; then
-    echo "error: FlameGraph directory not found at $FG_DIR" >&2
-    echo "       clone https://github.com/brendangregg/FlameGraph or pass --flamegraph-dir" >&2
-    exit 1
+    if command -v git >/dev/null; then
+        echo "[profile] FlameGraph not found; cloning into $FG_DIR"
+        git clone --depth=1 https://github.com/brendangregg/FlameGraph "$FG_DIR"
+    else
+        echo "error: FlameGraph directory not found at $FG_DIR" >&2
+        echo "       git clone --depth=1 https://github.com/brendangregg/FlameGraph $FG_DIR" >&2
+        exit 1
+    fi
 fi
 
-mkdir -p "$OUT_DIR"
+if [[ "$MODE" == "offcpu" || "$MODE" == "both" ]] && [[ ! -f "$SCRIPT_DIR/offcpu.bt" ]]; then
+    echo "error: $SCRIPT_DIR/offcpu.bt not found" >&2; exit 1
+fi
 
-WANT_CPU=false
-WANT_OFFCPU=false
+WANT_CPU=false; WANT_OFFCPU=false
 [[ "$MODE" == "cpu"    || "$MODE" == "both" ]] && WANT_CPU=true
 [[ "$MODE" == "offcpu" || "$MODE" == "both" ]] && WANT_OFFCPU=true
 
+mkdir -p "$OUT_DIR"
+
 # ---------------------------------------------------------------------------
-# Target resolution
+# PID resolution
 # ---------------------------------------------------------------------------
 
 resolve_pid_from_container() {
     local container="$1" pattern="$2"
     if ! docker ps --format '{{.Names}}' | grep -qx "$container"; then
-        echo "error: container '$container' is not running" >&2
-        return 1
+        echo "error: container '$container' is not running" >&2; return 1
     fi
     local found
     if [[ -n "$pattern" ]]; then
@@ -163,8 +167,7 @@ resolve_pid_from_container() {
             | awk 'NR>1 {print $1; exit}')"
     fi
     if [[ -z "$found" ]]; then
-        echo "error: no process in container '$container' matched '${pattern:-(any)}'" >&2
-        return 1
+        echo "error: no process in container '$container' matched '${pattern:-(any)}'" >&2; return 1
     fi
     echo "$found"
 }
@@ -174,8 +177,7 @@ resolve_pid_from_host() {
     local found
     found="$(pgrep -f "$pattern" | head -1 || true)"
     if [[ -z "$found" ]]; then
-        echo "error: no host process matched '$pattern'" >&2
-        return 1
+        echo "error: no host process matched '$pattern'" >&2; return 1
     fi
     echo "$found"
 }
@@ -186,35 +188,25 @@ if [[ -z "$PID" ]]; then
     elif [[ -n "$PID_PATTERN" ]]; then
         PID="$(resolve_pid_from_host "$PID_PATTERN")"
     else
-        echo "error: provide --pid, --pid-pattern, or --container" >&2
-        usage 1
+        echo "error: provide --pid, --pid-pattern, or --container" >&2; usage 1
     fi
 fi
 
-if [[ ! -d "/proc/$PID" ]]; then
-    echo "error: pid $PID does not exist" >&2
-    exit 1
-fi
+[[ ! -d "/proc/$PID" ]] && { echo "error: pid $PID does not exist" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Symbol mirror (perf only)
 #
-# When the target lives in a container or chroot, `perf script` on the host
-# can't open the in-container binaries to resolve symbols.  We mirror them
-# into a local directory tree at the same paths, then pass that tree to
-# `perf script --symfs`.
-#
-# Generic: we don't assume which binaries the extension uses.  After
-# recording, we extract every file-backed DSO that perf saw and copy each
-# from the container, preserving its in-container path.
+# When the target lives in a container, perf script on the host can't open
+# in-container binaries to resolve symbols.  We mirror them into a local
+# directory tree at the same paths, then pass that tree to perf script
+# --symfs.
 # ---------------------------------------------------------------------------
 
 build_symfs_from_container() {
     local container="$1" perf_data="$2" symfs="$3"
     mkdir -p "$symfs"
 
-    # `perf script` lists the DSO for every sample; dedupe and filter to
-    # absolute file paths (skip anonymous mappings and pseudo-files).
     local paths
     paths="$(perf script -i "$perf_data" 2>/dev/null \
         | grep -oE '\(/[^)]+\)' \
@@ -223,16 +215,14 @@ build_symfs_from_container() {
         | sort -u)"
 
     if [[ -z "$paths" ]]; then
-        echo "warn: no DSOs found in $perf_data; skipping symfs build" >&2
-        return 1
+        echo "warn: no DSOs found in $perf_data; skipping symfs build" >&2; return 1
     fi
 
     local copied=0 skipped=0
     while IFS= read -r path; do
         local target="$symfs$path"
         if [[ -e "$target" ]]; then
-            skipped=$(( skipped + 1 ))
-            continue
+            skipped=$(( skipped + 1 )); continue
         fi
         mkdir -p "$(dirname "$target")"
         if docker cp -L "$container:$path" "$target" 2>/dev/null; then
@@ -246,93 +236,22 @@ build_symfs_from_container() {
 }
 
 # ---------------------------------------------------------------------------
-# Workload + sampling window
+# Recording
 # ---------------------------------------------------------------------------
 
-WORKLOAD_LOG="$OUT_DIR/${LABEL}.workload.log"
-
-echo "[profile] target pid : $PID"
-echo "[profile] mode       : $MODE"
-echo "[profile] duration   : ${DURATION}s (warmup ${WARMUP}s)"
-echo "[profile] workload   : $WORKLOAD"
-echo "[profile] artifacts  : $OUT_DIR (label: $LABEL)"
-echo
-
-bash -c "$WORKLOAD" > "$WORKLOAD_LOG" 2>&1 &
-WORKLOAD_PID=$!
-cleanup() {
-    kill "$WORKLOAD_PID" 2>/dev/null || true
-    [[ -n "${PERF_PID:-}" ]] && kill "$PERF_PID" 2>/dev/null || true
-    if [[ -n "${BT_CONTAINER:-}" ]]; then
-        docker stop "$BT_CONTAINER" 2>/dev/null || true
-    elif [[ -n "${BPFTRACE_PID:-}" ]]; then
-        sudo kill "$BPFTRACE_PID" 2>/dev/null || true
-    fi
-    [[ -n "${BT_SCRIPT:-}" ]] && rm -f "$BT_SCRIPT" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-sleep "$WARMUP"
-
-SAMPLE_DURATION=$(( DURATION - WARMUP ))
-if (( SAMPLE_DURATION < 1 )); then SAMPLE_DURATION=1; fi
-
-PERF_DATA="$OUT_DIR/${LABEL}.cpu.perf.data"
-OFFCPU_RAW="$OUT_DIR/${LABEL}.offcpu.raw"
-
-# ---------------------------------------------------------------------------
-# Recording (concurrent if --mode both)
-# ---------------------------------------------------------------------------
-
-PERF_PID=""
-BPFTRACE_PID=""
-
-if $WANT_CPU; then
+record_cpu() {
     echo "[profile] perf record -F $FREQUENCY -p $PID --call-graph dwarf -- sleep $SAMPLE_DURATION"
     perf record -F "$FREQUENCY" -g --call-graph dwarf,16384 \
         -o "$PERF_DATA" -p "$PID" -- sleep "$SAMPLE_DURATION" \
         > "$OUT_DIR/${LABEL}.cpu.recorder.log" 2>&1 &
     PERF_PID=$!
-fi
-
-if $WANT_OFFCPU; then
-    BT_PROGRAM=$(cat <<'BT'
-tracepoint:sched:sched_switch
-/ args->prev_pid == $1 /
-{
-    @off_kstack[args->prev_pid] = kstack;
-    @off_ustack[args->prev_pid] = ustack;
-    @off_ts[args->prev_pid] = nsecs;
 }
 
-tracepoint:sched:sched_switch
-/ args->next_pid == $1 && @off_ts[args->next_pid] != 0 /
-{
-    $delta_us = (nsecs - @off_ts[args->next_pid]) / 1000;
-    @offcpu[@off_kstack[args->next_pid], @off_ustack[args->next_pid]] = sum($delta_us);
-    delete(@off_kstack[args->next_pid]);
-    delete(@off_ustack[args->next_pid]);
-    delete(@off_ts[args->next_pid]);
-}
-
-END {
-    clear(@off_kstack);
-    clear(@off_ustack);
-    clear(@off_ts);
-}
-BT
-)
-    # Write BT program to a temp file so it can be mounted into the container
-    # (or passed directly when using the host bpftrace path).
-    BT_SCRIPT="$(mktemp "${OUT_DIR}/.bt_XXXXXX.bt")"
-    printf '%s\n' "$BT_PROGRAM" > "$BT_SCRIPT"
-
+record_offcpu() {
     echo "[profile] bpftrace off-CPU for pid $PID over ${SAMPLE_DURATION}s"
-
     if $BPFTRACE_DOCKER; then
         if ! command -v docker >/dev/null; then
-            echo "error: docker not found in PATH (required for --bpftrace-docker)" >&2
-            exit 1
+            echo "error: docker not found in PATH (required for --bpftrace-docker)" >&2; exit 1
         fi
         BT_CONTAINER="profile_bpftrace_$$"
         echo "[profile] bpftrace via docker image=$BPFTRACE_IMAGE container=$BT_CONTAINER"
@@ -343,25 +262,33 @@ BT
             -v /sys/kernel/debug:/sys/kernel/debug:rw \
             -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
             -v /sys/fs/bpf:/sys/fs/bpf:rw \
-            -v "${BT_SCRIPT}:${BT_SCRIPT}:ro" \
+            -v "$SCRIPT_DIR/offcpu.bt:/offcpu.bt:ro" \
             "$BPFTRACE_IMAGE" \
-            /bin/bash -c "timeout ${SAMPLE_DURATION}s bpftrace -p ${PID} ${BT_SCRIPT} ${PID}" \
+            /bin/bash -c "timeout ${SAMPLE_DURATION}s bpftrace -p ${PID} /offcpu.bt ${PID}" \
             > "$OFFCPU_RAW" 2>&1 &
         BPFTRACE_PID=$!
     else
         if ! command -v bpftrace >/dev/null; then
-            echo "error: bpftrace not found in PATH; use --bpftrace-docker for container-based tracing" >&2
-            exit 1
+            echo "error: bpftrace not found in PATH; use --bpftrace-docker for container-based tracing" >&2; exit 1
         fi
         sudo timeout "${SAMPLE_DURATION}s" bpftrace -p "$PID" \
-            -e "$BT_PROGRAM" "$PID" > "$OFFCPU_RAW" 2>&1 &
+            "$SCRIPT_DIR/offcpu.bt" "$PID" > "$OFFCPU_RAW" 2>&1 &
         BPFTRACE_PID=$!
     fi
-fi
+}
 
-[[ -n "$PERF_PID"     ]] && wait "$PERF_PID"     || true
-[[ -n "$BPFTRACE_PID" ]] && wait "$BPFTRACE_PID" || true
-[[ -f "$OFFCPU_RAW"   ]] && sudo chown "$USER:$USER" "$OFFCPU_RAW" 2>/dev/null || true
+wait_for_profilers() {
+    if [[ -n "$PERF_PID" ]]; then
+        wait "$PERF_PID" \
+            || echo "[profile] warn: perf exited non-zero; check ${OUT_DIR}/${LABEL}.cpu.recorder.log" >&2
+    fi
+    if [[ -n "$BPFTRACE_PID" ]]; then
+        wait "$BPFTRACE_PID" || true  # timeout kills bpftrace; non-zero exit is expected
+        if ! grep -q "@offcpu" "$OFFCPU_RAW" 2>/dev/null; then
+            echo "[profile] warn: bpftrace produced no @offcpu output; check $OFFCPU_RAW" >&2
+        fi
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Rendering
@@ -371,11 +298,6 @@ render_cpu() {
     local script_file="$OUT_DIR/${LABEL}.cpu.script"
     local folded="$OUT_DIR/${LABEL}.cpu.folded"
     local svg="$OUT_DIR/${LABEL}.cpu.svg"
-
-    if ! $NO_SYMFS && [[ -z "$SYMFS" && -n "$CONTAINER" ]]; then
-        SYMFS="$OUT_DIR/symfs"
-        build_symfs_from_container "$CONTAINER" "$PERF_DATA" "$SYMFS" || SYMFS=""
-    fi
 
     local script_args=(-i "$PERF_DATA")
     [[ -n "$SYMFS" ]] && script_args+=(--symfs="$SYMFS")
@@ -393,104 +315,16 @@ render_cpu() {
 
 render_offcpu() {
     local folded="$OUT_DIR/${LABEL}.offcpu.folded"
-    local folded_by_reason="$OUT_DIR/${LABEL}.offcpu.by-reason.folded"
     local reason_summary="$OUT_DIR/${LABEL}.offcpu.by-reason.txt"
     local svg="$OUT_DIR/${LABEL}.offcpu.svg"
-    local svg_by_reason="$OUT_DIR/${LABEL}.offcpu.by-reason.svg"
 
-    python3 - "$OFFCPU_RAW" "$folded" "$folded_by_reason" "$reason_summary" <<'PY'
-import re, sys
-from collections import defaultdict
-
-raw_path, folded_path, by_reason_path, summary_path = sys.argv[1:5]
-
-# Each off-CPU span is classified by a pattern in its kernel stack.  The
-# kernel stack at de-schedule time always ends in `schedule` / `__schedule`;
-# the function above that identifies the blocking primitive that called it.
-# Patterns are checked in order — first match wins, so put more specific
-# patterns first.
-REASON_RULES = [
-    ("[fsync]",    ("ext4_sync_file", "vfs_fsync_range", "do_fsync", "__do_fsync")),
-    ("[disk-io]",  ("io_schedule", "submit_bio_wait", "wait_on_buffer", "folio_wait_bit")),
-    ("[epoll]",    ("do_epoll_wait", "ep_poll", "do_sys_poll", "do_select")),
-    ("[net-recv]", ("sk_wait_data", "tcp_recvmsg", "unix_stream_read_generic",
-                    "skb_wait_for_more_packets", "wait_for_packet")),
-    ("[net-send]", ("sk_stream_wait_memory", "wait_for_tcp_memory")),
-    ("[futex]",    ("futex_wait", "do_futex")),
-    ("[sleep]",    ("do_nanosleep", "hrtimer_nanosleep", "schedule_hrtimeout",
-                    "schedule_timeout")),
-    ("[pipe]",     ("pipe_read", "pipe_wait")),
-    ("[signal]",   ("do_signal_stop", "do_wait")),
-]
-
-def classify(kframes):
-    blob = " ".join(kframes)
-    for label, needles in REASON_RULES:
-        if any(n in blob for n in needles):
-            return label
-    return "[other]"
-
-def frames(raw):
-    out = []
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        out.append(re.sub(r"\+0x[0-9a-f]+$", "", s))
-    return out
-
-with open(raw_path) as f:
-    text = f.read()
-
-# bpftrace prints `@offcpu[<kstack>, <ustack>]: <microseconds>`.
-pat = re.compile(r"@offcpu\[\s*(.*?)\]:\s*(\d+)", re.DOTALL)
-
-flat   = defaultdict(int)
-tagged = defaultdict(int)
-totals = defaultdict(int)
-
-for body, val in ((m.group(1), int(m.group(2))) for m in pat.finditer(text)):
-    parts = body.split(",", 1)
-    k_raw, u_raw = (parts + [""])[:2] if len(parts) == 1 else parts
-    kframes = frames(k_raw)
-    uframes = frames(u_raw)
-    if not (kframes or uframes):
-        continue
-
-    # Caller-first order; user stack first, kernel stack on top.
-    stack = list(reversed(uframes)) + list(reversed(kframes))
-    flat[";".join(stack)] += val
-
-    reason = classify(kframes)
-    totals[reason] += val
-    tagged[f"{reason};" + ";".join(stack)] += val
-
-with open(folded_path, "w") as f:
-    for k, v in sorted(flat.items(), key=lambda kv: -kv[1]):
-        f.write(f"{k} {v}\n")
-
-with open(by_reason_path, "w") as f:
-    for k, v in sorted(tagged.items(), key=lambda kv: -kv[1]):
-        f.write(f"{k} {v}\n")
-
-total_us = sum(totals.values()) or 1
-with open(summary_path, "w") as f:
-    for reason, us in sorted(totals.items(), key=lambda kv: -kv[1]):
-        pct = 100.0 * us / total_us
-        f.write(f"  {reason:<12}  {us:>14d} us  {pct:5.1f}%\n")
-PY
+    python3 "$SCRIPT_DIR/offcpu_fold.py" \
+        "$OFFCPU_RAW" "$folded" "$reason_summary"
 
     "$FG_DIR/flamegraph.pl" \
-        --colors=io \
-        --countname=us \
+        --colors=io --countname=us \
         --title "$TITLE (off-CPU)" \
         "$folded" > "$svg"
-
-    "$FG_DIR/flamegraph.pl" \
-        --colors=io \
-        --countname=us \
-        --title "$TITLE (off-CPU by reason)" \
-        "$folded_by_reason" > "$svg_by_reason"
 
     echo
     echo "[profile] off-CPU time by reason:"
@@ -500,17 +334,59 @@ PY
     head -10 "$folded" \
         | awk '{n=$NF; $NF=""; printf "  %10d us  %s\n", n, $0}' || true
     echo "  → $svg"
-    echo "  → $svg_by_reason"
 }
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+WORKLOAD_LOG="$OUT_DIR/${LABEL}.workload.log"
+PERF_DATA="$OUT_DIR/${LABEL}.cpu.perf.data"
+OFFCPU_RAW="$OUT_DIR/${LABEL}.offcpu.raw"
+
+echo "[profile] target pid : $PID"
+echo "[profile] mode       : $MODE"
+echo "[profile] duration   : ${DURATION}s (warmup ${WARMUP}s)"
+echo "[profile] workload   : $WORKLOAD"
+echo "[profile] artifacts  : $OUT_DIR (label: $LABEL)"
+echo
+
+cleanup() {
+    kill "$WORKLOAD_PID" 2>/dev/null || true
+    [[ -n "${PERF_PID:-}"      ]] && kill "$PERF_PID" 2>/dev/null || true
+    if [[ -n "${BT_CONTAINER:-}" ]]; then
+        docker stop "$BT_CONTAINER" 2>/dev/null || true
+    elif [[ -n "${BPFTRACE_PID:-}" ]]; then
+        sudo kill "$BPFTRACE_PID" 2>/dev/null || true
+    fi
+}
+
+bash -c "$WORKLOAD" > "$WORKLOAD_LOG" 2>&1 &
+WORKLOAD_PID=$!
+trap cleanup EXIT
+sleep "$WARMUP"
+
+SAMPLE_DURATION=$(( DURATION - WARMUP ))
+if (( SAMPLE_DURATION < 1 )); then SAMPLE_DURATION=1; fi
+
+$WANT_CPU    && record_cpu
+$WANT_OFFCPU && record_offcpu
+
+wait_for_profilers
+
+if $WANT_CPU && ! $NO_SYMFS && [[ -z "$SYMFS" && -n "$CONTAINER" ]]; then
+    SYMFS="$OUT_DIR/symfs"
+    build_symfs_from_container "$CONTAINER" "$PERF_DATA" "$SYMFS" || SYMFS=""
+fi
 
 $WANT_CPU    && render_cpu
 $WANT_OFFCPU && render_offcpu
 
-# ---------------------------------------------------------------------------
-# Wait for workload, surface its tail
-# ---------------------------------------------------------------------------
-
+( sleep 30 && kill "$WORKLOAD_PID" 2>/dev/null \
+    && echo "[profile] warn: workload did not finish within 30s of profiling; killed" >&2 ) &
+WATCHDOG_PID=$!
 wait "$WORKLOAD_PID" 2>/dev/null || true
+kill "$WATCHDOG_PID" 2>/dev/null || true
 trap - EXIT
 
 echo
