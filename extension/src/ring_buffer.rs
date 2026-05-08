@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 /// Maximum number of events the ring buffer will hold before dropping the oldest.
 const DEFAULT_CAPACITY: usize = 8192;
@@ -89,5 +89,51 @@ pub fn drain() -> Vec<RingEvent> {
     let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
     ensure_init(&mut lock);
     lock.as_mut().unwrap().drain()
+}
+
+// ── Mapped-table fast-path filter ────────────────────────────────────────────
+//
+// Tracks which (schema, table) pairs have active topic mappings.  The output
+// plugin checks this set in `pg_decode_change` before calling `extract_columns`
+// so that WAL records for unmapped tables are silently consumed without any
+// tuple deserialization cost.
+//
+// Updated by `cdc_tick`:
+//   - on startup, seeded from the slot-checkpoint mapping load
+//   - on each MappingUpdate DELETE / INSERT / UPDATE event from the ring buffer
+
+static MAPPED_TABLES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+fn mapped_tables() -> &'static Mutex<HashSet<(String, String)>> {
+    MAPPED_TABLES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Replace the entire mapped-table set (called once at BGW startup).
+pub fn mapped_tables_init(tables: impl IntoIterator<Item = (String, String)>) {
+    *mapped_tables().lock().expect("mapped_tables: poisoned") = tables.into_iter().collect();
+}
+
+/// Add or refresh a single (schema, table) entry.
+pub fn mapped_table_add(schema: &str, table: &str) {
+    mapped_tables()
+        .lock()
+        .expect("mapped_tables: poisoned")
+        .insert((schema.to_string(), table.to_string()));
+}
+
+/// Remove a (schema, table) entry.  No-op if it was not present.
+pub fn mapped_table_remove(schema: &str, table: &str) {
+    mapped_tables()
+        .lock()
+        .expect("mapped_tables: poisoned")
+        .remove(&(schema.to_string(), table.to_string()));
+}
+
+/// Returns true if the table has at least one active topic mapping.
+pub fn is_table_mapped(schema: &str, table: &str) -> bool {
+    mapped_tables()
+        .lock()
+        .expect("mapped_tables: poisoned")
+        .contains(&(schema.to_string(), table.to_string()))
 }
 

@@ -375,6 +375,71 @@ def run_cdc(duration, n_workers, n_sub, per_worker_rate):
     )
 
 
+def start_wal_noise(rows_per_sec, stop_evt):
+    """
+    Spawn background threads that INSERT into an unmapped table at `rows_per_sec`
+    total rate.  Simulates a busy-WAL database where non-pgmqtt application
+    tables generate WAL the CDC slot must decode.
+
+    Uses 4 workers each committing batches of 50 rows, paced to hit the target
+    rate.  The table has no topic mapping, so the relation filter should discard
+    these WAL records without calling extract_columns.
+    """
+    BATCH = 50
+    N_WORKERS = 4
+    per_worker_rate = max(1, rows_per_sec // N_WORKERS)
+
+    run_psql("DROP TABLE IF EXISTS loadgen_noise CASCADE;")
+    run_psql(
+        "CREATE TABLE loadgen_noise ("
+        "  id bigserial PRIMARY KEY,"
+        "  worker_id int NOT NULL,"
+        "  val text NOT NULL,"
+        "  ts timestamptz NOT NULL DEFAULT now()"
+        ")"
+    )
+
+    def noise_worker(idx):
+        conn = psycopg2.connect(
+            host=PG_HOST, port=PG_PORT,
+            user=PG_USER, password=PG_PASSWORD, dbname=PG_DB,
+        )
+        conn.autocommit = False
+        seq = 0
+        interval = BATCH / per_worker_rate
+        next_send = time.perf_counter()
+        while not stop_evt.is_set():
+            rows = [(idx, f"noise-{idx}-{seq + j}") for j in range(BATCH)]
+            try:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO loadgen_noise (worker_id, val) VALUES (%s, %s)",
+                        rows,
+                    )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                break
+            seq += BATCH
+            next_send += interval
+            sleep_for = next_send - time.perf_counter()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            elif sleep_for < -1.0:
+                next_send = time.perf_counter()
+        conn.close()
+
+    threads = []
+    for i in range(N_WORKERS):
+        t = threading.Thread(target=noise_worker, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+    return threads
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["qos0", "qos1", "inbound", "cdc"], default="qos0")
@@ -388,21 +453,37 @@ def main():
         default=500,
         help="Per-publisher rate in msg/s.  0 = unthrottled (may trip broker 64 KiB parse-buffer cap).",
     )
+    ap.add_argument(
+        "--wal-noise",
+        type=int,
+        default=0,
+        metavar="ROWS_PER_SEC",
+        help="INSERT rows/sec into an unmapped table to simulate external WAL load. 0 = disabled.",
+    )
     args = ap.parse_args()
 
-    if args.mode in ("qos0", "qos1"):
-        run_qos(
-            args.mode,
-            args.duration,
-            args.publishers,
-            args.subscribers,
-            args.payload_bytes,
-            args.rate_per_pub,
-        )
-    elif args.mode == "inbound":
-        run_inbound(args.duration, args.publishers, args.payload_bytes)
-    elif args.mode == "cdc":
-        run_cdc(args.duration, args.publishers, args.subscribers, args.rate_per_pub)
+    noise_stop = threading.Event()
+    noise_threads = []
+    if args.wal_noise > 0:
+        print(f"[loadgen] wal-noise: {args.wal_noise} rows/sec on unmapped table", flush=True)
+        noise_threads = start_wal_noise(args.wal_noise, noise_stop)
+
+    try:
+        if args.mode in ("qos0", "qos1"):
+            run_qos(
+                args.mode,
+                args.duration,
+                args.publishers,
+                args.subscribers,
+                args.payload_bytes,
+                args.rate_per_pub,
+            )
+        elif args.mode == "inbound":
+            run_inbound(args.duration, args.publishers, args.payload_bytes)
+        elif args.mode == "cdc":
+            run_cdc(args.duration, args.publishers, args.subscribers, args.rate_per_pub)
+    finally:
+        noise_stop.set()
 
 
 if __name__ == "__main__":

@@ -1398,6 +1398,13 @@ unsafe extern "C-unwind" fn pg_decode_change(
         return;
     }
 
+    // Skip tables that have no active topic mapping.  extract_columns is
+    // expensive (full tuple deserialization); silently consuming the record
+    // here lets the slot advance past it without any decode work.
+    if !ring_buffer::is_table_mapped(&schema_name, &rel_name) {
+        return;
+    }
+
     // Extract column data from the tuple (only for user tables).
     let columns = extract_columns(relation, change);
 

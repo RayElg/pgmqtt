@@ -77,6 +77,16 @@ pub fn wal_remove(schema: &str, table: &str, name: &str) {
     }
 }
 
+/// Returns true if any mapping remains for this (schema, table) pair.
+/// Used to guard fast-path filter removal: if multiple mapping_names point at
+/// the same table, removing one should not remove the table from the filter.
+pub fn has_any_mapping(schema: &str, table: &str) -> bool {
+    let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    lock.as_ref()
+        .map(|m| m.iter().any(|e| e.schema == schema && e.table == table))
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Template rendering
 // ---------------------------------------------------------------------------

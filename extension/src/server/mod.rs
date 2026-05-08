@@ -1509,7 +1509,12 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                 Ok::<_, spi::Error>(rows)
             }) {
                 let count = mappings.len();
+                let mapped_set = mappings
+                    .iter()
+                    .map(|m| (m.schema.clone(), m.table.clone()))
+                    .collect::<std::collections::HashSet<_>>();
                 topic_map::set_mappings(mappings);
+                crate::ring_buffer::mapped_tables_init(mapped_set);
                 log!(
                     "pgmqtt: loaded {} topic mappings from slot checkpoint",
                     count
@@ -1604,6 +1609,11 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
 
                             if *op == "DELETE" {
                                 topic_map::wal_remove(&schema, &table, &name);
+                                // Only remove from the fast-path set if no other
+                                // mappings remain for this (schema, table) pair.
+                                if !topic_map::has_any_mapping(&schema, &table) {
+                                    crate::ring_buffer::mapped_table_remove(&schema, &table);
+                                }
                                 let _ = pgrx::spi::Spi::connect_mut(|client| {
                                     client.update(
                                         "DELETE FROM pgmqtt_slot_mappings \
@@ -1627,6 +1637,7 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                     qos,
                                 };
                                 topic_map::wal_upsert(mapping);
+                                crate::ring_buffer::mapped_table_add(&schema, &table);
                                 let tmpl_type = col("template_type");
                                 let _ = pgrx::spi::Spi::connect_mut(|client| {
                                     client.update(
