@@ -10,9 +10,14 @@
 //!   work (the slot previously decoded and immediately discarded every UPDATE
 //!   to these tables).
 //!
-//! `ALTER TABLE … SET UNLOGGED` is idempotent: running it on a table that is
-//! already UNLOGGED is a no-op, so `init_020` can be called on every BGW start
-//! (same pattern as `init_010`).
+//! - `pgmqtt_session_messages` is set to `REPLICA IDENTITY NOTHING`.  This
+//!   table holds transient QoS-1 delivery state; it is never logically
+//!   replicated, and physical streaming replication is unaffected by replica
+//!   identity.  Eliminating the old-tuple image from UPDATE (inflight
+//!   promotion) and DELETE (ACK) WAL records reduces WAL volume and CDC slot
+//!   decode work on write-heavy workloads.
+//!
+//! All DDL here is idempotent and safe to re-run on every BGW start.
 
 use pgrx::spi::Spi;
 
@@ -29,5 +34,9 @@ pub fn init_020() {
     run_ddl(
         "ALTER TABLE pgmqtt_metrics_current SET UNLOGGED",
         "set pgmqtt_metrics_current unlogged",
+    );
+    run_ddl(
+        "ALTER TABLE pgmqtt_session_messages REPLICA IDENTITY NOTHING",
+        "set pgmqtt_session_messages replica identity nothing",
     );
 }
