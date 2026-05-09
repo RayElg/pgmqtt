@@ -1206,6 +1206,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     // regardless of tick rate (pgmqtt.tick_interval_ms).
     let mut last_inbound_reload = std::time::Instant::now();
     let mut last_session_sweep = std::time::Instant::now();
+    let mut last_redeliver_check = std::time::Instant::now();
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
     let mut last_connections_flush = std::time::Instant::now();
@@ -1292,8 +1293,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             }
         }
 
-        // Periodically resend unacked QoS 1 messages
-        redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
+        // Periodically resend unacked QoS 1 messages (5s timeout; checking every 1s is sufficient)
+        if last_redeliver_check.elapsed() >= Duration::from_secs(1) {
+            redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
+            last_redeliver_check = std::time::Instant::now();
+        }
 
         publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
 
