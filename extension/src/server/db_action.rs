@@ -48,14 +48,22 @@ pub fn cleanup_orphaned_message(
     message_id: i64,
 ) -> Result<(), spi::Error> {
     let args: Vec<DatumWithOid> = vec![message_id.into()];
-    client.update(
-        "DELETE FROM pgmqtt_messages \
-         WHERE id = $1 AND retain = false \
-           AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
-           AND NOT EXISTS (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
-        None,
-        &args,
-    )?;
+    let result = match crate::statements::with_plans(|p| {
+        client.update(&p.del_orphan_msg, None, &args)
+    }) {
+        Some(r) => r,
+        None => client.update(
+            "DELETE FROM pgmqtt_messages \
+             WHERE id = $1 AND retain = false \
+               AND NOT EXISTS \
+                 (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
+               AND NOT EXISTS \
+                 (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+            None,
+            &args,
+        ),
+    };
+    result?;
     Ok(())
 }
 
@@ -110,6 +118,9 @@ pub enum SessionDbAction {
 /// Each action is applied in order. If any operation fails, the entire
 /// transaction rolls back (and the same actions will be retried on the
 /// next poll loop). This guarantees at-least-once semantics.
+///
+/// Hot-path queries use session-level prepared statements created by
+/// `crate::statements::prepare_hot_path_statements()` at BGW startup.
 pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     if actions.is_empty() {
         return;
@@ -118,6 +129,7 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
             let m = crate::metrics::get();
+
             for action in actions {
                 match action {
                     SessionDbAction::UpsertSession {
@@ -174,35 +186,31 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         message_id,
                         entries,
                     } => {
-                        // Build multi-row VALUES clause: ($1, $2, ...), ($3, $4, ...), etc.
-                        let mut values_clauses = Vec::new();
-                        let mut args: Vec<DatumWithOid> = vec![message_id.into()];
-                        let mut param_idx = 2;
-
-                        for (client_id, packet_id) in &entries {
+                        for (cid, packet_id) in &entries {
                             let pid_arg = packet_id.map(|p| p as i32);
-                            values_clauses.push(format!(
-                                "($1, ${}, ${}, CASE WHEN ${} IS NULL THEN NULL ELSE now() END)",
-                                param_idx,
-                                param_idx + 1,
-                                param_idx + 1
-                            ));
-                            args.push(client_id.as_str().into());
-                            args.push(pid_arg.into());
-                            param_idx += 2;
-                        }
-
-                        let values_str = values_clauses.join(",");
-                        let query = format!(
-                            "INSERT INTO pgmqtt_session_messages (message_id, client_id, packet_id, sent_at) \
-                             VALUES {} \
-                             ON CONFLICT (client_id, message_id) DO NOTHING",
-                            values_str
-                        );
-
-                        if let Err(e) = client.update(&query, None, &args) {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!("pgmqtt: failed to batch insert messages for message {}: {}", message_id, e);
+                            let args: Vec<DatumWithOid> = vec![
+                                message_id.into(),
+                                cid.as_str().into(),
+                                pid_arg.into(),
+                            ];
+                            let result = match crate::statements::with_plans(|p| {
+                                client.update(&p.ins_sess_msg, None, &args)
+                            }) {
+                                Some(r) => r,
+                                None => client.update(
+                                    "INSERT INTO pgmqtt_session_messages \
+                                     (message_id, client_id, packet_id, sent_at) \
+                                     VALUES ($1, $2, $3, \
+                                       CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
+                                     ON CONFLICT (client_id, message_id) DO NOTHING",
+                                    None,
+                                    &args,
+                                ),
+                            };
+                            if let Err(e) = result {
+                                crate::metrics::inc(&m.db_message_errors);
+                                pgrx::log!("pgmqtt: failed to insert session_message for message {}, client '{}': {}", message_id, cid, e);
+                            }
                         }
                     }
                     SessionDbAction::UpdateMessageInflight {
@@ -215,12 +223,19 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                             client_id.as_str().into(),
                             message_id.into(),
                         ];
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_session_messages SET packet_id = $1, sent_at = now() \
-                             WHERE client_id = $2 AND message_id = $3",
-                            None,
-                            &args,
-                        ) {
+                        let result = match crate::statements::with_plans(|p| {
+                            client.update(&p.upd_inflight, None, &args)
+                        }) {
+                            Some(r) => r,
+                            None => client.update(
+                                "UPDATE pgmqtt_session_messages \
+                                 SET packet_id = $1, sent_at = now() \
+                                 WHERE client_id = $2 AND message_id = $3",
+                                None,
+                                &args,
+                            ),
+                        };
+                        if let Err(e) = result {
                             crate::metrics::inc(&m.db_message_errors);
                             pgrx::log!("pgmqtt: failed to update message {} as inflight for session '{}': {}", message_id, client_id, e);
                         }
@@ -229,13 +244,20 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         client_id,
                         message_id,
                     } => {
-                        let args: Vec<DatumWithOid> =
+                        let del_args: Vec<DatumWithOid> =
                             vec![client_id.as_str().into(), message_id.into()];
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_session_messages WHERE client_id = $1 AND message_id = $2",
-                            None,
-                            &args,
-                        ) {
+                        let result = match crate::statements::with_plans(|p| {
+                            client.update(&p.del_sess_msg, None, &del_args)
+                        }) {
+                            Some(r) => r,
+                            None => client.update(
+                                "DELETE FROM pgmqtt_session_messages \
+                                 WHERE client_id = $1 AND message_id = $2",
+                                None,
+                                &del_args,
+                            ),
+                        };
+                        if let Err(e) = result {
                             crate::metrics::inc(&m.db_message_errors);
                             pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
                         }

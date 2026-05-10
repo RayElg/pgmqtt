@@ -1,0 +1,24 @@
+tracepoint:sched:sched_switch
+/ args->prev_pid == $1 /
+{
+    @off_kstack[args->prev_pid] = kstack;
+    @off_ustack[args->prev_pid] = ustack;
+    @off_ts[args->prev_pid]     = nsecs;
+}
+
+tracepoint:sched:sched_switch
+/ args->next_pid == $1 && @off_ts[args->next_pid] != 0 /
+{
+    $delta_us = (nsecs - @off_ts[args->next_pid]) / 1000;
+    @offcpu[@off_kstack[args->next_pid],
+            @off_ustack[args->next_pid]] = sum($delta_us);
+    delete(@off_kstack[args->next_pid]);
+    delete(@off_ustack[args->next_pid]);
+    delete(@off_ts[args->next_pid]);
+}
+
+END {
+    clear(@off_kstack);
+    clear(@off_ustack);
+    clear(@off_ts);
+}

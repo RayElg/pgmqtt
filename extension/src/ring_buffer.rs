@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Maximum number of events the ring buffer will hold before dropping the oldest.
 const DEFAULT_CAPACITY: usize = 8192;
@@ -89,5 +89,59 @@ pub fn drain() -> Vec<RingEvent> {
     let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
     ensure_init(&mut lock);
     lock.as_mut().unwrap().drain()
+}
+
+// ── Mapped-table fast-path filter ────────────────────────────────────────────
+//
+// Tracks which (schema, table) pairs have active topic mappings.  The output
+// plugin checks this set in `pg_decode_change` before calling `extract_columns`
+// so that WAL records for unmapped tables are silently consumed without any
+// tuple deserialization cost.
+//
+// Updated by `cdc_tick`:
+//   - on startup, seeded from the slot-checkpoint mapping load
+//   - on each MappingUpdate DELETE / INSERT / UPDATE event from the ring buffer
+
+static MAPPED_TABLES: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+
+fn mapped_tables() -> &'static RwLock<HashSet<String>> {
+    MAPPED_TABLES.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+// Keys are stored as "{schema}\0{table}". The null byte is forbidden in
+// PostgreSQL identifiers so it is a safe separator; using a single String per
+// entry halves allocations on the hot-path read compared to (String, String).
+fn make_key(schema: &str, table: &str) -> String {
+    format!("{schema}\0{table}")
+}
+
+/// Replace the entire mapped-table set (called once at BGW startup).
+pub fn mapped_tables_init(tables: impl IntoIterator<Item = (String, String)>) {
+    *mapped_tables().write().expect("mapped_tables: poisoned") =
+        tables.into_iter().map(|(s, t)| make_key(&s, &t)).collect();
+}
+
+/// Add or refresh a single (schema, table) entry.
+pub fn mapped_table_add(schema: &str, table: &str) {
+    mapped_tables()
+        .write()
+        .expect("mapped_tables: poisoned")
+        .insert(make_key(schema, table));
+}
+
+/// Remove a (schema, table) entry.  No-op if it was not present.
+pub fn mapped_table_remove(schema: &str, table: &str) {
+    mapped_tables()
+        .write()
+        .expect("mapped_tables: poisoned")
+        .remove(&make_key(schema, table));
+}
+
+/// Returns true if the table has at least one active topic mapping.
+pub fn is_table_mapped(schema: &str, table: &str) -> bool {
+    mapped_tables()
+        .read()
+        .expect("mapped_tables: poisoned")
+        .contains(&make_key(schema, table))
 }
 

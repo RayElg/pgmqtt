@@ -1,0 +1,9 @@
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    bpftrace \
+    linux-tools-6.8.0-90-generic \
+    linux-tools-common \
+    perl \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT []
