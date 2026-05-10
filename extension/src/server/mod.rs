@@ -2361,10 +2361,20 @@ fn finish_connect(
             client_id,
             to_send.len()
         );
+        let max_buf = crate::get_max_client_buffer_bytes_guc();
+        let mut overflow = false;
         if let Some(client) = clients.get_mut(&client_id) {
             for pkt in to_send {
+                if client.write_buf.len() + pkt.len() > max_buf {
+                    log!("pgmqtt mqtt: client '{}' write buffer full during session resume. Disconnecting.", client_id);
+                    overflow = true;
+                    break;
+                }
                 let _ = client.try_write(&pkt);
             }
+        }
+        if overflow {
+            disconnect_client(&client_id, clients, pending_publishes, session_db_actions);
         }
     }
 }
@@ -3417,12 +3427,16 @@ fn redeliver_unacked_messages(
         }
     }
 
+    let max_buf = crate::get_max_client_buffer_bytes_guc();
     let mut to_remove = Vec::new();
     for (cid, pid, topic, payload) in to_resend {
         if let Some(client) = clients.get_mut(&cid) {
             log!("pgmqtt mqtt: redelivering packet_id={} to '{}'", pid, cid);
             let pkt = mqtt::build_publish(&topic, &payload, 1, Some(pid), true, false, client.v5());
-            if client.try_write(&pkt).is_err() {
+            if client.write_buf.len() + pkt.len() > max_buf {
+                log!("pgmqtt mqtt: client '{}' write buffer full during redelivery. Disconnecting.", cid);
+                to_remove.push(cid);
+            } else if client.try_write(&pkt).is_err() {
                 to_remove.push(cid);
             }
         }

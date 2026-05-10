@@ -595,8 +595,7 @@ def test_inbound_qos0_throughput():
     rows = run_sql("SELECT COUNT(*) FROM perf_inbound;")
     count = rows[0][0] if rows else 0
     _print_result("Inbound QoS 0 (5k)", count, elapsed)
-    # QoS 0 is at-most-once; drops under saturation are spec-compliant.
-    assert count >= NUM_INBOUND * 0.85, f"Only {count}/{NUM_INBOUND} rows written"
+    assert count >= NUM_INBOUND * 0.95, f"Only {count}/{NUM_INBOUND} rows written"
 
 
 @pytest.mark.slow
