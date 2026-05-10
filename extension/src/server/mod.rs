@@ -25,7 +25,6 @@ use std::time::Duration;
 static NEXT_AUTO_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the BGW latch wakes to poll for connections.
-/// Reads the `pgmqtt.tick_interval_ms` GUC at runtime.
 fn latch_interval() -> Duration {
     Duration::from_millis(crate::get_tick_interval_ms_guc() as u64)
 }
@@ -1086,7 +1085,6 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     db_load_sessions_on_startup();
     load_inbound_mappings();
 
-    // Prepare session-lifetime hot-path SQL plans.
     BackgroundWorker::transaction(|| {
         crate::statements::prepare_hot_path_statements();
     });
@@ -1280,7 +1278,6 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
         execute_inbound_writes(pending_inbound_writes);
 
-        // ── CDC: advance slot, drain ring buffer (throttled by GUC) ──
         if tick % crate::get_cdc_every_n_ticks_guc() == 0 {
             let cdc_messages = cdc_tick(slot_name);
             if !cdc_messages.is_empty() {
@@ -1307,7 +1304,6 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // empty, so per-tick overhead is negligible.
         process_inbound_pending();
 
-        // Sweep sessions whose Session Expiry Interval has elapsed (~500 ms)
         if last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
             last_session_sweep = std::time::Instant::now();

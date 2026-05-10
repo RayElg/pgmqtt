@@ -71,22 +71,10 @@ static JWT_PUBLIC_KEY: GucSetting<Option<CString>> =
 static JWT_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-// Performance tuning GUCs
-/// BGW poll interval in milliseconds. Lower values reduce pub/sub latency at
-/// the cost of more frequent (but cheap) wakeups.  Default 5 ms.
+// Performance tuning GUCs (see pgmqtt.tick_interval_ms etc. in _PG_init for help text)
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
-/// Per-client socket buffer cap in bytes.  Applied in both directions:
-/// inbound (stop reading a publisher once this many bytes are buffered) and
-/// outbound (disconnect a QoS-1 subscriber / drop a QoS-0 message once the
-/// write buffer reaches this size).  Default 1048576 (1 MiB).
 static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1048576);
-/// Run cdc_tick every N ticks (1 = every tick, 16 ≈ 80 ms at 5 ms tick).
-/// Default 1 preserves original behaviour; raise to reduce CDC overhead when
-/// CDC replication latency requirements are relaxed.
 static CDC_EVERY_N_TICKS: GucSetting<i32> = GucSetting::<i32>::new(1);
-/// Gate verbose per-message and per-CDC-event log output.  Default false.
-/// When false, hot-path pgrx::log! calls that fire on every PUBLISH/PUBACK/
-/// CDC event are suppressed, eliminating elog(LOG) overhead on those paths.
 static DEBUG_LOG: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Observability GUCs (enterprise: metrics feature)
 /// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.

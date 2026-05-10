@@ -65,7 +65,6 @@ fn set_collate_c(table: &str, column: &str) {
     });
 }
 
-/// Apply v0.2.0 schema changes.
 pub fn init_020() {
     run_ddl(
         "ALTER TABLE pgmqtt_connections_cache SET UNLOGGED",
