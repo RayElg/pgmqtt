@@ -48,8 +48,11 @@ pub fn cleanup_orphaned_message(
     message_id: i64,
 ) -> Result<(), spi::Error> {
     let args: Vec<DatumWithOid> = vec![message_id.into()];
-    let result = crate::statements::with_plans(|p| client.update(&p.del_orphan_msg, None, &args))
-        .unwrap_or_else(|| client.update(
+    let result = match crate::statements::with_plans(|p| {
+        client.update(&p.del_orphan_msg, None, &args)
+    }) {
+        Some(r) => r,
+        None => client.update(
             "DELETE FROM pgmqtt_messages \
              WHERE id = $1 AND retain = false \
                AND NOT EXISTS \
@@ -58,7 +61,8 @@ pub fn cleanup_orphaned_message(
                  (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
             None,
             &args,
-        ));
+        ),
+    };
     result?;
     Ok(())
 }
