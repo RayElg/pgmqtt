@@ -252,7 +252,6 @@ fn skip_properties(buf: &[u8], offset: usize) -> Result<usize> {
     Ok(end)
 }
 
-/// `max_packet_size = None` ⇒ property absent (MQTT-3.1.2.11.4: no limit).
 fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, Option<u32>, usize)> {
     if offset >= buf.len() {
         return Ok((0, 65535, None, offset));
@@ -351,7 +350,12 @@ fn parse_connect_properties(buf: &[u8], offset: usize) -> Result<(u32, u16, Opti
             }
         }
     }
-    Ok((session_expiry_interval, receive_maximum, max_packet_size, props_end))
+    Ok((
+        session_expiry_interval,
+        receive_maximum,
+        max_packet_size,
+        props_end,
+    ))
 }
 
 const EMPTY_PROPERTIES: [u8; 1] = [0x00]; // property length = 0
@@ -512,7 +516,8 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
     let protocol_version = buf[off];
     if protocol_version != 5 && protocol_version != 4 {
         return Err(MqttError::ProtocolError(format!(
-            "unsupported MQTT version {}", protocol_version
+            "unsupported MQTT version {}",
+            protocol_version
         )));
     }
 
@@ -725,13 +730,19 @@ fn parse_disconnect(buf: &[u8], v5: bool) -> Result<(u8, Option<u32>)> {
                 if i + 4 > props_end {
                     break;
                 }
-                session_expiry =
-                    Some(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+                session_expiry = Some(u32::from_be_bytes([
+                    buf[i],
+                    buf[i + 1],
+                    buf[i + 2],
+                    buf[i + 3],
+                ]));
                 i += 4;
             }
             property::REASON_STRING => {
                 // UTF-8, skip
-                if i + 2 > props_end { break; }
+                if i + 2 > props_end {
+                    break;
+                }
                 let len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
                 i += 2 + len;
             }
@@ -765,7 +776,6 @@ pub fn build_connack(session_present: bool, reason_code: u8, v5: bool) -> Vec<u8
     build_connack_with_max_packet(session_present, reason_code, v5, None)
 }
 
-/// CONNACK with optional MQTT-3.2.2.3.5 Maximum Packet Size advertisement.
 pub fn build_connack_with_max_packet(
     session_present: bool,
     reason_code: u8,
@@ -774,7 +784,11 @@ pub fn build_connack_with_max_packet(
 ) -> Vec<u8> {
     let mut vh = Vec::with_capacity(3);
     vh.push(if session_present { 0x01 } else { 0x00 }); // connect ack flags
-    vh.push(if v5 { reason_code } else { v5_to_v3_connack(reason_code) });
+    vh.push(if v5 {
+        reason_code
+    } else {
+        v5_to_v3_connack(reason_code)
+    });
     if v5 {
         match server_max_packet_size {
             Some(n) => {
@@ -829,15 +843,21 @@ pub fn build_publish(
     v5: bool,
 ) -> Vec<u8> {
     let mut flags: u8 = (qos & 0x03) << 1;
-    if dup { flags |= 0x08; }
-    if retain { flags |= 0x01; }
+    if dup {
+        flags |= 0x08;
+    }
+    if retain {
+        flags |= 0x01;
+    }
 
     let mut vh = Vec::new();
     vh.extend_from_slice(&encode_utf8(topic));
     if let Some(pid) = packet_id {
         vh.extend_from_slice(&pid.to_be_bytes());
     }
-    if v5 { vh.extend_from_slice(&EMPTY_PROPERTIES); }
+    if v5 {
+        vh.extend_from_slice(&EMPTY_PROPERTIES);
+    }
     vh.extend_from_slice(payload);
     build_packet(PacketType::Publish, flags, &vh)
 }

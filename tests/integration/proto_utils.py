@@ -398,7 +398,7 @@ def encode_properties(props_dict):
                 res.extend(encode_variable_byte_integer(value))
             elif isinstance(value, str):
                 res.extend(encode_utf8_string(value))
-        elif prop_id in [0x02, 0x11]: # 4-byte integer (Message Expiry, Session Expiry)
+        elif prop_id in [0x02, 0x11, 0x27]: # 4-byte integer (Message Expiry, Session Expiry, Max Packet Size)
              res.extend(struct.pack('!I', value))
         elif prop_id in [0x21, 0x23]: # 2-byte integer (Receive Max, Topic Alias)
              res.extend(struct.pack('!H', value))
@@ -426,7 +426,7 @@ def decode_properties(buffer, offset):
             val, offset = decode_utf8_string(buffer, offset)
             if prop_id not in props: props[prop_id] = []
             props[prop_id].append((key, val))
-        elif prop_id in [0x02, 0x11]: # 4-byte (Message Expiry, Session Expiry)
+        elif prop_id in [0x02, 0x11, 0x27]: # 4-byte (Message Expiry, Session Expiry, Max Packet Size)
             props[prop_id] = struct.unpack_from('!I', buffer, offset)[0]
             offset += 4
         elif prop_id in [0x21, 0x23]: # 2-byte (Receive Max, Topic Alias)

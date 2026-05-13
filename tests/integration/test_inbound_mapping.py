@@ -11,6 +11,7 @@ import time
 from test_utils import run_sql
 from proto_utils import (
     create_connect_packet,
+    create_disconnect_packet,
     create_publish_packet,
     create_subscribe_packet,
     recv_packet,
@@ -639,6 +640,77 @@ def test_status_includes_inbound_mappings():
     assert len(result[0]) == 9, f"Expected 9 columns in pgmqtt_status(), got {len(result[0])}"
     inbound_count = result[0][6]
     assert inbound_count >= 1, f"Expected at least 1 inbound mapping, got {inbound_count}"
+
+
+def test_inbound_drop_table_dead_letters():
+    """Dropping the target table while a QoS 1 message is in pgmqtt_inbound_pending
+    must dead-letter the row and must NOT crash the BGW.
+
+    Scenario:
+      1. Create mapping → publish QoS 1 → PUBACK received (row in pending).
+      2. DROP the target table from a separate connection.
+      3. Wait one processing cycle for the BGW to attempt the write.
+      4. Verify: broker still accepts connections (BGW did not crash).
+      5. Verify: row appears in pgmqtt_dead_letters (not lost, not retried forever).
+    """
+    _cleanup()
+    _setup_test_table()
+
+    run_sql("""
+        SELECT pgmqtt_add_inbound_mapping(
+            'sensor/{site_id}/temperature/{sensor_id}',
+            'test_sensors',
+            '{"site_id": "{site_id}", "sensor_id": "{sensor_id}", "temperature": "$.temperature"}'::jsonb,
+            'insert', NULL, 'public', 'test_insert'
+        )
+    """)
+    time.sleep(TICK_WAIT)
+
+    s = _connect("inbound_drop_table_pub")
+
+    # Count existing dead letters so we can detect the new one.
+    before = run_sql("SELECT count(*) FROM pgmqtt_dead_letters") or [(0,)]
+    dead_before = before[0][0]
+
+    # Publish QoS 1 — PUBACK means the row is in pgmqtt_inbound_pending.
+    _publish_qos1(s, "sensor/site1/temperature/s1", {"temperature": 22.5}, packet_id=1)
+    _recv_puback(s)
+    s.sendall(create_disconnect_packet())
+    s.close()
+
+    # Drop the target table before the BGW processes the pending row.
+    run_sql("DROP TABLE IF EXISTS test_sensors CASCADE")
+
+    # Wait long enough for the BGW to attempt and fail the write.
+    time.sleep(TICK_WAIT)
+
+    # 4. Broker must still accept connections — BGW did not crash.
+    s_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_probe.connect((MQTT_HOST, MQTT_PORT))
+    s_probe.sendall(create_connect_packet("inbound_drop_probe", clean_start=True))
+    raw = recv_packet(s_probe, timeout=5)
+    assert raw is not None, "No CONNACK after potential BGW crash"
+    _, rc, _ = validate_connack(raw)
+    assert rc == 0, f"CONNACK reason_code={rc:#04x} — broker may have restarted"
+    s_probe.sendall(create_disconnect_packet())
+    s_probe.close()
+    print("  ✓ Broker still alive after target table drop")
+
+    # 5. Message must be dead-lettered, not silently lost or stuck in pending.
+    after = run_sql("SELECT count(*) FROM pgmqtt_dead_letters") or [(0,)]
+    dead_after = after[0][0]
+    assert dead_after > dead_before, (
+        f"Expected a new dead-letter entry (before={dead_before}, after={dead_after})"
+    )
+    print(f"  ✓ Message dead-lettered (dead_letters went {dead_before} → {dead_after})")
+
+    pending = run_sql(
+        "SELECT count(*) FROM pgmqtt_inbound_pending WHERE mapping_name = 'test_insert'"
+    ) or [(0,)]
+    assert pending[0][0] == 0, (
+        f"Pending row not cleared — stuck in pgmqtt_inbound_pending"
+    )
+    print("  ✓ pgmqtt_inbound_pending cleared")
 
 
 # ── Cleanup at end ────────────────────────────────────────────────────────────

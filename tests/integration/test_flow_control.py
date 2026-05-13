@@ -347,12 +347,209 @@ def test_resume_caps_redelivery_at_receive_maximum():
     s_clean.close()
 
 
+def test_max_packet_size_inflight_discarded():
+    """MQTT-3.1.2.24-2: inflight entries too large for the client's max_packet_size
+    must be treated as delivered on reconnect — not redelivered, not stuck.
+
+    Scenario:
+      1. Subscriber connects (no max_packet_size limit), receives N large QoS 1
+         messages without ACKing so they sit in inflight.
+      2. TCP close — session persists.
+      3. Subscriber reconnects with max_packet_size smaller than the messages.
+      4. Broker must NOT redeliver those messages (they are discarded per spec).
+      5. DB must be clean — no lingering session_messages rows.
+    """
+    print("\n[Flow Control] Test 4: max_packet_size discards oversized inflight on reconnect")
+    sub_id = "fc_maxpkt_inflight"
+    topic = "test/flow/maxpkt_inflight"
+    PAYLOAD = b"X" * 500   # 500-byte payload → PUBLISH packet ~520 bytes
+    MAX_PKT = 100           # reconnect limit well below the packet size
+    N = 5
+
+    # 1. Connect without max_packet_size limit and subscribe.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet(
+        sub_id, clean_start=True, keep_alive=120,
+        properties={0x11: 300},  # session_expiry=300s
+    ))
+    validate_connack(recv_packet(s))
+    s.sendall(create_subscribe_packet(1, topic, qos=1))
+    validate_suback(recv_packet(s), 1)
+
+    # 2. Publish N large messages and receive (but do NOT PUBACK) them.
+    pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    pub.connect((MQTT_HOST, MQTT_PORT))
+    pub.sendall(create_connect_packet("fc_maxpkt_inflight_pub"))
+    validate_connack(recv_packet(pub))
+    for i in range(N):
+        pub.sendall(create_publish_packet(topic, PAYLOAD, qos=1, packet_id=i + 1))
+        recv_packet(pub)  # PUBACK from broker
+    pub.sendall(create_disconnect_packet())
+    pub.close()
+
+    inflight_pids = drain_all_publish(s, N)
+    assert len(inflight_pids) == N
+    print(f"  ✓ Built {N} unacked inflight entries")
+
+    # 3. Abrupt close — session preserved.
+    s.close()
+    time.sleep(0.3)
+
+    # 4. Reconnect with max_packet_size=100 (< ~520-byte PUBLISH packets).
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((MQTT_HOST, MQTT_PORT))
+    s2.sendall(create_connect_packet(
+        sub_id, clean_start=False, keep_alive=120,
+        properties={0x11: 300, 0x27: MAX_PKT},
+    ))
+    raw = recv_packet(s2, timeout=5)
+    sp, rc, _ = validate_connack(raw)
+    assert rc == 0 and sp, f"Expected session resumption, got rc={rc} sp={sp}"
+
+    # 5. Verify no PUBLISH arrives within a 3-second window.
+    unexpected = []
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        pkt = recv_packet(s2, timeout=0.5)
+        if pkt is None:
+            continue
+        if (pkt[0] & 0xF0) >> 4 == MQTTControlPacket.PUBLISH:
+            unexpected.append(pkt)
+
+    assert len(unexpected) == 0, (
+        f"Expected 0 redeliveries (all oversized, must be discarded per MQTT-3.1.2.24-2), "
+        f"got {len(unexpected)}"
+    )
+    print("  ✓ No oversized messages redelivered")
+
+    # 6. Verify DB is clean — no session_messages rows left for this client.
+    time.sleep(0.5)  # allow DeleteMessage actions to flush
+    rows = run_psql(
+        f"SELECT count(*) FROM pgmqtt_session_messages "
+        f"WHERE client_id = '{sub_id}'"
+    ) or [(0,)]
+    assert rows[0][0] == 0, (
+        f"session_messages not cleaned up: {rows[0][0]} rows remain"
+    )
+    print("  ✓ DB clean — no lingering session_messages")
+
+    s2.sendall(create_disconnect_packet())
+    s2.close()
+    # Wipe session.
+    s3 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s3.connect((MQTT_HOST, MQTT_PORT))
+    s3.sendall(create_connect_packet(sub_id, clean_start=True))
+    recv_packet(s3)
+    s3.sendall(create_disconnect_packet())
+    s3.close()
+
+
+def test_max_packet_size_queue_discarded():
+    """MQTT-3.1.2.24-2: queued messages too large for the client's max_packet_size
+    must be treated as delivered on reconnect — not delivered, not stuck in DB.
+
+    Scenario:
+      1. Subscriber connects with session_expiry, then disconnects cleanly.
+      2. N large QoS 1 messages are published while subscriber is offline
+         (they land in pgmqtt_session_messages with packet_id=NULL).
+      3. Subscriber reconnects with max_packet_size smaller than the messages.
+      4. Broker must NOT deliver those messages; DB rows must be cleaned up.
+    """
+    print("\n[Flow Control] Test 5: max_packet_size discards oversized queued messages on reconnect")
+    sub_id = "fc_maxpkt_queue"
+    topic = "test/flow/maxpkt_queue"
+    PAYLOAD = b"Y" * 500
+    MAX_PKT = 100
+    N = 5
+
+    # 1. Connect, subscribe, then cleanly disconnect (session persists).
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((MQTT_HOST, MQTT_PORT))
+    s.sendall(create_connect_packet(
+        sub_id, clean_start=True, keep_alive=120,
+        properties={0x11: 300},
+    ))
+    validate_connack(recv_packet(s))
+    s.sendall(create_subscribe_packet(1, topic, qos=1))
+    validate_suback(recv_packet(s), 1)
+    s.sendall(create_disconnect_packet())
+    s.close()
+    time.sleep(0.3)
+
+    # 2. Publish while subscriber is offline — messages queue in DB.
+    pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    pub.connect((MQTT_HOST, MQTT_PORT))
+    pub.sendall(create_connect_packet("fc_maxpkt_queue_pub"))
+    validate_connack(recv_packet(pub))
+    for i in range(N):
+        pub.sendall(create_publish_packet(topic, PAYLOAD, qos=1, packet_id=i + 1))
+        recv_packet(pub)  # PUBACK
+    pub.sendall(create_disconnect_packet())
+    pub.close()
+    time.sleep(0.3)
+
+    # Verify messages landed in DB before reconnect.
+    rows = run_psql(
+        f"SELECT count(*) FROM pgmqtt_session_messages WHERE client_id = '{sub_id}'"
+    ) or [(0,)]
+    assert rows[0][0] == N, f"Expected {N} queued rows, got {rows[0][0]}"
+    print(f"  ✓ {N} messages queued in DB while offline")
+
+    # 3. Reconnect with max_packet_size=100.
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((MQTT_HOST, MQTT_PORT))
+    s2.sendall(create_connect_packet(
+        sub_id, clean_start=False, keep_alive=120,
+        properties={0x11: 300, 0x27: MAX_PKT},
+    ))
+    raw = recv_packet(s2, timeout=5)
+    sp, rc, _ = validate_connack(raw)
+    assert rc == 0 and sp, f"Expected session resumption, got rc={rc} sp={sp}"
+
+    # 4. No PUBLISH should arrive.
+    unexpected = []
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        pkt = recv_packet(s2, timeout=0.5)
+        if pkt is None:
+            continue
+        if (pkt[0] & 0xF0) >> 4 == MQTTControlPacket.PUBLISH:
+            unexpected.append(pkt)
+
+    assert len(unexpected) == 0, (
+        f"Expected 0 deliveries (all oversized), got {len(unexpected)}"
+    )
+    print("  ✓ No oversized queued messages delivered")
+
+    # 5. DB clean.
+    time.sleep(0.5)
+    rows = run_psql(
+        f"SELECT count(*) FROM pgmqtt_session_messages WHERE client_id = '{sub_id}'"
+    ) or [(0,)]
+    assert rows[0][0] == 0, (
+        f"session_messages not cleaned up: {rows[0][0]} rows remain"
+    )
+    print("  ✓ DB clean — queued rows removed")
+
+    s2.sendall(create_disconnect_packet())
+    s2.close()
+    s3 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s3.connect((MQTT_HOST, MQTT_PORT))
+    s3.sendall(create_connect_packet(sub_id, clean_start=True))
+    recv_packet(s3)
+    s3.sendall(create_disconnect_packet())
+    s3.close()
+
+
 if __name__ == "__main__":
     failures = []
     tests = [
         test_flow_control_queues_not_drops,
         test_fast_ack_receives_all,
         test_resume_caps_redelivery_at_receive_maximum,
+        test_max_packet_size_inflight_discarded,
+        test_max_packet_size_queue_discarded,
     ]
     for t in tests:
         try:
