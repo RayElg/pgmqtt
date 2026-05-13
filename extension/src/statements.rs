@@ -61,11 +61,13 @@ pub fn prepare_hot_path_statements() {
         let del_orphan_msg = client
             .prepare_mut(
                 "DELETE FROM pgmqtt_messages \
-                 WHERE id = $1 AND retain = false \
+                 WHERE id = $1 \
                    AND NOT EXISTS \
                      (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
                    AND NOT EXISTS \
-                     (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+                     (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1) \
+                   AND NOT EXISTS \
+                     (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
                 &[PgOid::from_untagged(pgrx::pg_sys::INT8OID)],
             )?
             .keep();

@@ -304,8 +304,8 @@ where
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Maximum number of subscriptions allowed per client.
-const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 100;
+/// Max subscriptions per client. 100 was too low for IoT fleet clients.
+const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 1000;
 
 /// Parse a topic filter that may be a shared subscription.
 ///
@@ -347,7 +347,7 @@ pub fn subscribe(client_id: &str, topic_filter: &str, requested_qos: u8) -> u8 {
                 client_id,
                 MAX_SUBSCRIPTIONS_PER_CLIENT
             );
-            return crate::mqtt::reason::UNSPECIFIED_ERROR;
+            return crate::mqtt::reason::QUOTA_EXCEEDED;
         }
 
         filters.insert(topic_filter.to_string());

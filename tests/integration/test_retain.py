@@ -3,6 +3,8 @@ MQTT 5.0 Retained Message Tests.
 """
 
 import socket
+import subprocess
+import time
 
 from proto_utils import (
     create_connect_packet,
@@ -236,3 +238,120 @@ def test_retained_qos1_puback_accepted():
     recv_packet(s)
     s.sendall(create_publish_packet(topic, b"", qos=0, retain=True))
     s.close()
+
+
+def _restart_broker():
+    subprocess.run(["docker", "compose", "restart", "postgres"], check=True)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect((MQTT_HOST, MQTT_PORT))
+            s.close()
+            time.sleep(2)
+            return
+        except (socket.timeout, ConnectionRefusedError):
+            time.sleep(1)
+    raise Exception("Broker failed to restart within 30 seconds.")
+
+
+def test_retained_clear_durable_across_restart():
+    """QoS 1 retained-clear is persisted to subscriber sessions, surviving a broker restart.
+
+    Regression test for the empty-payload retained-clear durability fix.
+    Per MQTT-3.3.1-6 the clear PUBLISH is forwarded to current subscribers as
+    a normal QoS 1 PUBLISH (RETAIN=0).  A persistent-session subscriber that
+    is offline when the clear fires must receive the empty PUBLISH on resume,
+    even after a broker restart — otherwise the clear notification is lost
+    and the client never learns the topic is no longer retained.
+    """
+    topic = "test/retain/clear_durable"
+    sub_id = "retain_clear_durable_sub"
+
+    # Wipe any leftover session state from prior runs.  Note: in this codebase
+    # the pgmqtt_session_messages → pgmqtt_sessions FK is missing on schemas
+    # created before the FK was added to init010.rs, so a clean_start reconnect
+    # leaves orphaned session_messages rows.  Delete both tables directly to
+    # guarantee a clean slate regardless of FK presence.
+    from proto_utils import run_psql
+    run_psql(f"DELETE FROM pgmqtt_session_messages WHERE client_id = '{sub_id}';")
+    run_psql(f"DELETE FROM pgmqtt_sessions WHERE client_id = '{sub_id}';")
+    # Also clear any leftover retained on this topic.
+    s_wipe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_wipe.connect((MQTT_HOST, MQTT_PORT))
+    s_wipe.sendall(create_connect_packet("retain_clear_durable_wipe"))
+    validate_connack(recv_packet(s_wipe))
+    s_wipe.sendall(create_publish_packet(topic, b"", qos=1, packet_id=1, retain=True))
+    recv_packet(s_wipe)
+    s_wipe.sendall(create_disconnect_packet())
+    s_wipe.close()
+    time.sleep(0.5)
+
+    # Pre-set the retained value BEFORE the subscriber subscribes, so the
+    # retained-on-subscribe path delivers it inline (and the subscriber ACKs
+    # it).  This isolates the test to the QoS 1 forward of the LATER clear.
+    s_setter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_setter.connect((MQTT_HOST, MQTT_PORT))
+    s_setter.sendall(create_connect_packet("retain_clear_durable_setter"))
+    validate_connack(recv_packet(s_setter))
+    s_setter.sendall(create_publish_packet(topic, b"initial", qos=1, packet_id=1, retain=True))
+    recv_packet(s_setter)  # PUBACK
+    s_setter.sendall(create_disconnect_packet())
+    s_setter.close()
+
+    # Subscriber: persistent session, subscribe QoS 1, ACK the retained-on-subscribe
+    # delivery, then close TCP abruptly.
+    s_sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub.connect((MQTT_HOST, MQTT_PORT))
+    s_sub.sendall(create_connect_packet(
+        sub_id, clean_start=True, properties={0x11: 300},
+    ))
+    validate_connack(recv_packet(s_sub))
+    s_sub.sendall(create_subscribe_packet(1, topic, qos=1))
+    validate_suback(recv_packet(s_sub), 1)
+    pkt = recv_packet(s_sub, timeout=5)
+    assert pkt is not None, "Should receive retained-on-subscribe"
+    _, p_init, _, _, _, pid_init, _ = validate_publish(pkt)
+    assert p_init == b"initial"
+    s_sub.sendall(create_puback_packet(pid_init))
+    s_sub.close()  # abrupt close — session preserved by expiry
+
+    # Publisher: clear retained.  The clear is a QoS 1 forward to the offline
+    # subscriber and must be persisted to pgmqtt_session_messages.
+    s_pub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_pub.connect((MQTT_HOST, MQTT_PORT))
+    s_pub.sendall(create_connect_packet("retain_clear_durable_pub"))
+    validate_connack(recv_packet(s_pub))
+    s_pub.sendall(create_publish_packet(topic, b"", qos=1, packet_id=2, retain=True))
+    recv_packet(s_pub)  # PUBACK — clear committed
+    s_pub.sendall(create_disconnect_packet())
+    s_pub.close()
+
+    # Allow the broker's next poll tick to flush session_db_actions (the
+    # InsertMessageBatch row for the offline subscriber) before we restart.
+    # PUBACK is sent before that batch is flushed, so we can't rely on its
+    # arrival as a synchronization point.
+    time.sleep(2)
+
+    # Broker restart wipes in-memory session.queue but persisted rows survive.
+    _restart_broker()
+
+    # Subscriber reconnects: must receive the empty-payload PUBLISH.
+    s_sub2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s_sub2.connect((MQTT_HOST, MQTT_PORT))
+    s_sub2.sendall(create_connect_packet(
+        sub_id, clean_start=False, properties={0x11: 300},
+    ))
+    sp, rc, _ = validate_connack(recv_packet(s_sub2))
+    assert rc == 0, f"CONNACK reason_code={rc:#04x}"
+    assert sp, "session_present should be true after restart"
+
+    pkt = recv_packet(s_sub2, timeout=10)
+    assert pkt is not None, "Should receive durable retained-clear notification after restart"
+    t, p, qos, _dup, retain, _pid, _props = validate_publish(pkt)
+    assert t == topic, f"Expected topic {topic}, got {t}"
+    assert p == b"", f"Expected empty payload (clear), got {p!r}"
+    assert qos == 1, f"Expected QoS 1, got {qos}"
+    assert not retain, "Forwarded clear must have RETAIN=0 (MQTT-3.3.1-9)"
+    s_sub2.close()

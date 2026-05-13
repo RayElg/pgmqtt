@@ -54,11 +54,13 @@ pub fn cleanup_orphaned_message(
         Some(r) => r,
         None => client.update(
             "DELETE FROM pgmqtt_messages \
-             WHERE id = $1 AND retain = false \
+             WHERE id = $1 \
                AND NOT EXISTS \
                  (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
                AND NOT EXISTS \
-                 (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1)",
+                 (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1) \
+               AND NOT EXISTS \
+                 (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
             None,
             &args,
         ),

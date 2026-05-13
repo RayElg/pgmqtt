@@ -95,4 +95,13 @@ pub fn init_020() {
     set_collate_c("pgmqtt_subscriptions", "client_id");
     set_collate_c("pgmqtt_subscriptions", "topic_filter");
     set_collate_c("pgmqtt_connections_cache", "client_id");
+
+    run_ddl(
+        "ALTER TABLE pgmqtt_metrics_current   ADD COLUMN IF NOT EXISTS cdc_ring_buffer_dropped bigint NOT NULL DEFAULT 0",
+        "add cdc_ring_buffer_dropped to metrics_current",
+    );
+    run_ddl(
+        "ALTER TABLE pgmqtt_metrics_snapshots ADD COLUMN IF NOT EXISTS cdc_ring_buffer_dropped bigint NOT NULL DEFAULT 0",
+        "add cdc_ring_buffer_dropped to metrics_snapshots",
+    );
 }

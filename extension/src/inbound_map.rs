@@ -147,6 +147,8 @@ pub fn try_match(
                 sql: mapping.sql.clone(),
                 values,
                 mapping_name: mapping.mapping_name.clone(),
+                target_schema: Arc::from(mapping.target_schema.as_str()),
+                target_table: Arc::from(mapping.target_table.as_str()),
             }));
         }
     }
@@ -159,6 +161,8 @@ pub struct InboundMatchResult {
     pub sql: Arc<str>,
     pub values: Vec<Option<String>>,
     pub mapping_name: Arc<str>,
+    pub target_schema: Arc<str>,
+    pub target_table: Arc<str>,
 }
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ impl RingBuffer {
         if self.buf.len() >= self.capacity {
             self.buf.pop_front();
             self.dropped += 1;
+            crate::metrics::inc(&crate::metrics::get().cdc_ring_buffer_dropped);
             if self.dropped % 100 == 1 {
                 pgrx::log!(
                     "WARNING: pgmqtt ring buffer overflow! Dropped {} CDC events so far.",

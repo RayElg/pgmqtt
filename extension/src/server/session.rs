@@ -32,6 +32,8 @@ pub struct MqttSession {
     /// MQTT 5.0 Receive Maximum: max unacknowledged QoS 1/2 messages allowed.
     /// Default: 65535 per spec. Set on CONNECT.
     pub receive_maximum: u16,
+    /// Sum of queued payload bytes; gated on `pgmqtt.max_queue_bytes_per_client`.
+    pub queue_bytes: usize,
 }
 
 impl MqttSession {
@@ -44,9 +46,68 @@ impl MqttSession {
             expiry_interval: 0,
             disconnected_at: None,
             receive_maximum: 65535,
+            queue_bytes: 0,
         }
     }
+
+    pub fn queue_push_back(&mut self, msg: MqttMessage) {
+        self.queue_bytes = self.queue_bytes.saturating_add(msg.payload.len());
+        self.queue.push_back(msg);
+    }
+
+    pub fn queue_pop_front(&mut self) -> Option<MqttMessage> {
+        let msg = self.queue.pop_front()?;
+        self.queue_bytes = self.queue_bytes.saturating_sub(msg.payload.len());
+        Some(msg)
+    }
+
+    pub fn queue_push_front(&mut self, msg: MqttMessage) {
+        self.queue_bytes = self.queue_bytes.saturating_add(msg.payload.len());
+        self.queue.push_front(msg);
+    }
+
+    /// MQTT-2.2.1 fixes packet_id at u16; linear-probe to skip occupied ids.
+    /// None ⇒ all 65535 occupied (caller queues instead).
+    pub fn alloc_packet_id(&mut self) -> Option<u16> {
+        for _ in 0..u16::MAX as u32 {
+            let pid = self.next_packet_id;
+            self.next_packet_id = self.next_packet_id.wrapping_add(1);
+            if self.next_packet_id == 0 {
+                self.next_packet_id = 1;
+            }
+            if !self.inflight.contains_key(&pid) {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    /// MQTT-3.3.4-7: cap per call at `receive_maximum`. Oldest sent_at first.
+    pub fn select_redelivery_pids(
+        &self,
+        now: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> Vec<u16> {
+        let mut entries: Vec<(std::time::Instant, u16)> = self
+            .inflight
+            .iter()
+            .filter_map(|(pid, (_, _, _, sent_at))| {
+                if now.duration_since(*sent_at) > timeout {
+                    Some((*sent_at, *pid))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(sent_at, _)| *sent_at);
+        entries
+            .into_iter()
+            .take(self.receive_maximum as usize)
+            .map(|(_, pid)| pid)
+            .collect()
+    }
 }
+
 
 /// Global session store: client_id → MqttSession.
 /// Lazily initialized on first use via with_sessions().
