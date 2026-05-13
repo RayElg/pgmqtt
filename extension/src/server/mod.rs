@@ -678,6 +678,29 @@ fn process_inbound_pending() {
                     Some(t) => t,
                 };
 
+                // Pre-check: to_regclass returns NULL for missing tables rather than
+                // raising a C-level ERROR (which would longjmp past catch_unwind).
+                let qualified = format!(
+                    "{}.{}",
+                    inbound_map::quote_ident(&match_result.target_schema),
+                    inbound_map::quote_ident(&match_result.target_table),
+                );
+                let table_exists = client
+                    .select(
+                        "SELECT to_regclass($1) IS NOT NULL",
+                        None,
+                        &[qualified.as_str().into()],
+                    )?
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.get_by_name::<bool, _>("?column?").ok().flatten())
+                    .unwrap_or(false);
+                if !table_exists {
+                    return Ok(RowOutcome::MappingGone {
+                        message_id, mapping_name, retry_count, topic, payload,
+                    });
+                }
+
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result
                     .values
                     .iter()

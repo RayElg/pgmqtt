@@ -21,7 +21,6 @@ from proto_utils import (
     MQTTControlPacket,
     MQTT_HOST,
     MQTT_PORT,
-    run_psql,
 )
 
 TICK_WAIT = 2.0
@@ -643,15 +642,16 @@ def test_status_includes_inbound_mappings():
 
 
 def test_inbound_drop_table_dead_letters():
-    """Dropping the target table while a QoS 1 message is in pgmqtt_inbound_pending
-    must dead-letter the row and must NOT crash the BGW.
+    """Target table dropped before the BGW processes pgmqtt_inbound_pending must
+    dead-letter the row and must NOT crash the BGW.
 
     Scenario:
-      1. Create mapping → publish QoS 1 → PUBACK received (row in pending).
-      2. DROP the target table from a separate connection.
-      3. Wait one processing cycle for the BGW to attempt the write.
-      4. Verify: broker still accepts connections (BGW did not crash).
-      5. Verify: row appears in pgmqtt_dead_letters (not lost, not retried forever).
+      1. Create mapping + table, wait for cache reload.
+      2. DROP the target table (mapping stays in pgmqtt_inbound_mappings).
+      3. Publish QoS 1 — PUBACK is received (row lands in pgmqtt_inbound_pending).
+      4. Wait for the BGW to attempt the write against the now-missing table.
+      5. Verify: broker still accepts connections (BGW did not crash).
+      6. Verify: row appears in pgmqtt_dead_letters (not silently lost).
     """
     _cleanup()
     _setup_test_table()
@@ -666,20 +666,20 @@ def test_inbound_drop_table_dead_letters():
     """)
     time.sleep(TICK_WAIT)
 
-    s = _connect("inbound_drop_table_pub")
-
     # Count existing dead letters so we can detect the new one.
     before = run_sql("SELECT count(*) FROM pgmqtt_dead_letters") or [(0,)]
     dead_before = before[0][0]
 
-    # Publish QoS 1 — PUBACK means the row is in pgmqtt_inbound_pending.
+    # Drop the target table BEFORE publishing so the BGW definitely sees a
+    # missing table when it processes the pending row.  The mapping row in
+    # pgmqtt_inbound_mappings is unaffected by the DROP.
+    run_sql("DROP TABLE IF EXISTS test_sensors CASCADE")
+
+    s = _connect("inbound_drop_table_pub")
     _publish_qos1(s, "sensor/site1/temperature/s1", {"temperature": 22.5}, packet_id=1)
     _recv_puback(s)
     s.sendall(create_disconnect_packet())
     s.close()
-
-    # Drop the target table before the BGW processes the pending row.
-    run_sql("DROP TABLE IF EXISTS test_sensors CASCADE")
 
     # Wait long enough for the BGW to attempt and fail the write.
     time.sleep(TICK_WAIT)
