@@ -211,10 +211,14 @@ def test_wal_ordering_old_rows_use_old_mapping():
     sub = _connect_and_subscribe("wmt_order_sub", "order/#", qos=1)
 
     try:
-        # Wait for the initial mapping to be in the cache.
-        lsn_init = _get_current_wal_lsn()
+        # Wait for the trigger row to be fully processed before recording the
+        # baseline.  lsn_init is captured before the INSERT, so waiting on it
+        # only guarantees events UP TO lsn_init were consumed — the trigger
+        # row's own LSN may be higher and its pgmqtt_messages INSERT not yet
+        # committed.  Waiting on the post-insert LSN closes that window.
         _trigger_wal_advance(table)
-        _wait_for_lsn_past(lsn_init)
+        lsn_after_trigger = _get_current_wal_lsn()
+        _wait_for_lsn_past(lsn_after_trigger)
 
         # Record the high-water mark so we only examine messages from this test.
         baseline_id = _max_message_id()

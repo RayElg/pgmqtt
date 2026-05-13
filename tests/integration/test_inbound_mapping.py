@@ -293,12 +293,21 @@ def test_qos1_puback_with_inbound_write():
     sock = _connect("inbound_test_qos1")
     _publish_qos1(sock, "sensor/site-D/temperature/s4", {"temperature": 42.0}, packet_id=1)
 
-    # Should receive PUBACK after DB write
+    # Should receive PUBACK after pgmqtt_inbound_pending row is committed.
+    # The actual target-table write happens in process_inbound_pending, which
+    # runs in the same BGW tick but after publish_messages_batch sends PUBACK.
     puback = _recv_puback(sock, timeout=10.0)
     assert puback is not None
 
-    # Verify row was written
-    rows = run_sql("SELECT temperature FROM test_sensors WHERE site_id = 'site-D' AND sensor_id = 's4'")
+    # Poll for the row: process_inbound_pending runs after PUBACK is sent so
+    # the row may not be visible yet when we query immediately.
+    rows = None
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        rows = run_sql("SELECT temperature FROM test_sensors WHERE site_id = 'site-D' AND sensor_id = 's4'")
+        if rows:
+            break
+        time.sleep(0.05)
     assert rows is not None
     assert len(rows) == 1
     assert float(rows[0][0]) == 42.0
