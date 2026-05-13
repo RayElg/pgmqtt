@@ -19,7 +19,10 @@ const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Maximum WebSocket frame payload we will allocate.  A client claiming a
 /// larger frame is almost certainly malicious; reject it before touching the
 /// heap.  65 536 bytes is well above any realistic MQTT packet size.
-const MAX_WS_FRAME_SIZE: usize = 65_536;
+/// Mirrors TCP's `pgmqtt.max_client_buffer_bytes` — keeps WSS at parity.
+fn ws_frame_cap() -> usize {
+    crate::get_max_client_buffer_bytes_guc()
+}
 
 // Opcodes
 const OP_CONT: u8 = 0x0;
@@ -291,12 +294,13 @@ impl<S: Read + Write> WsStream<S> {
             self.read_exact_inner(&mut mask)?;
 
             // ── Payload ───────────────────────────────────────────────────────
-            if payload_len > MAX_WS_FRAME_SIZE {
+            let frame_cap = ws_frame_cap();
+            if payload_len > frame_cap {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "ws frame too large: {} bytes (max {})",
-                        payload_len, MAX_WS_FRAME_SIZE
+                        payload_len, frame_cap
                     ),
                 ));
             }
@@ -324,7 +328,7 @@ impl<S: Read + Write> WsStream<S> {
                 }
                 OP_CONT => {
                     // Continuation frame — append to the reassembly buffer.
-                    if self.frag_buf.len() + payload.len() > MAX_WS_FRAME_SIZE {
+                    if self.frag_buf.len() + payload.len() > frame_cap {
                         self.frag_buf.clear();
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -332,7 +336,7 @@ impl<S: Read + Write> WsStream<S> {
                                 "ws reassembled message too large: {} + {} bytes (max {})",
                                 self.frag_buf.len(),
                                 payload.len(),
-                                MAX_WS_FRAME_SIZE,
+                                frame_cap,
                             ),
                         ));
                     }

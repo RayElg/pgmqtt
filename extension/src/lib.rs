@@ -74,6 +74,7 @@ static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Performance tuning GUCs (see pgmqtt.tick_interval_ms etc. in _PG_init for help text)
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1048576);
+static MAX_QUEUE_BYTES_PER_CLIENT: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
 static CDC_EVERY_N_TICKS: GucSetting<i32> = GucSetting::<i32>::new(1);
 static DEBUG_LOG: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Observability GUCs (enterprise: metrics feature)
@@ -100,6 +101,10 @@ pub fn get_tick_interval_ms_guc() -> i32 {
 
 pub fn get_max_client_buffer_bytes_guc() -> usize {
     MAX_CLIENT_BUFFER_BYTES.get().max(65536) as usize
+}
+
+pub fn get_max_queue_bytes_per_client_guc() -> usize {
+    MAX_QUEUE_BYTES_PER_CLIENT.get().max(1048576) as usize
 }
 
 pub fn get_cdc_every_n_ticks_guc() -> u64 {
@@ -774,7 +779,7 @@ fn pgmqtt_metrics() -> TableIterator<
                     pubacks_sent, pubacks_received,
                     subscribe_ops, unsubscribe_ops,
                     cdc_events_processed, cdc_msgs_published,
-                    cdc_render_errors, cdc_slot_errors, cdc_persist_errors,
+                    cdc_render_errors, cdc_slot_errors, cdc_persist_errors, cdc_ring_buffer_dropped,
                     inbound_writes_ok, inbound_writes_failed, inbound_retries, inbound_dead_letters,
                     db_batches_committed, db_session_errors, db_message_errors, db_subscription_errors
              FROM pgmqtt_metrics_current
@@ -821,6 +826,7 @@ fn pgmqtt_metrics() -> TableIterator<
                 m!("cdc_render_errors",      "total",        "CDC template render errors");
                 m!("cdc_slot_errors",        "total",        "CDC replication slot errors");
                 m!("cdc_persist_errors",     "total",        "CDC message persist errors");
+                m!("cdc_ring_buffer_dropped", "total",       "CDC events dropped due to ring buffer overflow (data loss)");
                 m!("inbound_writes_ok",      "total",        "Successful inbound MQTT-to-DB writes");
                 m!("inbound_writes_failed",  "total",        "Failed inbound MQTT-to-DB writes");
                 m!("inbound_retries",        "total",        "Inbound write retries");
@@ -957,6 +963,7 @@ fn pgmqtt_prometheus_metrics() -> String {
                 g!(subscribe_ops); g!(unsubscribe_ops);
                 g!(cdc_events_processed); g!(cdc_msgs_published);
                 g!(cdc_render_errors); g!(cdc_slot_errors); g!(cdc_persist_errors);
+                g!(cdc_ring_buffer_dropped);
                 g!(inbound_writes_ok); g!(inbound_writes_failed); g!(inbound_retries);
                 g!(inbound_dead_letters); g!(db_batches_committed);
                 g!(db_session_errors); g!(db_message_errors); g!(db_subscription_errors);
@@ -1191,6 +1198,16 @@ pub unsafe extern "C" fn _PG_init() {
         &MAX_CLIENT_BUFFER_BYTES,
         65536,
         16777216,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.max_queue_bytes_per_client",
+        c"Max queued-payload bytes per offline-but-persistent client (1048576-2147483647, default 67108864).  Caps queue memory for a single misbehaving subscriber.",
+        c"",
+        &MAX_QUEUE_BYTES_PER_CLIENT,
+        1048576,
+        i32::MAX,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

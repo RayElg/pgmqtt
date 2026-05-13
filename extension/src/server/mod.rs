@@ -32,8 +32,16 @@ fn latch_interval() -> Duration {
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum bytes to read from a client request.
-const MAX_REQUEST_BYTES: usize = 65536;
+/// Pre-handshake DoS floor: peer must produce a parseable CONNECT before
+/// accumulating more than this. Sized for chunky JWTs (~8 KiB) + headroom.
+const MAX_PRE_CONNECT_BYTES: usize = 16_384;
+
+const READ_CHUNK_BYTES: usize = 65_536;
+
+/// MQTT-3.2.2.3.5 Maximum Packet Size advertised in CONNACK.
+fn broker_max_packet_size() -> u32 {
+    crate::get_max_client_buffer_bytes_guc().min(u32::MAX as usize) as u32
+}
 
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
@@ -225,7 +233,7 @@ fn db_load_sessions_on_startup() {
                                 );
                             } else {
                                 // Queued
-                                sess.queue.push_back(MqttMessage {
+                                sess.queue_push_back(MqttMessage {
                                     id: Some(message_id),
                                     topic: Arc::from(topic.as_str()),
                                     payload: Arc::from(payload.unwrap_or_default()),
@@ -842,6 +850,9 @@ struct MqttClient {
     keep_alive: u16,
     last_received_at: std::time::Instant,
     receive_maximum: u16,
+    /// MQTT-3.1.2.24-1: outbound packets larger than this MUST be dropped.
+    /// None ⇒ no limit (always None for v3.1.1).
+    max_packet_size: Option<u32>,
     /// MQTT protocol version (4 = v3.1.1, 5 = v5.0).
     protocol_version: u8,
     /// JWT claim-based topic filters for subscribe authorization.
@@ -870,6 +881,7 @@ impl MqttClient {
         will: Option<mqtt::Will>,
         keep_alive: u16,
         receive_maximum: u16,
+        max_packet_size: Option<u32>,
         protocol_version: u8,
         session: MqttSession,
         transport_label: &'static str,
@@ -877,11 +889,12 @@ impl MqttClient {
         Self {
             transport,
             client_id,
-            buf: Vec::with_capacity(MAX_REQUEST_BYTES),
+            buf: Vec::with_capacity(READ_CHUNK_BYTES),
             will,
             keep_alive,
             last_received_at: std::time::Instant::now(),
             receive_maximum,
+            max_packet_size,
             protocol_version,
             sub_claims: Vec::new(),
             pub_claims: Vec::new(),
@@ -901,6 +914,12 @@ impl MqttClient {
     #[inline]
     fn v5(&self) -> bool {
         mqtt::is_v5(self.protocol_version)
+    }
+
+    /// MQTT-3.1.2.24-1: callers MUST drop the packet if this is true.
+    #[inline]
+    fn exceeds_max_packet(&self, pkt_len: usize) -> bool {
+        matches!(self.max_packet_size, Some(m) if pkt_len > m as usize)
     }
 
     #[inline]
@@ -1347,6 +1366,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // The client did NOT send a normal DISCONNECT, so the will fires.
         if let Some(will) = client.will.take() {
             log!("pgmqtt mqtt: firing Will for '{}' on shutdown", id);
+            crate::metrics::inc(&crate::metrics::get().wills_fired);
             will_publishes.push(PendingPublish {
                 topic: Arc::from(will.topic.as_str()),
                 payload: Arc::from(will.payload),
@@ -1998,7 +2018,7 @@ fn handle_new_connection(
             }
             Err(mqtt::MqttError::Incomplete) => {
                 // Keep reading
-                if connect_buf.len() > MAX_REQUEST_BYTES {
+                if connect_buf.len() > MAX_PRE_CONNECT_BYTES {
                     log!("pgmqtt mqtt: CONNECT packet too large");
                     return;
                 }
@@ -2158,6 +2178,12 @@ fn finish_connect(
             "pgmqtt mqtt: session takeover for '{}', disconnecting old connection",
             client_id
         );
+        // Bypasses disconnect_client(), so do its metric bookkeeping inline.
+        {
+            let m = crate::metrics::get();
+            crate::metrics::dec(&m.connections_current);
+            crate::metrics::inc(&m.disconnections_unclean);
+        }
         let _ = old_client.transport.write_all(&mqtt::build_disconnect(
             mqtt::reason::SESSION_TAKEN_OVER,
             old_client.v5(),
@@ -2166,6 +2192,7 @@ fn finish_connect(
         // when the server closes the connection for any reason other than a
         // normal DISCONNECT from the client).
         if let Some(will) = old_client.will.take() {
+            crate::metrics::inc(&crate::metrics::get().wills_fired);
             pending_publishes.push(PendingPublish {
                 topic: Arc::from(will.topic.as_str()),
                 payload: Arc::from(will.payload),
@@ -2255,8 +2282,12 @@ fn finish_connect(
         expiry_interval: expiry,
     });
 
-    // Send CONNACK with success
-    let connack = mqtt::build_connack(session_present, mqtt::reason::SUCCESS, v5);
+    let connack = mqtt::build_connack_with_max_packet(
+        session_present,
+        mqtt::reason::SUCCESS,
+        v5,
+        if v5 { Some(broker_max_packet_size()) } else { None },
+    );
     if transport.write_all(&connack).is_err() {
         log!("pgmqtt mqtt: failed to send CONNACK to '{}'", client_id);
         // Put session back so it isn't lost.
@@ -2284,28 +2315,51 @@ fn finish_connect(
     // with session_present=true.
     let mut to_send: Vec<Vec<u8>> = Vec::new();
     if session_present {
-        // 1. Redeliver inflight messages (DUP=1) so the client can PUBACK them.
-        for (pid, (topic, payload, _msg_id, sent_at)) in session.inflight.iter_mut() {
-            to_send.push(mqtt::build_publish(
-                topic,
-                payload,
-                1,
-                Some(*pid),
-                true,
-                false,
-                v5,
-            ));
-            // Reset the timer so redeliver_unacked_messages doesn't fire immediately.
-            *sent_at = std::time::Instant::now();
+        // MQTT-3.3.4-7: cap concurrent on-wire unacked PUBLISHes at the new
+        // receive_maximum. Excess stays inflight with stale sent_at, picked
+        // up by redeliver_unacked_messages as ACKs free capacity.
+        let resume_budget = session.receive_maximum as usize;
+        let client_max_pkt = packet.max_packet_size;
+        let mut pids: Vec<u16> = session.inflight.keys().copied().collect();
+        pids.sort_unstable();
+        let now = std::time::Instant::now();
+        let mut sent = 0;
+        for pid in pids {
+            if sent >= resume_budget {
+                break;
+            }
+            if let Some(entry) = session.inflight.get_mut(&pid) {
+                let (topic, payload, _msg_id, sent_at) = entry;
+                let pkt = mqtt::build_publish(topic, payload, 1, Some(pid), true, false, v5);
+                if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
+                    continue; // MQTT-3.1.2.24-1
+                }
+                to_send.push(pkt);
+                *sent_at = now;
+                sent += 1;
+            }
+        }
+        if session.inflight.len() > resume_budget {
+            log!(
+                "pgmqtt mqtt: '{}' resume: {} inflight exceeds receive_maximum={}, deferring {} until ACKs free quota",
+                client_id,
+                session.inflight.len(),
+                resume_budget,
+                session.inflight.len() - resume_budget,
+            );
         }
         // 2. Drain the pending queue into inflight and add to send list.
         let inflight_limit = std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
         while session.inflight.len() < inflight_limit {
-            if let Some(queued) = session.queue.pop_front() {
-                let pid = session.next_packet_id;
-                session.next_packet_id = session.next_packet_id.wrapping_add(1);
-                if session.next_packet_id == 0 {
-                    session.next_packet_id = 1;
+            if let Some(queued) = session.queue_pop_front() {
+                let Some(pid) = session.alloc_packet_id() else {
+                    // All 65535 ids occupied — push back and stop draining.
+                    session.queue_push_front(queued);
+                    break;
+                };
+                let pkt = mqtt::build_publish(&queued.topic, &queued.payload, 1, Some(pid), false, false, v5);
+                if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
+                    continue; // MQTT-3.1.2.24-1
                 }
                 session.inflight.insert(
                     pid,
@@ -2316,15 +2370,7 @@ fn finish_connect(
                         std::time::Instant::now(),
                     ),
                 );
-                to_send.push(mqtt::build_publish(
-                    &queued.topic,
-                    &queued.payload,
-                    1,
-                    Some(pid),
-                    false,
-                    false,
-                    v5,
-                ));
+                to_send.push(pkt);
             } else {
                 break;
             }
@@ -2343,6 +2389,7 @@ fn finish_connect(
         packet.will,
         packet.keep_alive,
         packet.receive_maximum,
+        packet.max_packet_size,
         packet.protocol_version,
         session,
         transport_label,
@@ -2468,7 +2515,7 @@ fn poll_mqtt_clients(
             if client.buf.len() >= max_inbound_buf {
                 break;
             }
-            let mut tmp = [0u8; MAX_REQUEST_BYTES];
+            let mut tmp = [0u8; READ_CHUNK_BYTES];
             match client.transport.read(&mut tmp) {
                 Ok(0) => {
                     // EOF: client closed the connection. Mark for removal but
@@ -2598,21 +2645,33 @@ fn publish_messages_batch(
                 for p in &persistent {
                     let mut msg_id_opt: Option<i64> = None;
 
-                    // Issue 10: an empty-payload retain is a "clear retained" command.
-                    // We must NOT insert a pgmqtt_messages row here — it would be an orphan
-                    // with no pgmqtt_retained entry pointing to it after the DELETE.
-                    // We still deliver to live subscribers so they see the clear.
+                    // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
+                    // non-retained row at QoS 1 so the forwarded clear has DB
+                    // backing for reconnect redelivery.
                     if p.retain && p.payload.is_empty() {
-                        // Clear retained entry; errors are propagated so the transaction
-                        // rolls back cleanly (issue 13).
                         let topic_ref: &str = &p.topic;
                         let args: Vec<pgrx::datum::DatumWithOid> =
                             vec![topic_ref.into()];
-                        client.update(
-                            "DELETE FROM pgmqtt_retained WHERE topic = $1",
+                        let table = client.update(
+                            "DELETE FROM pgmqtt_retained WHERE topic = $1 RETURNING message_id",
                             None,
                             &args,
                         )?;
+                        for row in table {
+                            if let Ok(Some(old_id)) = row.get_by_name::<i64, _>("message_id") {
+                                db_action::cleanup_orphaned_message(client, old_id)?;
+                            }
+                        }
+                        if p.qos > 0 {
+                            let msg_id = db_action::persist_message(
+                                client,
+                                &p.topic,
+                                &p.payload,
+                                p.qos,
+                                false,
+                            )?;
+                            msg_id_opt = Some(msg_id);
+                        }
                     } else {
                         // Normal publish: persist the message and update retained index.
                         let msg_id = db_action::persist_message(
@@ -2628,12 +2687,29 @@ fn publish_messages_batch(
                             let topic_ref: &str = &p.topic;
                             let args: Vec<pgrx::datum::DatumWithOid> =
                                 vec![topic_ref.into(), msg_id.into()];
-                            client.update(
-                                "INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
-                                 ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id",
+                            let table = client.update(
+                                "WITH old AS ( \
+                                     SELECT message_id AS old_id FROM pgmqtt_retained WHERE topic = $1 \
+                                 ), upsert AS ( \
+                                     INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
+                                     ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id \
+                                     RETURNING 1 \
+                                 ) \
+                                 SELECT old_id FROM old, upsert",
                                 None,
                                 &args,
                             )?;
+                            let mut old_msg_id: Option<i64> = None;
+                            for row in table {
+                                if let Ok(Some(id)) = row.get_by_name::<i64, _>("old_id") {
+                                    old_msg_id = Some(id);
+                                }
+                            }
+                            if let Some(old_id) = old_msg_id {
+                                if old_id != msg_id {
+                                    db_action::cleanup_orphaned_message(client, old_id)?;
+                                }
+                            }
                         }
                     }
 
@@ -2761,38 +2837,52 @@ fn handle_mqtt_packet(
                 );
             }
             // Slot freed — promote next queued message into inflight (if within receive_maximum).
+            let v5 = client.v5();
+            let client_max_pkt = client.max_packet_size;
             let session = &mut client.session;
             let inflight_limit =
                 std::cmp::min(MAX_INFLIGHT_MESSAGES, session.receive_maximum as usize);
             let (next_pkt, db_action) =
                 if session.inflight.len() < inflight_limit && !session.queue.is_empty() {
-                    if let Some(queued) = session.queue.pop_front() {
-                        let pid = session.next_packet_id;
-                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
-                        if session.next_packet_id == 0 {
-                            session.next_packet_id = 1;
-                        }
-                        session.inflight.insert(
-                            pid,
-                            (
-                                queued.topic.clone(),
-                                queued.payload.clone(),
-                                queued.id,
-                                std::time::Instant::now(),
-                            ),
+                    if let Some(queued) = session.queue_pop_front() {
+                        // MQTT-3.1.2.24-1: size-check before reserving an
+                        // inflight slot, otherwise an oversize message wastes
+                        // a slot every PUBACK forever.
+                        let pkt = mqtt::build_publish(
+                            &queued.topic,
+                            &queued.payload,
+                            1,
+                            Some(0),
+                            false,
+                            false,
+                            v5,
                         );
-                        (
-                            Some(mqtt::build_publish(
+                        if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
+                            (None, None)
+                        } else if let Some(pid) = session.alloc_packet_id() {
+                            session.inflight.insert(
+                                pid,
+                                (
+                                    queued.topic.clone(),
+                                    queued.payload.clone(),
+                                    queued.id,
+                                    std::time::Instant::now(),
+                                ),
+                            );
+                            let pkt = mqtt::build_publish(
                                 &queued.topic,
                                 &queued.payload,
                                 1,
                                 Some(pid),
                                 false,
                                 false,
-                                client.v5(),
-                            )),
-                            queued.id.map(|id| (id, pid)),
-                        )
+                                v5,
+                            );
+                            (Some(pkt), queued.id.map(|id| (id, pid)))
+                        } else {
+                            session.queue_push_front(queued);
+                            (None, None)
+                        }
                     } else {
                         (None, None)
                     }
@@ -2953,11 +3043,14 @@ fn handle_mqtt_packet(
                                 let arc_topic: Arc<str> = Arc::from(topic.as_str());
                                 let arc_payload: Arc<[u8]> = Arc::from(payload.as_slice());
                                 let sess = &mut client.session;
-                                let pid = sess.next_packet_id;
-                                sess.next_packet_id = sess.next_packet_id.wrapping_add(1);
-                                if sess.next_packet_id == 0 {
-                                    sess.next_packet_id = 1;
-                                }
+                                let Some(pid) = sess.alloc_packet_id() else {
+                                    // No free packet_id; skip this retained delivery.
+                                    // Subscriber will see it on next reconnect via
+                                    // pgmqtt_session_messages — but here, with no row
+                                    // inserted, it is dropped.  Acceptable: clients
+                                    // hitting this limit are already in trouble.
+                                    break;
+                                };
                                 sess.inflight.insert(
                                     pid,
                                     (
@@ -2980,7 +3073,9 @@ fn handle_mqtt_packet(
                                     true,
                                     client.v5(),
                                 );
-                                let _ = client.transport.write_all(&pkt);
+                                if !client.exceeds_max_packet(pkt.len()) {
+                                    let _ = client.transport.write_all(&pkt);
+                                }
                             } else {
                                 let pkt = mqtt::build_publish(
                                     topic,
@@ -2991,7 +3086,9 @@ fn handle_mqtt_packet(
                                     true,
                                     client.v5(),
                                 );
-                                let _ = client.transport.write_all(&pkt);
+                                if !client.exceeds_max_packet(pkt.len()) {
+                                    let _ = client.transport.write_all(&pkt);
+                                }
                             }
                             break; // deliver each retained message at most once per SUBSCRIBE
                         }
@@ -3277,19 +3374,24 @@ fn deliver_messages(
 
                 if delivery_qos == 1 {
                     if session.inflight.len() >= inflight_limit {
-                        if session.queue.len() >= MAX_QUEUE_SIZE {
+                        let queue_byte_cap = crate::get_max_queue_bytes_per_client_guc();
+                        if session.queue.len() >= MAX_QUEUE_SIZE
+                            || session.queue_bytes.saturating_add(msg.payload.len()) > queue_byte_cap
+                        {
                             if crate::get_debug_log_guc() {
                                 pgrx::log!(
-                                    "pgmqtt: client '{}' queue hit hard limit ({} messages). Disconnecting.",
+                                    "pgmqtt: client '{}' queue hit hard limit ({} msgs / {} bytes, cap {}). Disconnecting.",
                                     sub_id,
-                                    MAX_QUEUE_SIZE,
+                                    session.queue.len(),
+                                    session.queue_bytes,
+                                    queue_byte_cap,
                                 );
                             }
                             crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                             to_remove.push(sub_id.clone());
                             continue;
                         }
-                        session.queue.push_back(MqttMessage {
+                        session.queue_push_back(MqttMessage {
                             id: msg.id,
                             topic: msg.topic.clone(),
                             payload: msg.payload.clone(),
@@ -3307,11 +3409,11 @@ fn deliver_messages(
                             batch_entries.push((sub_id.clone(), None));
                         }
                     } else {
-                        let pid = session.next_packet_id;
-                        session.next_packet_id = session.next_packet_id.wrapping_add(1);
-                        if session.next_packet_id == 0 {
-                            session.next_packet_id = 1;
-                        }
+                        // alloc_packet_id cannot return None here: inflight.len() < 800
+                        // is far below the 65535 packet_id space.  expect() is fine.
+                        let pid = session
+                            .alloc_packet_id()
+                            .expect("unreachable: inflight slot free implies free packet_id");
                         session.inflight.insert(
                             pid,
                             (
@@ -3333,7 +3435,12 @@ fn deliver_messages(
                             false,
                             client.v5(),
                         );
-                        if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                        if client.exceeds_max_packet(pkt.len()) {
+                            pgrx::log!(
+                                "pgmqtt: dropping {}-byte PUBLISH for '{}' (exceeds client max_packet_size={:?})",
+                                pkt.len(), sub_id, client.max_packet_size,
+                            );
+                        } else if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
                             pgrx::log!(
                                 "pgmqtt: client '{}' write buffer full (QoS 1). Disconnecting.",
                                 sub_id
@@ -3356,7 +3463,9 @@ fn deliver_messages(
                         false,
                         client.v5(),
                     );
-                    if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                    if client.exceeds_max_packet(pkt.len()) {
+                        crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
+                    } else if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
                         // QoS 0 is at-most-once: drop rather than disconnect.
                         crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                     } else {
@@ -3370,9 +3479,16 @@ fn deliver_messages(
                 // ── Disconnected client with persistent session: queue for later ──
                 let delivery_qos = std::cmp::min(msg.qos, *granted_qos);
                 if delivery_qos >= 1 {
+                    let queue_byte_cap = crate::get_max_queue_bytes_per_client_guc();
                     with_sessions(|sessions| {
                         if let Some(session) = sessions.get_mut(sub_id) {
-                            session.queue.push_back(MqttMessage {
+                            if session.queue.len() >= MAX_QUEUE_SIZE
+                                || session.queue_bytes.saturating_add(msg.payload.len()) > queue_byte_cap
+                            {
+                                crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
+                                return;
+                            }
+                            session.queue_push_back(MqttMessage {
                                 id: msg.id,
                                 topic: msg.topic.clone(),
                                 payload: msg.payload.clone(),
@@ -3415,10 +3531,11 @@ fn redeliver_unacked_messages(
     let mut to_resend = Vec::new();
 
     for (client_id, client) in clients.iter_mut() {
-        for (pid, (topic, payload, _msg_id, sent_at)) in &mut client.session.inflight {
-            if now.duration_since(*sent_at) > timeout {
-                to_resend.push((client_id.clone(), *pid, topic.clone(), payload.clone()));
-                *sent_at = now; // update timer for next redelivery
+        // Cap per-tick redelivery at receive_maximum (MQTT-3.3.4-7), oldest first.
+        for pid in client.session.select_redelivery_pids(now, timeout) {
+            if let Some(entry) = client.session.inflight.get_mut(&pid) {
+                to_resend.push((client_id.clone(), pid, entry.0.clone(), entry.1.clone()));
+                entry.3 = now; // update timer for next redelivery
             }
         }
     }
@@ -3429,6 +3546,9 @@ fn redeliver_unacked_messages(
         if let Some(client) = clients.get_mut(&cid) {
             log!("pgmqtt mqtt: redelivering packet_id={} to '{}'", pid, cid);
             let pkt = mqtt::build_publish(&topic, &payload, 1, Some(pid), true, false, client.v5());
+            if client.exceeds_max_packet(pkt.len()) {
+                continue; // MQTT-3.1.2.24-1
+            }
             if client.write_buf.len() + pkt.len() > max_buf {
                 log!("pgmqtt mqtt: client '{}' write buffer full during redelivery. Disconnecting.", cid);
                 to_remove.push(cid);
