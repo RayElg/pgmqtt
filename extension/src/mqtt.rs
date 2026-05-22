@@ -426,7 +426,9 @@ pub struct ConnectPacket {
     pub receive_maximum: u16,
     /// MQTT-3.1.2.24-1; None ⇒ no client-imposed limit.
     pub max_packet_size: Option<u32>,
-    /// Optional password field (used for JWT bearer tokens).
+    /// Optional username from the CONNECT payload.
+    pub username: Option<String>,
+    /// Optional password field. May carry a JWT bearer token or a plaintext password.
     pub password: Option<Vec<u8>>,
 }
 
@@ -566,11 +568,14 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         });
     }
 
-    // Skip username / read password if present
-    if has_username {
-        let (_, new_off) = decode_utf8(buf, off)?;
+    // Username / password
+    let username = if has_username {
+        let (u, new_off) = decode_utf8(buf, off)?;
         off = new_off;
-    }
+        Some(u)
+    } else {
+        None
+    };
     let password = if has_password {
         let (data, _new_off) = decode_binary(buf, off)?;
         Some(data)
@@ -587,6 +592,7 @@ fn parse_connect(buf: &[u8]) -> Result<ConnectPacket> {
         session_expiry_interval,
         receive_maximum,
         max_packet_size,
+        username,
         password,
     })
 }

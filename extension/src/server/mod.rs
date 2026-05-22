@@ -883,10 +883,13 @@ struct MqttClient {
     max_packet_size: Option<u32>,
     /// MQTT protocol version (4 = v3.1.1, 5 = v5.0).
     protocol_version: u8,
-    /// JWT claim-based topic filters for subscribe authorization.
+    /// Subscribe-side topic allowlist (from JWT sub_claims or pgmqtt_acls).
     sub_claims: Vec<String>,
-    /// JWT claim-based topic filters for publish authorization.
+    /// Publish-side topic allowlist (from JWT pub_claims or pgmqtt_acls).
     pub_claims: Vec<String>,
+    /// Postgres role this client authenticated as (None = anonymous or JWT).
+    /// Used by pgmqtt_disconnect_role and pgmqtt_reload_acls.
+    authenticated_role: Option<String>,
     transport_label: &'static str,
     connected_at_unix: u64,
     msgs_received_count: u64,
@@ -926,6 +929,7 @@ impl MqttClient {
             protocol_version,
             sub_claims: Vec::new(),
             pub_claims: Vec::new(),
+            authenticated_role: None,
             session,
             transport_label,
             connected_at_unix: crate::license::now_secs() as u64,
@@ -1270,6 +1274,29 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         if last_inbound_reload.elapsed() >= Duration::from_millis(500) {
             load_inbound_mappings();
             last_inbound_reload = std::time::Instant::now();
+        }
+
+        // Drain admin commands (disconnect / reload-acls). Cheap when empty.
+        // Done before accept() so a disconnect targeting a session-takeover
+        // race lands on the in-flight in-memory state.
+        let admin_cmds = crate::admin_commands::drain(64);
+        if !admin_cmds.is_empty() {
+            let mut admin_sess_actions = Vec::new();
+            let mut admin_pubs = Vec::new();
+            for cmd in admin_cmds {
+                dispatch_admin_command(
+                    cmd,
+                    &mut clients,
+                    &mut admin_pubs,
+                    &mut admin_sess_actions,
+                );
+            }
+            if !admin_pubs.is_empty() {
+                publish_messages_batch(admin_pubs, &mut clients, &mut admin_sess_actions);
+            }
+            if !admin_sess_actions.is_empty() {
+                execute_session_db_actions(admin_sess_actions);
+            }
         }
 
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
@@ -2107,7 +2134,12 @@ fn finish_connect(
         if v5 { "5.0" } else { "3.1.1" }
     );
 
-    // ── JWT authentication ────────────────────────────────────────────────────
+    // ── Authentication ────────────────────────────────────────────────────────
+    // Resolution order (highest priority first):
+    //   1. JWT (if jwt_public_key is set AND the password field/WS token
+    //      looks like a JWT, OR the field is absent and only WS token is set)
+    //   2. Password (if password_auth_enabled AND CONNECT carries a username)
+    //   3. Anonymous (subject to *_required GUCs)
     let jwt_key_str = crate::get_jwt_public_key_guc();
     let is_ws = matches!(transport, Transport::Ws(_) | Transport::Wss(_));
     let jwt_required = if is_ws && crate::get_jwt_required_ws_guc() {
@@ -2115,22 +2147,41 @@ fn finish_connect(
     } else {
         crate::get_jwt_required_guc()
     };
-    let mut jwt_sub_claims: Vec<String> = Vec::new();
-    let mut jwt_pub_claims: Vec<String> = Vec::new();
+    let password_auth_enabled = crate::get_password_auth_enabled_guc();
+    let password_auth_required = crate::get_password_auth_required_guc();
 
-    if !jwt_key_str.is_empty() {
-        // Try to parse the JWT: password field first, then WS token (query param / header).
-        let token_opt = packet
-            .password
-            .as_deref()
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.trim().to_string())
-            .or(ws_jwt);
+    let mut sub_acl: Vec<String> = Vec::new();
+    let mut pub_acl: Vec<String> = Vec::new();
+    let mut authenticated_role: Option<String> = None;
+
+    let password_bytes = packet.password.as_deref();
+    let password_looks_like_jwt = password_bytes
+        .map(crate::password_auth::looks_like_jwt)
+        .unwrap_or(false);
+
+    // Did we send/route the password field down the JWT path?
+    let mut routed_password_to_jwt = false;
+
+    // JWT path: only attempt if a key is configured AND either:
+    //   - the password field looks like a JWT, OR
+    //   - the password field is absent (so it's WS-token-only), OR
+    //   - JWT is required (we still try, even if it doesn't sniff)
+    let try_jwt = !jwt_key_str.is_empty()
+        && (password_looks_like_jwt || password_bytes.is_none() || jwt_required);
+
+    if try_jwt {
+        let token_opt = if password_looks_like_jwt {
+            password_bytes
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        }
+        .or(ws_jwt);
 
         match (token_opt, parse_jwt_public_key(&jwt_key_str)) {
             (Some(token), Some(pubkey)) => match validate_jwt(&token, &pubkey) {
                 Ok(claims) => {
-                    // Enforce client_id claim: if JWT specifies a client_id, CONNECT must match
                     if let Some(ref jwt_cid) = claims.client_id {
                         if jwt_cid != &client_id {
                             log!(
@@ -2146,8 +2197,9 @@ fn finish_connect(
                             return;
                         }
                     }
-                    jwt_sub_claims = claims.sub_claims;
-                    jwt_pub_claims = claims.pub_claims;
+                    sub_acl = claims.sub_claims;
+                    pub_acl = claims.pub_claims;
+                    routed_password_to_jwt = password_looks_like_jwt;
                     log!("pgmqtt mqtt: JWT validated for '{}'", client_id);
                 }
                 Err(e) => {
@@ -2195,6 +2247,90 @@ fn finish_connect(
                 }
             }
         }
+    }
+
+    // Password path: only when JWT didn't already consume the password field.
+    if password_auth_enabled && !routed_password_to_jwt {
+        match (&packet.username, password_bytes) {
+            (Some(user), Some(pass)) => {
+                use crate::password_auth::AuthOutcome;
+                let outcome = crate::password_auth::verify(user, pass);
+                match outcome {
+                    AuthOutcome::Ok => {
+                        log!(
+                            "pgmqtt mqtt: password auth ok for '{}' (role '{}')",
+                            client_id,
+                            user
+                        );
+                        authenticated_role = Some(user.clone());
+                        let rules = crate::password_auth::load_acls_for_role(user);
+                        // Password ACLs override JWT claims if both somehow validated.
+                        sub_acl = rules.sub;
+                        pub_acl = rules.pub_;
+                    }
+                    AuthOutcome::FilteredOut => {
+                        log!(
+                            "pgmqtt mqtt: password auth rejected '{}' — role '{}' fails role_filter",
+                            client_id,
+                            user
+                        );
+                        let _ = transport.write_all(&mqtt::build_connack(
+                            false,
+                            mqtt::reason::NOT_AUTHORIZED,
+                            v5,
+                        ));
+                        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+                        return;
+                    }
+                    AuthOutcome::BadRole
+                    | AuthOutcome::BadVerifier
+                    | AuthOutcome::BadPassword
+                    | AuthOutcome::LookupError => {
+                        log!(
+                            "pgmqtt mqtt: password auth failed for '{}' (role '{}'): {:?}",
+                            client_id,
+                            user,
+                            outcome
+                        );
+                        let _ = transport.write_all(&mqtt::build_connack(
+                            false,
+                            mqtt::reason::BAD_USERNAME_PASSWORD,
+                            v5,
+                        ));
+                        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                if password_auth_required {
+                    log!(
+                        "pgmqtt mqtt: password auth required but credentials missing for '{}'",
+                        client_id
+                    );
+                    let _ = transport.write_all(&mqtt::build_connack(
+                        false,
+                        mqtt::reason::BAD_USERNAME_PASSWORD,
+                        v5,
+                    ));
+                    crate::metrics::inc(&crate::metrics::get().connections_rejected);
+                    return;
+                }
+            }
+        }
+    } else if password_auth_required && !routed_password_to_jwt {
+        // Required but feature gate not enabled — surface a clear error.
+        log!(
+            "pgmqtt mqtt: password_auth_required = on but password_auth_enabled = off; rejecting '{}'",
+            client_id
+        );
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::NOT_AUTHORIZED,
+            v5,
+        ));
+        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+        return;
     }
 
     // ── Session takeover (MQTT 5.0 §4.9) ──────────────────────────────────────
@@ -2453,8 +2589,9 @@ fn finish_connect(
         session,
         transport_label,
     );
-    mqtt_client.sub_claims = jwt_sub_claims;
-    mqtt_client.pub_claims = jwt_pub_claims;
+    mqtt_client.sub_claims = sub_acl;
+    mqtt_client.pub_claims = pub_acl;
+    mqtt_client.authenticated_role = authenticated_role;
     clients.insert(client_id.clone(), mqtt_client);
 
     if !to_send.is_empty() {
@@ -2493,6 +2630,85 @@ struct PendingPublish {
     /// tracking rows into pgmqtt_inbound_pending atomically with message
     /// persistence.
     inbound_mappings: Vec<Arc<str>>,
+}
+
+/// Dispatch a single admin command against the live client map.
+fn dispatch_admin_command(
+    cmd: crate::admin_commands::Command,
+    clients: &mut HashMap<String, MqttClient>,
+    pending_publishes: &mut Vec<PendingPublish>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    use crate::admin_commands::Command;
+    match cmd {
+        Command::DisconnectClient { client_id, reason } => {
+            if let Some(client) = clients.get_mut(&client_id) {
+                let _ = client
+                    .transport
+                    .write_all(&mqtt::build_disconnect(reason, client.v5()));
+                log!("pgmqtt admin: disconnecting '{}' (reason 0x{:02x})", client_id, reason);
+                disconnect_client(&client_id, clients, pending_publishes, session_db_actions);
+            } else {
+                log!("pgmqtt admin: disconnect_client '{}': no such client", client_id);
+            }
+        }
+        Command::DisconnectRole { role_name, reason } => {
+            let targets: Vec<String> = clients
+                .iter()
+                .filter_map(|(id, c)| {
+                    c.authenticated_role
+                        .as_ref()
+                        .filter(|r| *r == &role_name)
+                        .map(|_| id.clone())
+                })
+                .collect();
+            if targets.is_empty() {
+                log!("pgmqtt admin: disconnect_role '{}': no matching clients", role_name);
+            } else {
+                log!(
+                    "pgmqtt admin: disconnect_role '{}': kicking {} client(s)",
+                    role_name,
+                    targets.len()
+                );
+            }
+            for id in targets {
+                if let Some(client) = clients.get_mut(&id) {
+                    let _ = client
+                        .transport
+                        .write_all(&mqtt::build_disconnect(reason, client.v5()));
+                }
+                disconnect_client(&id, clients, pending_publishes, session_db_actions);
+            }
+        }
+        Command::ReloadAcls { target } => {
+            if target == "*" {
+                let mut n = 0;
+                for client in clients.values_mut() {
+                    if let Some(role) = client.authenticated_role.clone() {
+                        let rules = crate::password_auth::load_acls_for_role(&role);
+                        client.sub_claims = rules.sub;
+                        client.pub_claims = rules.pub_;
+                        n += 1;
+                    }
+                }
+                log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
+            } else if let Some(client) = clients.get_mut(&target) {
+                if let Some(role) = client.authenticated_role.clone() {
+                    let rules = crate::password_auth::load_acls_for_role(&role);
+                    client.sub_claims = rules.sub;
+                    client.pub_claims = rules.pub_;
+                    log!("pgmqtt admin: reload_acls '{}': refreshed", target);
+                } else {
+                    log!(
+                        "pgmqtt admin: reload_acls '{}': client has no authenticated role",
+                        target
+                    );
+                }
+            } else {
+                log!("pgmqtt admin: reload_acls '{}': no such client", target);
+            }
+        }
+    }
 }
 
 fn disconnect_client(

@@ -2,13 +2,16 @@ use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 use std::time::Duration;
 
+mod admin_commands;
 mod ffi_safe;
 pub mod inbound_map;
 mod init010;
 mod init020;
+mod init030;
 pub mod license;
 pub mod metrics;
 mod mqtt;
+pub mod password_auth;
 mod ring_buffer;
 mod server;
 mod statements;
@@ -41,6 +44,16 @@ extension_sql!(
     requires = [pgmqtt_add_inbound_mapping, pgmqtt_remove_inbound_mapping, pgmqtt_list_inbound_mappings],
 );
 
+extension_sql!(
+    r#"
+    REVOKE EXECUTE ON FUNCTION pgmqtt_disconnect_client(text, int) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_disconnect_role(text, int) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_reload_acls(text) FROM PUBLIC;
+    "#,
+    name = "revoke_admin_commands_from_public",
+    requires = [pgmqtt_disconnect_client, pgmqtt_disconnect_role, pgmqtt_reload_acls],
+);
+
 // ---------------------------------------------------------------------------
 // GUC definitions
 // ---------------------------------------------------------------------------
@@ -70,6 +83,12 @@ static JWT_PUBLIC_KEY: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 static JWT_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+// Password authentication (Community feature).
+static PASSWORD_AUTH_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PASSWORD_AUTH_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PASSWORD_AUTH_ROLE_FILTER: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 // Performance tuning GUCs (see pgmqtt.tick_interval_ms etc. in _PG_init for help text)
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
@@ -135,6 +154,21 @@ pub fn get_jwt_required_guc() -> bool {
 
 pub fn get_jwt_required_ws_guc() -> bool {
     JWT_REQUIRED_WS.get()
+}
+
+pub fn get_password_auth_enabled_guc() -> bool {
+    PASSWORD_AUTH_ENABLED.get()
+}
+
+pub fn get_password_auth_required_guc() -> bool {
+    PASSWORD_AUTH_REQUIRED.get()
+}
+
+pub fn get_password_auth_role_filter_guc() -> String {
+    PASSWORD_AUTH_ROLE_FILTER
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub fn get_metrics_snapshot_interval_guc() -> i32 {
@@ -212,6 +246,7 @@ pub fn get_tls_key_file_guc() -> String {
 fn ensure_tables_exist() {
     init010::init_010();
     init020::init_020();
+    init030::init_030();
 }
 
 /// Register a CDC → MQTT outbound topic mapping (persisted to DB table).
@@ -624,6 +659,52 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
     .unwrap_or_default();
 
     TableIterator::new(mappings.into_iter())
+}
+
+// ---------------------------------------------------------------------------
+// Admin commands (broker-side disconnect / ACL reload)
+// ---------------------------------------------------------------------------
+
+fn enqueue_admin_command(kind: &str, target: &str, reason_code: Option<i16>) -> i64 {
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> =
+            vec![kind.into(), target.into(), reason_code.into()];
+        let table = client.update(
+            "INSERT INTO pgmqtt_admin_commands (kind, target, reason_code) \
+             VALUES ($1, $2, $3) RETURNING id",
+            None,
+            &args,
+        )?;
+        for row in table {
+            return Ok::<i64, spi::Error>(row.get::<i64>(1)?.unwrap_or(0));
+        }
+        Ok(0)
+    })
+    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to enqueue admin command: {}", e))
+}
+
+/// Disconnect a single MQTT client by client_id. Returns the command id.
+///
+/// The disconnect is asynchronous: the row is consumed by the BGW on the next
+/// tick (default 5 ms). The Will message, if any, fires.
+#[pg_extern]
+fn pgmqtt_disconnect_client(client_id: &str, reason_code: default!(i32, 135)) -> i64 {
+    enqueue_admin_command("disconnect_client", client_id, Some(reason_code as i16))
+}
+
+/// Disconnect every MQTT client that authenticated as the given Postgres role.
+/// Returns the command id. Use after revoking a role's password or ACLs.
+#[pg_extern]
+fn pgmqtt_disconnect_role(role_name: &str, reason_code: default!(i32, 135)) -> i64 {
+    enqueue_admin_command("disconnect_role", role_name, Some(reason_code as i16))
+}
+
+/// Reload the in-memory ACL allowlist for a connected client (or all clients
+/// with `'*'`) without disconnecting them. No-op for clients that did not
+/// authenticate via password auth.
+#[pg_extern]
+fn pgmqtt_reload_acls(target: &str) -> i64 {
+    enqueue_admin_command("reload_acls", target, None)
 }
 
 /// Return the current license status as a composite row.
@@ -1135,6 +1216,30 @@ pub unsafe extern "C" fn _PG_init() {
         c"Require valid JWT for WebSocket connections (overrides jwt_required for WS)",
         c"",
         &JWT_REQUIRED_WS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.password_auth_enabled",
+        c"Enable MQTT username/password authentication against Postgres roles (pg_authid SCRAM-SHA-256)",
+        c"",
+        &PASSWORD_AUTH_ENABLED,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.password_auth_required",
+        c"Require valid username/password on every MQTT CONNECT (only effective when password_auth_enabled = on)",
+        c"",
+        &PASSWORD_AUTH_REQUIRED,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
+        c"pgmqtt.password_auth_role_filter",
+        c"Optional SQL LIKE pattern (e.g. 'mqtt\\_%') restricting which roles may authenticate via MQTT. Empty = any login role.",
+        c"",
+        &PASSWORD_AUTH_ROLE_FILTER,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

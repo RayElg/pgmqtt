@@ -82,6 +82,80 @@ Hot-reloadable — key rotation and policy changes take effect on the next conne
 
 ---
 
+## Password Authentication
+
+Validates the MQTT CONNECT `username` and `password` against the SCRAM-SHA-256 verifier stored in `pg_authid` for that Postgres role. Validation runs in-process during the CONNECT handshake — no extra database connection is opened.
+
+- Only `SCRAM-SHA-256` verifiers are accepted. The deprecated `md5` scheme is explicitly rejected.
+- `rolcanlogin` and `rolvaliduntil` are honored. Roles with `LOGIN` disabled or with an expired `VALID UNTIL` cannot authenticate via MQTT.
+- `pg_hba.conf` is **not** consulted — it governs libpq connections only. Use `pgmqtt.password_auth_role_filter` (a SQL `LIKE` pattern) if you want to restrict MQTT auth to a specific subset of roles.
+- The broker only handles ASCII passwords reliably. Postgres applies SASLprep (RFC 4013) when computing the verifier; for non-ASCII passwords the input you provide on CONNECT must already be SASLprep-normalized.
+
+### GUCs
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pgmqtt.password_auth_enabled` | bool | `off` | Master switch. When off, username/password on CONNECT is ignored. |
+| `pgmqtt.password_auth_required` | bool | `off` | Reject any CONNECT that does not present a valid username/password. Only effective when `password_auth_enabled = on`. |
+| `pgmqtt.password_auth_role_filter` | string | `""` | Optional SQL `LIKE` pattern, e.g. `'mqtt\_%'`, restricting which roles may authenticate via MQTT. Empty = any login role. |
+
+### Setup
+
+```sql
+-- Create a dedicated login role for MQTT clients.
+CREATE ROLE mqtt_devices LOGIN PASSWORD 'hunter2';
+
+-- Enable password auth on the broker.
+ALTER SYSTEM SET pgmqtt.password_auth_enabled = 'on';
+
+-- Optional: restrict MQTT auth to roles named like 'mqtt_*'.
+ALTER SYSTEM SET pgmqtt.password_auth_role_filter = 'mqtt\_%';
+
+-- Optional: require password auth on every CONNECT.
+ALTER SYSTEM SET pgmqtt.password_auth_required = 'on';
+
+SELECT pg_reload_conf();
+```
+
+> **Confirm the verifier scheme.** Run `SHOW password_encryption;` — it must be `scram-sha-256` (PostgreSQL 14+ default). If your cluster still uses `md5`, MQTT password auth will fail with `BadVerifier` for every role until you set `password_encryption = scram-sha-256` and have users reset their passwords.
+
+### Behavior Matrix
+
+| `password_auth_enabled` | `password_auth_required` | Username | Password | Result |
+|---|---|---|---|---|
+| `off` | any | any | any | Allowed (anonymous) — username/password ignored |
+| `on` | `off` | absent | absent | Allowed (anonymous) |
+| `on` | `off` | present | valid | Allowed, authenticated as the role |
+| `on` | `off` | present | invalid | **Rejected** (0x86 BAD_USERNAME_PASSWORD) |
+| `on` | `on` | absent | any | **Rejected** (0x86) |
+| `on` | `on` | present | valid | Allowed |
+| `on` | `on` | present | invalid | **Rejected** (0x86) |
+
+When `password_auth_required = on` but `password_auth_enabled = off`, the broker rejects with `NOT_AUTHORIZED` (0x87) so the misconfiguration is loud.
+
+### Coexistence with JWT
+
+Both auth modes can be enabled simultaneously. On every CONNECT the broker sniffs the password field:
+
+- If it parses as `header.payload.signature` (three non-empty base64url segments separated by `.`) → routed to JWT.
+- Otherwise → routed to the password path (if `password_auth_enabled = on`).
+
+A plaintext password that happens to contain two dots and be base64url-decodable in all three segments will be misrouted to JWT. This is rare enough in practice that the simple sniff is preferred over a configuration knob. If you hit it, change the password.
+
+### Per-Topic ACLs
+
+When a client authenticates via password auth, per-topic access control can be enforced through the `pgmqtt_acls` table. This requires the enterprise `acl` license feature — see [enterprise.md → Topic-Level Access Control](enterprise.md#topic-level-access-control). Without the `acl` feature, password-authenticated clients get unrestricted topic access.
+
+### Admin Commands
+
+Three SQL functions let operators manage live connections. See [interfaces.md → Admin Commands](interfaces.md#admin-commands) for full details:
+
+- `pgmqtt_disconnect_client(client_id, reason_code)` — kick a single client.
+- `pgmqtt_disconnect_role(role_name, reason_code)` — kick all clients authenticated as a role.
+- `pgmqtt_reload_acls(target)` — refresh a live connection's ACL allowlist without disconnecting.
+
+---
+
 ## Performance Tuning
 
 Controls the BGW event loop cadence and CDC read frequency. These are the primary levers for trading latency against throughput.

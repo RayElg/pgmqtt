@@ -31,7 +31,10 @@ This document covers the enterprise-only features of pgmqtt: **license managemen
 | HTTP healthcheck endpoint | Yes | Yes |
 | Max concurrent connections | 1,000 | License-defined |
 | TLS (MQTTS / WSS) | No | Yes (`tls` feature) |
+| Username/password authentication (pg_authid SCRAM-SHA-256) | Yes | Yes |
+| Admin commands (`pgmqtt_disconnect_*`, `pgmqtt_reload_acls`) | Yes | Yes |
 | JWT authentication | No | Yes (`jwt` feature) |
+| Per-topic ACLs (via `pgmqtt_acls` table) | No | Yes (`acl` feature) |
 | Per-topic ACLs (via JWT claims) | No | Yes (`jwt` feature) |
 | WebSocket-only JWT enforcement | No | Yes (`jwt` feature) |
 | JWT `client_id` binding | No | Yes (`jwt` feature) |
@@ -40,7 +43,6 @@ This document covers the enterprise-only features of pgmqtt: **license managemen
 | Prometheus exposition | No | Yes (`metrics` feature) |
 | Metrics hook functions | No | Yes (`metrics` feature) |
 | NOTIFY streaming | No | Yes (`metrics` feature) |
-| Multi-node replication | No | Yes (`multi_node` feature) |
 | License grace period | N/A | Yes |
 | `pgmqtt_license_status()` | Returns `community` | Returns `active`/`grace`/`expired` |
 
@@ -71,7 +73,7 @@ The signature is computed over the raw JSON payload bytes using Ed25519. Tokens 
   "customer": "acme-corp",
   "expires_at": 1710354890,
   "grace_expires_at": 1711049890,
-  "features": ["tls", "jwt", "multi_node"],
+  "features": ["tls", "jwt"],
   "max_connections": 100
 }
 ```
@@ -81,7 +83,7 @@ The signature is computed over the raw JSON payload bytes using Ed25519. Tokens 
 | `customer` | string | Customer identifier |
 | `expires_at` | i64 | Unix timestamp — license expiration |
 | `grace_expires_at` | i64 | Unix timestamp — hard cutoff after grace period |
-| `features` | string[] | Enabled features: `"tls"`, `"jwt"`, `"multi_node"` |
+| `features` | string[] | Enabled features: `"tls"`, `"jwt"`, `"acl"`, `"metrics"` |
 | `max_connections` | usize | Maximum concurrent MQTT connections |
 
 Unrecognized feature names in the `features` array will produce a warning log.
@@ -116,6 +118,7 @@ python scripts/gen_test_license.py \
   --features tls jwt \
   --max-connections 50
 ```
+
 
 ---
 
@@ -214,13 +217,40 @@ SELECT pg_reload_conf();
 
 ### Overview
 
-When a JWT contains `sub_claims` or `pub_claims`, the server enforces per-topic authorization on every SUBSCRIBE and PUBLISH packet for the lifetime of the connection.
+Per-topic authorization is enforced on every SUBSCRIBE and PUBLISH packet for the lifetime of the connection. The allowlist comes from one of two sources, depending on how the client authenticated:
+
+- **JWT** (`jwt` license feature): the `sub_claims` / `pub_claims` arrays inside the validated token.
+- **Password auth** (`acl` license feature): rows in the `pgmqtt_acls` table keyed on the authenticated role.
+
+Without the corresponding license feature, the allowlist is **empty** which under the rule below means "unrestricted" — Community-tier password-authenticated clients get full topic access.
+
+### The `pgmqtt_acls` table
+
+```sql
+CREATE TABLE pgmqtt_acls (
+    role_name     name    NOT NULL,
+    topic_filter  text    NOT NULL,
+    can_publish   boolean NOT NULL DEFAULT false,
+    can_subscribe boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (role_name, topic_filter)
+);
+```
+
+Example: a role that can publish telemetry it owns and subscribe to its own command channel.
+
+```sql
+INSERT INTO pgmqtt_acls (role_name, topic_filter, can_publish, can_subscribe) VALUES
+  ('mqtt_devices', 'telemetry/{client_id}', true,  false),
+  ('mqtt_devices', 'cmd/+',                 false, true);
+```
+
+ACLs are loaded once on CONNECT and cached on the connection. To refresh a live connection without disconnecting it, use [`pgmqtt_reload_acls`](#admin-commands).
 
 ### Rules
 
-- **Empty claims array = unrestricted.** If `sub_claims` is `[]` or absent, the client can subscribe to any topic. Same for `pub_claims` and publishing.
-- **Non-empty claims = allowlist.** The client can only operate on topics that match at least one entry in the claims array.
-- **MQTT wildcards supported.** Claim entries can use `+` (single-level) and `#` (multi-level) wildcards with standard MQTT semantics.
+- **Empty allowlist = unrestricted.** If no rows match the role (or no JWT claims), the client can operate on any topic.
+- **Non-empty allowlist.** The client can only operate on topics that match at least one entry. `can_publish` and `can_subscribe` are evaluated independently.
+- **MQTT wildcards supported.** Entries can use `+` (single-level) and `#` (multi-level) wildcards with standard MQTT semantics.
 
 ### Enforcement
 
@@ -239,6 +269,7 @@ When a JWT contains `sub_claims` or `pub_claims`, the server enforces per-topic 
 | `sensors/#` | `sensors/temp/deep` | Yes |
 | `devices/42` | `devices/42` | Yes |
 | `devices/42` | `devices/99` | No |
+
 
 ---
 
@@ -484,4 +515,8 @@ Returns all metrics in Prometheus text exposition format. Requires `metrics` lic
 ```sql
 SELECT pgmqtt_prometheus_metrics();
 ```
+
+### `pgmqtt_disconnect_client(text, int)` / `pgmqtt_disconnect_role(text, int)` / `pgmqtt_reload_acls(text)`
+
+Admin commands — see [interfaces.md → Admin Commands](interfaces.md#admin-commands).
 
