@@ -2682,16 +2682,26 @@ fn dispatch_admin_command(
         }
         Command::ReloadAcls { target } => {
             if target == "*" {
-                let mut n = 0;
-                for client in clients.values_mut() {
-                    if let Some(role) = client.authenticated_role.clone() {
-                        let rules = crate::password_auth::load_acls_for_role(&role);
-                        client.sub_claims = rules.sub;
-                        client.pub_claims = rules.pub_;
-                        n += 1;
+                let roles: Vec<String> = clients
+                    .values()
+                    .filter_map(|c| c.authenticated_role.clone())
+                    .collect();
+                if roles.is_empty() {
+                    log!("pgmqtt admin: reload_acls '*': no authenticated clients");
+                } else {
+                    let by_role = crate::password_auth::load_acls_for_roles(&roles);
+                    let mut n = 0;
+                    for client in clients.values_mut() {
+                        if let Some(role) = &client.authenticated_role {
+                            if let Some(rules) = by_role.get(role) {
+                                client.sub_claims = rules.sub.clone();
+                                client.pub_claims = rules.pub_.clone();
+                                n += 1;
+                            }
+                        }
                     }
+                    log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
                 }
-                log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
             } else if let Some(client) = clients.get_mut(&target) {
                 if let Some(role) = client.authenticated_role.clone() {
                     let rules = crate::password_auth::load_acls_for_role(&role);

@@ -82,7 +82,7 @@ fn active_public_key() -> &'static [u8; 32] {
 }
 
 /// Known feature names for validation.
-const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "multi_node", "acl"];
+const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "acl"];
 
 fn validate_license_with_key(token: &str, pubkey_bytes: &[u8; 32]) -> LicenseStatus {
     let token = token.trim();

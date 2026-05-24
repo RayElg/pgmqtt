@@ -22,6 +22,7 @@ use base64::Engine;
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::spi::Spi;
 use ring::{constant_time, digest, hmac, pbkdf2};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 // Dummy verifier params used on no-role / bad-verifier paths so that every
@@ -52,44 +53,20 @@ pub enum AuthOutcome {
 /// Verify the supplied (username, password) against `pg_authid`. Honors the
 /// optional `password_auth_role_filter` LIKE pattern.
 ///
-/// Timing: every code path runs exactly one `compute_stored_key` (PBKDF2 +
-/// HMAC + SHA-256) against either the real verifier or a fixed dummy, then a
-/// constant-time compare. This prevents a remote attacker from distinguishing
-/// "no such role", "filtered out", or "wrong password" by measuring response
-/// latency — all paths pay the full PBKDF2 cost.
-///
-// TODO(perf): `lookup_role` and `role_matches_filter` each open a
-// `BackgroundWorker::transaction` + SPI round-trip on the event-loop hot
-// path. Acceptable for current scale (IoT, not thousands of CONNECTs/s),
-// but should be profiled if high-throughput auth is needed.
+/// Timing: every code path runs exactly one `lookup_auth` SPI roundtrip and
+/// one `compute_stored_key` (PBKDF2 + HMAC + SHA-256) against either the real
+/// verifier or a fixed dummy, then a constant-time compare. This prevents a
+/// remote attacker from distinguishing "no such role", "filtered out", or
+/// "wrong password" by measuring response latency.
 pub fn verify(username: &str, password: &[u8]) -> AuthOutcome {
-    // If the role filter is configured, check it first. On rejection we do
-    // NOT return early — we fall through to the dummy PBKDF2 derivation so
-    // that FilteredOut and LookupError are indistinguishable from
-    // BadPassword by response latency.
-    let mut filter_outcome: Option<AuthOutcome> = None;
     let filter = crate::get_password_auth_role_filter_guc();
-    if !filter.is_empty() {
-        match role_matches_filter(username, &filter) {
-            Some(true) => {}
-            Some(false) => filter_outcome = Some(AuthOutcome::FilteredOut),
-            None => filter_outcome = Some(AuthOutcome::LookupError),
-        }
-    }
-
-    // Skip the real lookup when we already know the filter rejected the
-    // role — we'll use the dummy verifier either way.
-    let row = if filter_outcome.is_none() {
-        lookup_role(username)
-    } else {
-        Ok(None)
-    };
+    let lookup = lookup_auth(username, &filter);
 
     // Pick a verifier: the real one if the role is valid and has a parseable
     // SCRAM-SHA-256 entry, otherwise the dummy. The dummy ensures we always
     // do one PBKDF2 derivation below.
-    let real_verifier: Option<ScramVerifier> = match &row {
-        Ok(Some(r)) => {
+    let real_verifier: Option<ScramVerifier> = match &lookup {
+        Ok(l) => l.role.as_ref().and_then(|r| {
             let role_usable = r.can_login
                 && r.valid_until_unix
                     .map(|t| crate::license::now_secs() <= t)
@@ -99,8 +76,8 @@ pub fn verify(username: &str, password: &[u8]) -> AuthOutcome {
             } else {
                 None
             }
-        }
-        _ => None,
+        }),
+        Err(()) => None,
     };
 
     let (salt, iterations, expected_stored_key): (&[u8], NonZeroU32, &[u8]) = match &real_verifier {
@@ -115,20 +92,19 @@ pub fn verify(username: &str, password: &[u8]) -> AuthOutcome {
     let computed = compute_stored_key(password, salt, iterations);
     let matches = constant_time::verify_slices_are_equal(&computed, expected_stored_key).is_ok();
 
-    // If the filter already decided the outcome, return it now that we've
-    // paid the PBKDF2 cost.
-    if let Some(outcome) = filter_outcome {
-        return outcome;
-    }
-
-    // Decide the outcome based on the *role state*, not the compare result.
-    // The compare is short-circuited to a guaranteed-false dummy on every
-    // path where the role can't authenticate, so `matches == true` only ever
-    // happens when we ran a real verifier.
-    match row {
+    match lookup {
         Err(()) => AuthOutcome::LookupError,
-        Ok(None) => AuthOutcome::BadRole,
-        Ok(Some(r)) => {
+        Ok(l) => {
+            // Filter rejection takes priority over role state — preserves
+            // prior semantics where FilteredOut surfaces as NOT_AUTHORIZED
+            // (0x87) so operators can distinguish it from BadPassword.
+            if !l.passes_filter {
+                return AuthOutcome::FilteredOut;
+            }
+            let r = match l.role {
+                Some(r) => r,
+                None => return AuthOutcome::BadRole,
+            };
             if !r.can_login {
                 return AuthOutcome::BadRole;
             }
@@ -155,58 +131,55 @@ struct AuthRow {
     rolpassword: Option<String>,
 }
 
-fn lookup_role(username: &str) -> Result<Option<AuthRow>, ()> {
+struct AuthLookup {
+    /// True when the GUC pattern is empty or `username LIKE pattern`.
+    passes_filter: bool,
+    /// Role row from pg_authid; None when the role does not exist.
+    role: Option<AuthRow>,
+}
+fn lookup_auth(username: &str, filter: &str) -> Result<AuthLookup, ()> {
     // BGW runs as the bootstrap superuser, so `pg_authid` is readable.
     // DatumWithOid args MUST be constructed inside the Spi::connect closure —
     // they reference SPI memory contexts that don't exist outside it.
     // BackgroundWorker::transaction provides the outer transaction; Spi::connect
     // alone is not safe at the BGW main-loop scope.
-    let result: Result<Option<AuthRow>, pgrx::spi::Error> = BackgroundWorker::transaction(|| Spi::connect(|client| {
-        let args: Vec<pgrx::datum::DatumWithOid> = vec![username.into()];
-        let table = client.select(
-            "SELECT rolcanlogin, \
-                    EXTRACT(EPOCH FROM rolvaliduntil)::bigint AS valid_until, \
-                    rolpassword \
-             FROM pg_catalog.pg_authid \
-             WHERE rolname = $1",
-            Some(1),
-            &args,
-        )?;
-        for row in table {
-            let can_login: bool = row.get::<bool>(1)?.unwrap_or(false);
-            let valid_until_unix: Option<i64> = row.get::<i64>(2)?;
-            let rolpassword: Option<String> = row.get::<String>(3)?;
-            return Ok(Some(AuthRow {
-                can_login,
-                valid_until_unix,
-                rolpassword,
-            }));
-        }
-        Ok(None)
-    }));
-    result.map_err(|e| {
-        pgrx::log!("pgmqtt password_auth: pg_authid lookup failed: {}", e);
-    })
-}
-
-fn role_matches_filter(username: &str, pattern: &str) -> Option<bool> {
-    let result: Result<Option<bool>, pgrx::spi::Error> =
+    let result: Result<AuthLookup, pgrx::spi::Error> =
         BackgroundWorker::transaction(|| Spi::connect(|client| {
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![username.into(), pattern.into()];
-            let table = client.select("SELECT $1 LIKE $2", Some(1), &args)?;
+            let args: Vec<pgrx::datum::DatumWithOid> =
+                vec![username.into(), filter.into()];
+            let table = client.select(
+                "SELECT \
+                     ($2::text = '' OR $1::text LIKE $2::text) AS passes_filter, \
+                     a.rolcanlogin, \
+                     EXTRACT(EPOCH FROM a.rolvaliduntil)::bigint AS valid_until, \
+                     a.rolpassword \
+                 FROM (SELECT 1) q \
+                 LEFT JOIN pg_catalog.pg_authid a ON a.rolname = $1::text",
+                Some(1),
+                &args,
+            )?;
             for row in table {
-                return Ok(row.get::<bool>(1)?);
+                let passes_filter: bool = row.get::<bool>(1)?.unwrap_or(false);
+                let rolcanlogin: Option<bool> = row.get::<bool>(2)?;
+                let valid_until_unix: Option<i64> = row.get::<i64>(3)?;
+                let rolpassword: Option<String> = row.get::<String>(4)?;
+                let role = rolcanlogin.map(|can_login| AuthRow {
+                    can_login,
+                    valid_until_unix,
+                    rolpassword,
+                });
+                return Ok(AuthLookup { passes_filter, role });
             }
-            Ok(Some(false))
+            // LEFT JOIN against a one-row source always yields a row; this
+            // branch is unreachable but kept explicit for type completeness.
+            Ok(AuthLookup {
+                passes_filter: false,
+                role: None,
+            })
         }));
-    match result {
-        Ok(Some(b)) => Some(b),
-        Ok(None) => Some(false),
-        Err(e) => {
-            pgrx::log!("pgmqtt password_auth: role-filter LIKE failed: {}", e);
-            None
-        }
-    }
+    result.map_err(|e| {
+        pgrx::log!("pgmqtt password_auth: auth lookup failed: {}", e);
+    })
 }
 
 struct ScramVerifier {
@@ -264,11 +237,6 @@ pub struct AclRules {
 ///
 /// Returns empty rules when the license does not include the `acl` feature —
 /// Community-tier password auth grants full topic access.
-///
-// TODO(perf): When `reload_acls('*')` fires, this is called once per
-// authenticated client — N separate SPI transactions. For deployments with
-// many authenticated connections, batch into a single
-// `WHERE role_name = ANY($1)` query and distribute results in-memory.
 pub fn load_acls_for_role(role_name: &str) -> AclRules {
     if !crate::license::has_feature(crate::license::Feature::Acl) {
         return AclRules::default();
@@ -307,6 +275,77 @@ pub fn load_acls_for_role(role_name: &str) -> AclRules {
         Err(e) => {
             pgrx::log!("pgmqtt acls: load failed for role {}: {}", role_name, e);
             AclRules::default()
+        }
+    }
+}
+
+/// Returns a map from role name → rules. Roles with no matching rows are
+/// present in the map with an empty `AclRules` (unrestricted under the
+/// existing claims-enforcement code). Caller can pass duplicates; they're
+/// deduped before the query.
+///
+/// Returns an empty map when the license does not include the `acl` feature.
+pub fn load_acls_for_roles(role_names: &[String]) -> HashMap<String, AclRules> {
+    if !crate::license::has_feature(crate::license::Feature::Acl) {
+        return HashMap::new();
+    }
+    // Dedup the caller's roles so every requested role appears in the
+    // result map, even if pgmqtt_acls has no rows for it (empty rules ==
+    // unrestricted under the claims-enforcement code).
+    let unique: Vec<String> = {
+        let mut seen: HashMap<String, ()> = HashMap::new();
+        for r in role_names {
+            seen.entry(r.clone()).or_default();
+        }
+        seen.into_keys().collect()
+    };
+    if unique.is_empty() {
+        return HashMap::new();
+    }
+
+    let result: Result<HashMap<String, AclRules>, pgrx::spi::Error> =
+        BackgroundWorker::transaction(|| {
+            Spi::connect(|client| {
+                let mut out: HashMap<String, AclRules> = HashMap::new();
+                for r in &unique {
+                    out.entry(r.clone()).or_default();
+                }
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![unique.clone().into()];
+                let table = client.select(
+                    "SELECT role_name::text, topic_filter, can_publish, can_subscribe \
+                     FROM pgmqtt_acls WHERE role_name = ANY($1::name[])",
+                    None,
+                    &args,
+                )?;
+                for row in table {
+                    let role: String = match row.get::<String>(1)? {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let filter: String = match row.get::<String>(2)? {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let can_pub: bool = row.get::<bool>(3)?.unwrap_or(false);
+                    let can_sub: bool = row.get::<bool>(4)?.unwrap_or(false);
+                    let rules = out.entry(role).or_default();
+                    if can_pub {
+                        rules.pub_.push(filter.clone());
+                    }
+                    if can_sub {
+                        rules.sub.push(filter);
+                    }
+                }
+                Ok(out)
+            })
+        });
+    match result {
+        Ok(m) => m,
+        Err(e) => {
+            // Return empty map so caller leaves existing in-memory ACLs
+            // untouched on transient SPI failure rather than wiping them.
+            pgrx::log!("pgmqtt acls: batched load failed: {}", e);
+            HashMap::new()
         }
     }
 }
