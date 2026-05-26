@@ -397,7 +397,7 @@ pgmqtt_disconnect_client(
 ) RETURNS bigint
 ```
 
-Returns the inserted command row's `id`. Execution is asynchronous (next tick — typically <10 ms). The Will message, if any, fires.
+Returns the inserted command row's `id`. Execution is asynchronous (next tick — typically <10 ms). The Will message, if any, fires — except when the client's current `pub_claims` / `pgmqtt_acls` no longer cover the Will topic (e.g. after a `pgmqtt_reload_acls`), in which case it is silently dropped.
 
 The default `reason_code` is `0x87` (NOT_AUTHORIZED). Pass a different MQTT 5 reason code per [§3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208) if needed (e.g. `0x8E` SESSION_TAKEN_OVER). MQTT 3.1.1 has no server→client DISCONNECT packet, so 3.1.1 clients see the socket close without a reason code.
 
@@ -423,6 +423,8 @@ pgmqtt_disconnect_role(
 
 Returns the inserted command row's `id`. Anonymous and JWT-authenticated clients are unaffected.
 
+Kicked clients with a persistent session (`session_expiry_interval > 0`) keep their session and subscriptions. On reconnect, persisted subscriptions are re-validated against the role's *current* `pgmqtt_acls` and any rows no longer covered are pruned. If you want to fully expire the session as well, also delete the row from `pgmqtt_sessions`.
+
 **Example:**
 ```sql
 -- Force-reconnect everyone using a role after rotating its password.
@@ -443,7 +445,12 @@ pgmqtt_reload_acls(
 ) RETURNS bigint
 ```
 
-Returns the inserted command row's `id`. No-op for clients that did not authenticate via password auth.
+Returns the inserted command row's `id`. No-op for clients that did not authenticate via password auth (JWT claims are immutable for the session lifetime).
+
+Side effects of a refresh:
+
+- **Subscriptions are pruned.** Any active subscription whose topic filter is no longer covered by the refreshed `sub` rules is removed from the in-memory tree and `pgmqtt_subscriptions`. The client is not notified — MQTT has no server-initiated UNSUBSCRIBE — so they will simply stop receiving traffic on that filter.
+- **Stored Wills are re-checked.** If the client connected with a Will whose topic is no longer covered by the refreshed `pub` rules, the Will is dropped from the connection's state and will not fire on subsequent disconnect.
 
 **Example:**
 ```sql

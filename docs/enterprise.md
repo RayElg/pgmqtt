@@ -208,7 +208,9 @@ SELECT pg_reload_conf();
 
 ### Important Caveats
 
-- **Claims are connection-scoped and immutable.** Once a client connects with a JWT, its permissions are fixed for the session lifetime. There is no token refresh mechanism — if a token expires mid-session, the existing connection continues operating. Disconnect and reconnect to pick up new claims.
+- **Claims are connection-scoped and immutable for JWT.** Once a client connects with a JWT, its permissions are fixed for the session lifetime. There is no token refresh mechanism — if a token expires mid-session, the existing connection continues operating. Disconnect and reconnect to pick up new claims. (Password-auth ACLs can be refreshed without disconnect via [`pgmqtt_reload_acls`](#admin-commands).)
+- **Persistent subscriptions are re-validated on reconnect.** When a client reconnects (without `clean_start`), any persisted subscription whose topic filter is no longer covered by the current `sub_claims` / `pgmqtt_acls` is dropped from both the in-memory tree and `pgmqtt_subscriptions`. This applies regardless of whether the change came from a new JWT, an edited ACL row, or `pgmqtt_reload_acls`.
+- **Will messages are authorized at CONNECT and re-checked at fire time.** A Will whose topic is not covered by the client's `pub_claims` causes the CONNECT to be rejected with `0x87` (NOT_AUTHORIZED). If `pgmqtt_reload_acls` later narrows the pub allowlist, a stored Will whose topic is no longer covered is silently dropped instead of being published on disconnect.
 - **No audience/issuer validation.** Any valid Ed25519-signed JWT with a non-expired `exp` is accepted. If you share signing keys across services, consider adding application-level claim validation.
 
 ---
@@ -259,6 +261,10 @@ ACLs are loaded once on CONNECT and cached on the connection. To refresh a live 
 | SUBSCRIBE to unauthorized topic | SUBACK with reason code `0x87` (NOT_AUTHORIZED) |
 | PUBLISH QoS 1 to unauthorized topic | PUBACK with reason code `0x87` (NOT_AUTHORIZED) |
 | PUBLISH QoS 0 to unauthorized topic | Silently dropped (per MQTT spec, QoS 0 has no acknowledgment) |
+| CONNECT with Will on unauthorized topic | CONNACK with reason code `0x87` (NOT_AUTHORIZED); connection closed |
+| CONNECT with Will using a wildcard / NUL in the topic | CONNACK with reason code `0x90` (TOPIC_NAME_INVALID); connection closed |
+| Reconnect with persisted subscription no longer covered | Subscription pruned silently from in-memory tree and `pgmqtt_subscriptions` |
+| `pgmqtt_reload_acls` narrows the allowlist | Now-unauthorized subscriptions pruned; a stored Will on a now-unauthorized topic is dropped |
 
 ### Wildcard Matching Examples
 

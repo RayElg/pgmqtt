@@ -395,6 +395,18 @@ pub fn unsubscribe(client_id: &str, topic_filter: &str) -> bool {
     })
 }
 
+/// Return the topic filters currently subscribed by `client_id`.
+/// Filters are returned in their full wire form (including `$share/{group}/` prefix).
+pub fn client_filters(client_id: &str) -> Vec<String> {
+    with_state(|state| {
+        state
+            .client_to_filters
+            .get(client_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Return subscription counts for all clients in a single lock acquisition.
 pub fn subscription_counts() -> std::collections::HashMap<String, usize> {
     with_state(|state| {

@@ -1420,17 +1420,25 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
         // The client did NOT send a normal DISCONNECT, so the will fires.
         if let Some(will) = client.will.take() {
-            log!("pgmqtt mqtt: firing Will for '{}' on shutdown", id);
-            crate::metrics::inc(&crate::metrics::get().wills_fired);
-            will_publishes.push(PendingPublish {
-                topic: Arc::from(will.topic.as_str()),
-                payload: Arc::from(will.payload),
-                qos: will.qos,
-                retain: will.retain,
-                log_sender: format!("{} (Will/shutdown)", id),
-                packet_id: None,
-                inbound_mappings: Vec::new(),
-            });
+            if will_authorized(&client.pub_claims, &will.topic) {
+                log!("pgmqtt mqtt: firing Will for '{}' on shutdown", id);
+                crate::metrics::inc(&crate::metrics::get().wills_fired);
+                will_publishes.push(PendingPublish {
+                    topic: Arc::from(will.topic.as_str()),
+                    payload: Arc::from(will.payload),
+                    qos: will.qos,
+                    retain: will.retain,
+                    log_sender: format!("{} (Will/shutdown)", id),
+                    packet_id: None,
+                    inbound_mappings: Vec::new(),
+                });
+            } else {
+                log!(
+                    "pgmqtt mqtt: dropping Will for '{}' on shutdown — topic '{}' no longer authorized",
+                    id,
+                    will.topic
+                );
+            }
         }
 
         // Remove in-memory subscriptions and mark session state.
@@ -2333,6 +2341,52 @@ fn finish_connect(
         return;
     }
 
+    // ── Will validation ───────────────────────────────────────────────────────
+    // The Will is a deferred PUBLISH; it must satisfy the same authorization
+    // (JWT pub_claims / pgmqtt_acls pub rules) and topic-name rules (MQTT-3.3.2-2:
+    // no wildcards / NUL) as an inline PUBLISH. Without this check a client can
+    // bypass ACL/JWT by stashing the forbidden topic in a Will and disconnecting.
+    // Run before session takeover so an unauthorized new connection cannot
+    // collaterally tear down the existing session.
+    if let Some(ref will) = packet.will {
+        if will.topic.is_empty()
+            || will.topic.contains('\0')
+            || will.topic.contains('+')
+            || will.topic.contains('#')
+        {
+            log!(
+                "pgmqtt mqtt: '{}' CONNECT with invalid Will topic '{}' — rejecting",
+                client_id,
+                will.topic
+            );
+            let _ = transport.write_all(&mqtt::build_connack(
+                false,
+                mqtt::reason::TOPIC_NAME_INVALID,
+                v5,
+            ));
+            crate::metrics::inc(&crate::metrics::get().connections_rejected);
+            return;
+        }
+        if !pub_acl.is_empty()
+            && !pub_acl
+                .iter()
+                .any(|claim| crate::mqtt::topic_matches_filter(&will.topic, claim))
+        {
+            log!(
+                "pgmqtt mqtt: '{}' CONNECT with Will topic '{}' not authorized — rejecting",
+                client_id,
+                will.topic
+            );
+            let _ = transport.write_all(&mqtt::build_connack(
+                false,
+                mqtt::reason::NOT_AUTHORIZED,
+                v5,
+            ));
+            crate::metrics::inc(&crate::metrics::get().connections_rejected);
+            return;
+        }
+    }
+
     // ── Session takeover (MQTT 5.0 §4.9) ──────────────────────────────────────
     // If the ClientID represents a Client already connected, send DISCONNECT
     // with reason code 0x8E (Session taken over), fire its Will, then close
@@ -2356,16 +2410,24 @@ fn finish_connect(
         // when the server closes the connection for any reason other than a
         // normal DISCONNECT from the client).
         if let Some(will) = old_client.will.take() {
-            crate::metrics::inc(&crate::metrics::get().wills_fired);
-            pending_publishes.push(PendingPublish {
-                topic: Arc::from(will.topic.as_str()),
-                payload: Arc::from(will.payload),
-                qos: will.qos,
-                retain: will.retain,
-                log_sender: format!("{} (Will/takeover)", client_id),
-                packet_id: None,
-                inbound_mappings: Vec::new(),
-            });
+            if will_authorized(&old_client.pub_claims, &will.topic) {
+                crate::metrics::inc(&crate::metrics::get().wills_fired);
+                pending_publishes.push(PendingPublish {
+                    topic: Arc::from(will.topic.as_str()),
+                    payload: Arc::from(will.payload),
+                    qos: will.qos,
+                    retain: will.retain,
+                    log_sender: format!("{} (Will/takeover)", client_id),
+                    packet_id: None,
+                    inbound_mappings: Vec::new(),
+                });
+            } else {
+                log!(
+                    "pgmqtt mqtt: dropping Will for '{}' on takeover — topic '{}' no longer authorized",
+                    client_id,
+                    will.topic
+                );
+            }
         }
 
         // Session takeover acts as a disconnect for the old connection.
@@ -2572,6 +2634,13 @@ fn finish_connect(
         }
     }
 
+    // Persistent subscriptions outlive the auth identity that created them.
+    // A client reconnecting (or taking over a session) may now hold narrower
+    // sub_claims than when the subscriptions were written. Prune anything the
+    // current claims don't cover before the client is registered, so the
+    // delivery path (which trusts the subscription tree) cannot leak messages.
+    prune_unauthorized_subscriptions(&client_id, &sub_acl, session_db_actions);
+
     let transport_label: &'static str = match &transport {
         Transport::Raw(_) => "mqtt",
         Transport::Ws(_) => "ws",
@@ -2690,15 +2759,32 @@ fn dispatch_admin_command(
                     log!("pgmqtt admin: reload_acls '*': no authenticated clients");
                 } else {
                     let by_role = crate::password_auth::load_acls_for_roles(&roles);
-                    let mut n = 0;
-                    for client in clients.values_mut() {
+                    // Collect ids to prune after the mutable borrow on `clients` drops.
+                    let mut refreshed: Vec<(String, Vec<String>)> = Vec::new();
+                    for (id, client) in clients.iter_mut() {
                         if let Some(role) = &client.authenticated_role {
                             if let Some(rules) = by_role.get(role) {
                                 client.sub_claims = rules.sub.clone();
                                 client.pub_claims = rules.pub_.clone();
-                                n += 1;
+                                let drop_will = client
+                                    .will
+                                    .as_ref()
+                                    .is_some_and(|w| !will_authorized(&client.pub_claims, &w.topic));
+                                if drop_will {
+                                    if let Some(w) = client.will.take() {
+                                        log!(
+                                            "pgmqtt admin: dropping Will for '{}' after reload_acls — topic '{}' no longer authorized",
+                                            id, w.topic
+                                        );
+                                    }
+                                }
+                                refreshed.push((id.clone(), client.sub_claims.clone()));
                             }
                         }
+                    }
+                    let n = refreshed.len();
+                    for (id, claims) in refreshed {
+                        prune_unauthorized_subscriptions(&id, &claims, session_db_actions);
                     }
                     log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
                 }
@@ -2707,7 +2793,21 @@ fn dispatch_admin_command(
                     let rules = crate::password_auth::load_acls_for_role(&role);
                     client.sub_claims = rules.sub;
                     client.pub_claims = rules.pub_;
+                    let drop_will = client
+                        .will
+                        .as_ref()
+                        .is_some_and(|w| !will_authorized(&client.pub_claims, &w.topic));
+                    if drop_will {
+                        if let Some(w) = client.will.take() {
+                            log!(
+                                "pgmqtt admin: dropping Will for '{}' after reload_acls — topic '{}' no longer authorized",
+                                target, w.topic
+                            );
+                        }
+                    }
+                    let claims = client.sub_claims.clone();
                     log!("pgmqtt admin: reload_acls '{}': refreshed", target);
+                    prune_unauthorized_subscriptions(&target, &claims, session_db_actions);
                 } else {
                     log!(
                         "pgmqtt admin: reload_acls '{}': client has no authenticated role",
@@ -2717,6 +2817,57 @@ fn dispatch_admin_command(
             } else {
                 log!("pgmqtt admin: reload_acls '{}': no such client", target);
             }
+        }
+    }
+}
+
+/// Re-check a stored Will against the client's *current* pub_claims.
+/// Empty claims means "no restrictions" (matches the inline PUBLISH path).
+/// Needed at fire time because pgmqtt_reload_acls can update pub_claims after
+/// the Will was accepted at CONNECT.
+fn will_authorized(pub_claims: &[String], will_topic: &str) -> bool {
+    pub_claims.is_empty()
+        || pub_claims
+            .iter()
+            .any(|claim| crate::mqtt::topic_matches_filter(will_topic, claim))
+}
+
+/// Drop any of `client_id`'s subscriptions that the current `sub_claims` no
+/// longer cover. Called when claims change underneath an active session
+/// (pgmqtt_reload_acls) or when a client resumes a persistent session under
+/// a different identity than the one that originally subscribed.
+///
+/// Mirrors the SUBSCRIBE-time check at [`InboundPacket::Subscribe`]: empty
+/// claims = unrestricted, and shared subscriptions are validated against
+/// their real filter (post `$share/{group}/` prefix). Each pruned filter
+/// also produces a DeleteSubscription so the DB row goes too — without this
+/// the row would resurrect the subscription on the next broker restart.
+fn prune_unauthorized_subscriptions(
+    client_id: &str,
+    sub_claims: &[String],
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    if sub_claims.is_empty() {
+        return;
+    }
+    for filter in subscriptions::client_filters(client_id) {
+        let auth_filter = subscriptions::parse_shared_filter(&filter)
+            .map(|(_, f)| f)
+            .unwrap_or(filter.as_str());
+        let allowed = sub_claims
+            .iter()
+            .any(|claim| crate::mqtt::filter_covers_filter(auth_filter, claim));
+        if !allowed {
+            subscriptions::unsubscribe(client_id, &filter);
+            session_db_actions.push(SessionDbAction::DeleteSubscription {
+                client_id: client_id.to_string(),
+                topic_filter: filter.clone(),
+            });
+            log!(
+                "pgmqtt mqtt: pruning subscription '{}' for '{}' — not covered by current sub claims",
+                filter,
+                client_id
+            );
         }
     }
 }
@@ -2736,20 +2887,28 @@ fn disconnect_client(
             crate::metrics::inc(&m.disconnections_unclean);
         }
         if let Some(will) = client.will.take() {
-            log!(
-                "pgmqtt mqtt: client '{}' disconnected unexpectedly, buffering Will",
-                id
-            );
-            crate::metrics::inc(&m.wills_fired);
-            pending_publishes.push(PendingPublish {
-                topic: Arc::from(will.topic.as_str()),
-                payload: Arc::from(will.payload),
-                qos: will.qos,
-                retain: will.retain,
-                log_sender: format!("{} (Will)", id),
-                packet_id: None,
-                inbound_mappings: Vec::new(),
-            });
+            if will_authorized(&client.pub_claims, &will.topic) {
+                log!(
+                    "pgmqtt mqtt: client '{}' disconnected unexpectedly, buffering Will",
+                    id
+                );
+                crate::metrics::inc(&m.wills_fired);
+                pending_publishes.push(PendingPublish {
+                    topic: Arc::from(will.topic.as_str()),
+                    payload: Arc::from(will.payload),
+                    qos: will.qos,
+                    retain: will.retain,
+                    log_sender: format!("{} (Will)", id),
+                    packet_id: None,
+                    inbound_mappings: Vec::new(),
+                });
+            } else {
+                log!(
+                    "pgmqtt mqtt: dropping Will for '{}' on disconnect — topic '{}' no longer authorized",
+                    id,
+                    will.topic
+                );
+            }
         }
 
         // Mark session as disconnected so the sweeper can reap it later.
