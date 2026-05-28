@@ -182,6 +182,7 @@ def _auth_enabled_and_clean():
     yield
     _clear_acls()
     reset_guc("pgmqtt.password_auth_enabled")
+    reset_guc("pgmqtt.acl_default_deny")
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +277,11 @@ def test_pub_and_sub_are_independent(acl_license):
         sock.close()
 
 
-def test_no_acl_rows_means_unrestricted(acl_license):
-    """A role with zero rows in pgmqtt_acls keeps full access (empty
-    allowlist = unrestricted)."""
+def test_default_deny_off_restores_unrestricted(acl_license):
+    """With acl_default_deny explicitly off, a role with zero rows in
+    pgmqtt_acls keeps full access — the pre-0.3.0 fail-open behavior, now
+    opt-in."""
+    set_guc("pgmqtt.acl_default_deny", "off")
     # No rows inserted.
     sock = _mqtt_connect_authed("acl-empty")
     try:
@@ -305,6 +308,68 @@ def test_without_acl_license_rows_are_ignored(no_acl_license):
         sock.close()
 
 
+def test_default_deny_blocks_role_with_no_acls(acl_license):
+    """By default (acl_default_deny on since 0.3.0), a password-authed role that
+    has zero rows in pgmqtt_acls can neither subscribe nor publish (fail
+    closed). No GUC is set here — this exercises the shipped default."""
+    # No rows inserted for the role.
+    sock = _mqtt_connect_authed("acl-deny-norows")
+    try:
+        sock.sendall(_build_subscribe("anything/here", packet_id=1))
+        suback = read_packet(sock, timeout=5.0)
+        assert _parse_suback_reason(suback) == RC_NOT_AUTHORIZED, \
+            "default-deny should reject SUBSCRIBE for a role with no ACL rows"
+
+        sock.sendall(_build_publish_qos1("anything/here", b"x", packet_id=2))
+        puback = read_packet(sock, timeout=5.0)
+        assert _parse_puback_reason(puback) == RC_NOT_AUTHORIZED, \
+            "default-deny should reject PUBLISH for a role with no ACL rows"
+    finally:
+        sock.close()
+
+
+def test_default_deny_is_per_side(acl_license):
+    """default-deny is applied independently to the sub and pub allowlists: a
+    role granted only a subscribe row keeps that subscribe access but is denied
+    all publishing (its pub allowlist is empty → deny-all). Relies on the
+    default-on behavior."""
+    _insert_acl("allowed/#", can_pub=False, can_sub=True)
+
+    sock = _mqtt_connect_authed("acl-deny-perside")
+    try:
+        # Granted subscribe topic still works.
+        sock.sendall(_build_subscribe("allowed/here", packet_id=1))
+        suback = read_packet(sock, timeout=5.0)
+        assert _parse_suback_reason(suback) == GRANTED_QOS_0
+
+        # Subscribe outside the grant is denied.
+        sock.sendall(_build_subscribe("other/topic", packet_id=2))
+        suback = read_packet(sock, timeout=5.0)
+        assert _parse_suback_reason(suback) == RC_NOT_AUTHORIZED
+
+        # Publishing is denied entirely — no can_publish row exists.
+        sock.sendall(_build_publish_qos1("allowed/here", b"x", packet_id=3))
+        puback = read_packet(sock, timeout=5.0)
+        assert _parse_puback_reason(puback) == RC_NOT_AUTHORIZED
+    finally:
+        sock.close()
+
+
+def test_default_deny_ignored_without_acl_license(no_acl_license):
+    """acl_default_deny is an enterprise ('acl' feature) capability: without the
+    license it must not lock out a Community password-authed client, which stays
+    unrestricted."""
+    set_guc("pgmqtt.acl_default_deny", "on")
+    sock = _mqtt_connect_authed("acl-deny-no-license")
+    try:
+        sock.sendall(_build_subscribe("anything/here", packet_id=1))
+        suback = read_packet(sock, timeout=5.0)
+        assert _parse_suback_reason(suback) == GRANTED_QOS_0, \
+            "default-deny should be a no-op without the 'acl' license feature"
+    finally:
+        sock.close()
+
+
 def test_reload_acls_refreshes_without_disconnect(acl_license):
     """pgmqtt_reload_acls swaps the in-memory allowlist on a live client.
 
@@ -312,6 +377,9 @@ def test_reload_acls_refreshes_without_disconnect(acl_license):
     (only 'allowed/#' permitted) → reload → previously-allowed topic is now
     rejected on the SAME socket without a reconnect.
     """
+    # This scenario starts from the unrestricted (no-rows) state, so opt out of
+    # the 0.3.0 default-deny; the point under test is the live in-memory swap.
+    set_guc("pgmqtt.acl_default_deny", "off")
     sock = _mqtt_connect_authed("acl-reload")
     try:
         # Initially unrestricted: subscribe to a topic we'll later forbid.

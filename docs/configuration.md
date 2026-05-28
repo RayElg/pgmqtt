@@ -146,6 +146,8 @@ A plaintext password that happens to contain two dots and be base64url-decodable
 
 When a client authenticates via password auth, per-topic access control can be enforced through the `pgmqtt_acls` table. This requires the enterprise `acl` license feature — see [enterprise.md → Topic-Level Access Control](enterprise.md#topic-level-access-control). Without the `acl` feature, password-authenticated clients get unrestricted topic access.
 
+With the `acl` feature, a role with **no covering `pgmqtt_acls` row is denied** by default. Set `pgmqtt.acl_default_deny = off` to restore the legacy fail-open behavior where such a role gets unrestricted access — see [enterprise.md → `acl_default_deny`](enterprise.md#opting-back-into-fail-open-pgmqttacl_default_deny).
+
 ### Admin Commands
 
 Three SQL functions let operators manage live connections. See [interfaces.md → Admin Commands](interfaces.md#admin-commands) for full details:

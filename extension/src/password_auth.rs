@@ -232,6 +232,30 @@ pub struct AclRules {
     pub pub_: Vec<String>,
 }
 
+/// Sentinel topic filter meaning "deny every topic". Injected into an otherwise
+/// empty allowlist when `acl_default_deny` is on, so the existing "non-empty
+/// allowlist = restrict to these filters" enforcement (subscribe/publish/Will/
+/// prune) denies everything with no special-casing. The NUL byte never appears
+/// in a valid MQTT topic name or filter, so no real PUBLISH topic can match it
+/// and no real SUBSCRIBE filter can be covered by it.
+pub const DENY_ALL_SENTINEL: &str = "\0pgmqtt-deny-all";
+
+/// Apply `acl_default_deny` to a freshly loaded rule set: a side (sub or pub)
+/// with no rows becomes a single deny-all sentinel instead of the default
+/// "empty = unrestricted". Applied per-side, so a role granted only
+/// `can_subscribe` rows is still denied all publishing (and vice versa).
+fn apply_default_deny(mut rules: AclRules) -> AclRules {
+    if crate::get_acl_default_deny_guc() {
+        if rules.sub.is_empty() {
+            rules.sub.push(DENY_ALL_SENTINEL.to_string());
+        }
+        if rules.pub_.is_empty() {
+            rules.pub_.push(DENY_ALL_SENTINEL.to_string());
+        }
+    }
+    rules
+}
+
 /// Load the per-topic ACL rows for `role_name` from `pgmqtt_acls`. Empty
 /// vectors mean "unrestricted" under the existing claims-enforcement code.
 ///
@@ -265,16 +289,19 @@ pub fn load_acls_for_role(role_name: &str) -> AclRules {
             }
         }
         // Empty sub/pub_ vectors fall through to "unrestricted" under the
-        // existing claims-enforcement code (see mqtt.rs:claim_covers_*). If
-        // an operator wants "deny everything", they should leave the role
-        // out of pgmqtt_acls and rely on jwt or role-filter instead.
+        // existing claims-enforcement code (see mqtt.rs:claim_covers_*), unless
+        // acl_default_deny is on — see apply_default_deny below.
         Ok(rules)
     }));
     match result {
-        Ok(rules) => rules,
+        Ok(rules) => apply_default_deny(rules),
         Err(e) => {
+            // Fail closed: under acl_default_deny a transient load error must
+            // not silently grant unrestricted access. apply_default_deny turns
+            // the empty rule set into deny-all; with the GUC off it stays empty
+            // (unrestricted), matching the prior behavior.
             pgrx::log!("pgmqtt acls: load failed for role {}: {}", role_name, e);
-            AclRules::default()
+            apply_default_deny(AclRules::default())
         }
     }
 }
@@ -340,10 +367,18 @@ pub fn load_acls_for_roles(role_names: &[String]) -> HashMap<String, AclRules> {
             })
         });
     match result {
-        Ok(m) => m,
+        Ok(mut m) => {
+            // Per-side deny-all for roles with no covering row when
+            // acl_default_deny is on (no-op otherwise).
+            for rules in m.values_mut() {
+                *rules = apply_default_deny(std::mem::take(rules));
+            }
+            m
+        }
         Err(e) => {
-            // Return empty map so caller leaves existing in-memory ACLs
-            // untouched on transient SPI failure rather than wiping them.
+            // Leave the caller's existing in-memory ACLs untouched on transient
+            // SPI failure rather than wiping them. Those were already
+            // default-deny-resolved at load time, so this never widens access.
             pgrx::log!("pgmqtt acls: batched load failed: {}", e);
             HashMap::new()
         }
@@ -389,6 +424,25 @@ mod tests {
     #[test]
     fn scram_verifier_rejects_md5() {
         assert!(parse_scram_verifier("md5abcdef0123456789abcdef01234567").is_none());
+    }
+
+    #[test]
+    fn deny_all_sentinel_matches_no_topic() {
+        // The deny-all sentinel must reject every realistic publish topic and
+        // never cover any subscribe filter, so injecting it into an allowlist
+        // denies everything via the normal enforcement path.
+        for topic in ["a", "a/b/c", "$SYS/x", "telemetry/42", ""] {
+            assert!(
+                !crate::mqtt::topic_matches_filter(topic, DENY_ALL_SENTINEL),
+                "sentinel unexpectedly matched publish topic {topic:?}"
+            );
+        }
+        for filter in ["a", "a/b/c", "a/#", "+/+", "#"] {
+            assert!(
+                !crate::mqtt::filter_covers_filter(filter, DENY_ALL_SENTINEL),
+                "sentinel unexpectedly covered subscribe filter {filter:?}"
+            );
+        }
     }
 
     #[test]

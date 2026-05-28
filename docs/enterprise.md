@@ -224,7 +224,7 @@ Per-topic authorization is enforced on every SUBSCRIBE and PUBLISH packet for th
 - **JWT** (`jwt` license feature): the `sub_claims` / `pub_claims` arrays inside the validated token.
 - **Password auth** (`acl` license feature): rows in the `pgmqtt_acls` table keyed on the authenticated role.
 
-Without the corresponding license feature, the allowlist is **empty** which under the rule below means "unrestricted" — Community-tier password-authenticated clients get full topic access.
+Without the corresponding license feature the table is never consulted, so the client is **unrestricted** — Community-tier password-authenticated clients get full topic access (and `acl_default_deny` has no effect).
 
 ### The `pgmqtt_acls` table
 
@@ -250,9 +250,27 @@ ACLs are loaded once on CONNECT and cached on the connection. To refresh a live 
 
 ### Rules
 
-- **Empty allowlist = unrestricted.** If no rows match the role (or no JWT claims), the client can operate on any topic.
+- **Default-deny for password auth (`acl` feature).** A password-authenticated role with **no covering `pgmqtt_acls` row** is denied that operation. Evaluated independently per side: a role granted only `can_subscribe` rows is still denied all publishing. Set `pgmqtt.acl_default_deny = off` (below) to restore the legacy "no rows = unrestricted" behavior.
 - **Non-empty allowlist.** The client can only operate on topics that match at least one entry. `can_publish` and `can_subscribe` are evaluated independently.
+- **JWT empty claims = unrestricted.** A JWT with an empty/absent `sub_claims` (or `pub_claims`) can operate on any topic. JWT keeps these semantics regardless of `acl_default_deny`, which governs only the `pgmqtt_acls` path.
 - **MQTT wildcards supported.** Entries can use `+` (single-level) and `#` (multi-level) wildcards with standard MQTT semantics.
+
+#### Opting back into fail-open: `pgmqtt.acl_default_deny`
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pgmqtt.acl_default_deny` | bool | `on` | When `on` (default), a password-authenticated role with no covering `pgmqtt_acls` row is denied. Set `off` to grant such a role unrestricted access instead (the pre-0.3.0 behavior). |
+
+```sql
+-- Only if you specifically want the legacy fail-open behavior:
+ALTER SYSTEM SET pgmqtt.acl_default_deny = 'off';
+SELECT pg_reload_conf();
+```
+
+Notes:
+
+- **Only effective with the `acl` license feature.** Without it, `pgmqtt_acls` is never consulted, so the GUC is a no-op and Community-tier password-authenticated clients remain unrestricted regardless of its value.
+- **JWT is unaffected.** JWT `sub_claims` / `pub_claims` keep their own "empty claims = unrestricted" semantics; `acl_default_deny` only governs the `pgmqtt_acls` path.
 
 ### Enforcement
 

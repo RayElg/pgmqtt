@@ -397,7 +397,7 @@ pgmqtt_disconnect_client(
 ) RETURNS bigint
 ```
 
-Returns the inserted command row's `id`. Execution is asynchronous (next tick — typically <10 ms). The Will message, if any, fires — except when the client's current `pub_claims` / `pgmqtt_acls` no longer cover the Will topic (e.g. after a `pgmqtt_reload_acls`), in which case it is silently dropped.
+Returns the inserted command row's `id`. Execution is asynchronous: the BGW drains the queue on a fixed ~100 ms cadence. The Will message, if any, fires — except when the client's current `pub_claims` / `pgmqtt_acls` no longer cover the Will topic (e.g. after a `pgmqtt_reload_acls`), in which case it is silently dropped.
 
 The default `reason_code` is `0x87` (NOT_AUTHORIZED). Pass a different MQTT 5 reason code per [§3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208) if needed (e.g. `0x8E` SESSION_TAKEN_OVER). MQTT 3.1.1 has no server→client DISCONNECT packet, so 3.1.1 clients see the socket close without a reason code.
 

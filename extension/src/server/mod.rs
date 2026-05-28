@@ -1256,6 +1256,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     let mut last_inbound_reload = std::time::Instant::now();
     let mut last_session_sweep = std::time::Instant::now();
     let mut last_redeliver_check = std::time::Instant::now();
+    let mut last_admin_drain = std::time::Instant::now();
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
     let mut last_connections_flush = std::time::Instant::now();
@@ -1276,26 +1277,33 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             last_inbound_reload = std::time::Instant::now();
         }
 
-        // Drain admin commands (disconnect / reload-acls). Cheap when empty.
-        // Done before accept() so a disconnect targeting a session-takeover
-        // race lands on the in-flight in-memory state.
-        let admin_cmds = crate::admin_commands::drain(64);
-        if !admin_cmds.is_empty() {
-            let mut admin_sess_actions = Vec::new();
-            let mut admin_pubs = Vec::new();
-            for cmd in admin_cmds {
-                dispatch_admin_command(
-                    cmd,
-                    &mut clients,
-                    &mut admin_pubs,
-                    &mut admin_sess_actions,
-                );
-            }
-            if !admin_pubs.is_empty() {
-                publish_messages_batch(admin_pubs, &mut clients, &mut admin_sess_actions);
-            }
-            if !admin_sess_actions.is_empty() {
-                execute_session_db_actions(admin_sess_actions);
+        // Drain admin commands (disconnect / reload-acls) every ~100 ms rather
+        // than every tick: an empty drain still costs an SPI round-trip plus a
+        // BGW transaction, and at the default 5 ms tick that is ~200/s of pure
+        // overhead on an idle broker. 100 ms keeps operator-issued kicks/reloads
+        // snappy while cutting the idle query rate ~20x. Done before accept() so
+        // a disconnect targeting a session-takeover race lands on the in-flight
+        // in-memory state.
+        if last_admin_drain.elapsed() >= Duration::from_millis(100) {
+            last_admin_drain = std::time::Instant::now();
+            let admin_cmds = crate::admin_commands::drain(64);
+            if !admin_cmds.is_empty() {
+                let mut admin_sess_actions = Vec::new();
+                let mut admin_pubs = Vec::new();
+                for cmd in admin_cmds {
+                    dispatch_admin_command(
+                        cmd,
+                        &mut clients,
+                        &mut admin_pubs,
+                        &mut admin_sess_actions,
+                    );
+                }
+                if !admin_pubs.is_empty() {
+                    publish_messages_batch(admin_pubs, &mut clients, &mut admin_sess_actions);
+                }
+                if !admin_sess_actions.is_empty() {
+                    execute_session_db_actions(admin_sess_actions);
+                }
             }
         }
 
