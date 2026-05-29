@@ -18,8 +18,8 @@ Retained messages are **supported**:
 
 ## 3. Security and Authentication
 - **Native TLS/SSL (enterprise)**: MQTTS (port 8883) and WSS (port 9002) listeners are available in enterprise builds via `pgmqtt.mqtts_enabled` / `pgmqtt.wss_enabled`. Community builds should terminate TLS at a reverse proxy (nginx, HAProxy, AWS NLB) and forward plain MQTT or WebSocket traffic to pgmqtt.
-- **No username/password authentication**: The broker does not validate MQTT credentials beyond JWT tokens.
-- **JWT authentication**: Supported via `pgmqtt.jwt_public_key` / `pgmqtt.jwt_required` (enterprise feature).
+- **Username/password authentication**: Validates the CONNECT username/password against the SCRAM-SHA-256 verifier in `pg_authid` via `pgmqtt.password_auth_enabled` / `pgmqtt.password_auth_required`. Only SCRAM verifiers are accepted (`md5` is rejected), and only ASCII passwords are handled reliably — non-ASCII input must be pre-SASLprep-normalized. See [configuration.md → Password Authentication](configuration.md#password-authentication).
+- **JWT authentication**: Supported via `pgmqtt.jwt_public_key` / `pgmqtt.jwt_required` (enterprise feature). When both JWT and password auth are enabled, the password field is sniffed: a `header.payload.signature` shape routes to JWT, everything else to password auth.
 
 ## 4. Supported Operations
 `INSERT`, `UPDATE`, and `DELETE` operations are captured. `DELETE` requiring `REPLICA IDENTITY FULL` still applies. DDL changes and `TRUNCATE` are not captured.

@@ -2,13 +2,16 @@ use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 use std::time::Duration;
 
+mod admin_commands;
 mod ffi_safe;
 pub mod inbound_map;
 mod init010;
 mod init020;
+mod init030;
 pub mod license;
 pub mod metrics;
 mod mqtt;
+pub mod password_auth;
 mod ring_buffer;
 mod server;
 mod statements;
@@ -28,7 +31,11 @@ extension_sql!(
     REVOKE EXECUTE ON FUNCTION pgmqtt_list_outbound_mappings() FROM PUBLIC;
     "#,
     name = "revoke_mapping_from_public",
-    requires = [pgmqtt_add_outbound_mapping, pgmqtt_remove_outbound_mapping, pgmqtt_list_outbound_mappings],
+    requires = [
+        pgmqtt_add_outbound_mapping,
+        pgmqtt_remove_outbound_mapping,
+        pgmqtt_list_outbound_mappings
+    ],
 );
 
 extension_sql!(
@@ -38,7 +45,25 @@ extension_sql!(
     REVOKE EXECUTE ON FUNCTION pgmqtt_list_inbound_mappings() FROM PUBLIC;
     "#,
     name = "revoke_inbound_mapping_from_public",
-    requires = [pgmqtt_add_inbound_mapping, pgmqtt_remove_inbound_mapping, pgmqtt_list_inbound_mappings],
+    requires = [
+        pgmqtt_add_inbound_mapping,
+        pgmqtt_remove_inbound_mapping,
+        pgmqtt_list_inbound_mappings
+    ],
+);
+
+extension_sql!(
+    r#"
+    REVOKE EXECUTE ON FUNCTION pgmqtt_disconnect_client(text, int) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_disconnect_role(text, int) FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pgmqtt_reload_acls(text) FROM PUBLIC;
+    "#,
+    name = "revoke_admin_commands_from_public",
+    requires = [
+        pgmqtt_disconnect_client,
+        pgmqtt_disconnect_role,
+        pgmqtt_reload_acls
+    ],
 );
 
 // ---------------------------------------------------------------------------
@@ -48,8 +73,7 @@ extension_sql!(
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CString;
 
-static LICENSE_KEY: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 static MQTT_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 static WS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -61,15 +85,19 @@ static WS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9001);
 static MQTTS_PORT: GucSetting<i32> = GucSetting::<i32>::new(8883);
 static WSS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9002);
 
-static TLS_CERT_FILE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
-static TLS_KEY_FILE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
-static JWT_PUBLIC_KEY: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static JWT_PUBLIC_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static JWT_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static JWT_REQUIRED_WS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+// Password authentication (Community feature).
+static PASSWORD_AUTH_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PASSWORD_AUTH_REQUIRED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PASSWORD_AUTH_ROLE_FILTER: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+static ACL_DEFAULT_DENY: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // Performance tuning GUCs (see pgmqtt.tick_interval_ms etc. in _PG_init for help text)
 static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
@@ -135,6 +163,25 @@ pub fn get_jwt_required_guc() -> bool {
 
 pub fn get_jwt_required_ws_guc() -> bool {
     JWT_REQUIRED_WS.get()
+}
+
+pub fn get_password_auth_enabled_guc() -> bool {
+    PASSWORD_AUTH_ENABLED.get()
+}
+
+pub fn get_password_auth_required_guc() -> bool {
+    PASSWORD_AUTH_REQUIRED.get()
+}
+
+pub fn get_password_auth_role_filter_guc() -> String {
+    PASSWORD_AUTH_ROLE_FILTER
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn get_acl_default_deny_guc() -> bool {
+    ACL_DEFAULT_DENY.get()
 }
 
 pub fn get_metrics_snapshot_interval_guc() -> i32 {
@@ -212,6 +259,7 @@ pub fn get_tls_key_file_guc() -> String {
 fn ensure_tables_exist() {
     init010::init_010();
     init020::init_020();
+    init030::init_030();
 }
 
 /// Register a CDC → MQTT outbound topic mapping (persisted to DB table).
@@ -413,7 +461,10 @@ fn pgmqtt_add_inbound_mapping(
     for (col_name, expr_val) in map_obj {
         let expr = match expr_val.as_str() {
             Some(s) => s,
-            None => pgrx::error!("pgmqtt: column_map value for '{}' must be a string", col_name),
+            None => pgrx::error!(
+                "pgmqtt: column_map value for '{}' must be a string",
+                col_name
+            ),
         };
         let source = match parse_column_source(expr) {
             Ok(s) => s,
@@ -441,13 +492,18 @@ fn pgmqtt_add_inbound_mapping(
     let col_names: Vec<String> = parsed_columns.iter().map(|(n, _)| n.clone()).collect();
 
     // Check table existence using parameterized query (safe against injection)
-    let qualified_name = format!("{}.{}", quote_ident(target_schema), quote_ident(target_table));
+    let qualified_name = format!(
+        "{}.{}",
+        quote_ident(target_schema),
+        quote_ident(target_table)
+    );
     let table_exists = pgrx::spi::Spi::connect(|client| {
-        let result = client.select(
-            "SELECT to_regclass($1)::text",
-            None,
-            &[qualified_name.as_str().into()],
-        )?
+        let result = client
+            .select(
+                "SELECT to_regclass($1)::text",
+                None,
+                &[qualified_name.as_str().into()],
+            )?
             .first()
             .get_one::<String>()?;
         Ok::<bool, spi::Error>(result.is_some())
@@ -497,10 +553,7 @@ fn pgmqtt_add_inbound_mapping(
     if let Some(ref cc) = conflict_columns {
         for c in cc {
             if !col_names.contains(c) {
-                pgrx::error!(
-                    "pgmqtt: conflict column '{}' is not in column_map",
-                    c
-                );
+                pgrx::error!("pgmqtt: conflict column '{}' is not in column_map", c);
             }
         }
     }
@@ -551,9 +604,7 @@ fn pgmqtt_add_inbound_mapping(
 
 /// Remove an inbound mapping by name.
 #[pg_extern]
-fn pgmqtt_remove_inbound_mapping(
-    mapping_name: default!(&str, "'default'"),
-) -> bool {
+fn pgmqtt_remove_inbound_mapping(mapping_name: default!(&str, "'default'")) -> bool {
     let query = "DELETE FROM pgmqtt_inbound_mappings WHERE mapping_name = $1";
     let args: Vec<pgrx::datum::DatumWithOid> = vec![mapping_name.into()];
 
@@ -588,7 +639,11 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
 > {
     let mappings = Spi::connect(|client| {
         let table_exists = client
-            .select("SELECT to_regclass('pgmqtt_inbound_mappings')::text", None, &[])?
+            .select(
+                "SELECT to_regclass('pgmqtt_inbound_mappings')::text",
+                None,
+                &[],
+            )?
             .first()
             .get_one::<String>()?
             .is_some();
@@ -606,16 +661,45 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
             &[],
         ) {
             for row in table {
-                let mn: String = row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
-                let tp: String = row.get_by_name("topic_pattern").ok().flatten().unwrap_or_default();
-                let ts: String = row.get_by_name("target_schema").ok().flatten().unwrap_or_else(|| "public".to_string());
-                let tt: String = row.get_by_name("target_table").ok().flatten().unwrap_or_default();
-                let cm_str: String = row.get_by_name("column_map").ok().flatten().unwrap_or_else(|| "{}".to_string());
-                let op_str: String = row.get_by_name("op").ok().flatten().unwrap_or_else(|| "insert".to_string());
+                let mn: String = row
+                    .get_by_name("mapping_name")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let tp: String = row
+                    .get_by_name("topic_pattern")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let ts: String = row
+                    .get_by_name("target_schema")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "public".to_string());
+                let tt: String = row
+                    .get_by_name("target_table")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let cm_str: String = row
+                    .get_by_name("column_map")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "{}".to_string());
+                let op_str: String = row
+                    .get_by_name("op")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "insert".to_string());
                 let cc: Option<Vec<String>> = row.get_by_name("conflict_columns").ok().flatten();
-                let tmpl: String = row.get_by_name("template_type").ok().flatten().unwrap_or_else(|| "jsonpath".to_string());
+                let tmpl: String = row
+                    .get_by_name("template_type")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "jsonpath".to_string());
 
-                let cm_json: serde_json::Value = serde_json::from_str(&cm_str).unwrap_or(serde_json::json!({}));
+                let cm_json: serde_json::Value =
+                    serde_json::from_str(&cm_str).unwrap_or(serde_json::json!({}));
                 rows.push((mn, tp, ts, tt, pgrx::JsonB(cm_json), op_str, cc, tmpl));
             }
         }
@@ -624,6 +708,52 @@ fn pgmqtt_list_inbound_mappings() -> TableIterator<
     .unwrap_or_default();
 
     TableIterator::new(mappings.into_iter())
+}
+
+// ---------------------------------------------------------------------------
+// Admin commands (broker-side disconnect / ACL reload)
+// ---------------------------------------------------------------------------
+
+fn enqueue_admin_command(kind: &str, target: &str, reason_code: Option<i16>) -> i64 {
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> =
+            vec![kind.into(), target.into(), reason_code.into()];
+        let table = client.update(
+            "INSERT INTO pgmqtt_admin_commands (kind, target, reason_code) \
+             VALUES ($1, $2, $3) RETURNING id",
+            None,
+            &args,
+        )?;
+        for row in table {
+            return Ok::<i64, spi::Error>(row.get::<i64>(1)?.unwrap_or(0));
+        }
+        Ok(0)
+    })
+    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to enqueue admin command: {}", e))
+}
+
+/// Disconnect a single MQTT client by client_id. Returns the command id.
+///
+/// The disconnect is asynchronous: the row is consumed by the BGW when it next
+/// drains the admin queue (~100 ms cadence). The Will message, if any, fires.
+#[pg_extern]
+fn pgmqtt_disconnect_client(client_id: &str, reason_code: default!(i32, 135)) -> i64 {
+    enqueue_admin_command("disconnect_client", client_id, Some(reason_code as i16))
+}
+
+/// Disconnect every MQTT client that authenticated as the given Postgres role.
+/// Returns the command id. Use after revoking a role's password or ACLs.
+#[pg_extern]
+fn pgmqtt_disconnect_role(role_name: &str, reason_code: default!(i32, 135)) -> i64 {
+    enqueue_admin_command("disconnect_role", role_name, Some(reason_code as i16))
+}
+
+/// Reload the in-memory ACL allowlist for a connected client (or all clients
+/// with `'*'`) without disconnecting them. No-op for clients that did not
+/// authenticate via password auth.
+#[pg_extern]
+fn pgmqtt_reload_acls(target: &str) -> i64 {
+    enqueue_admin_command("reload_acls", target, None)
 }
 
 /// Return the current license status as a composite row.
@@ -761,9 +891,7 @@ fn pgmqtt_metrics() -> TableIterator<
     ),
 > {
     if !crate::license::has_feature(crate::license::Feature::Metrics) {
-        pgrx::error!(
-            "pgmqtt_metrics() requires an enterprise license with the 'metrics' feature"
-        );
+        pgrx::error!("pgmqtt_metrics() requires an enterprise license with the 'metrics' feature");
     }
 
     let rows = Spi::connect(|client| {
@@ -878,7 +1006,22 @@ fn pgmqtt_connections() -> TableIterator<
         );
     }
 
-    type Row = (String, String, i64, i64, i32, i64, i64, i64, i64, i32, i32, i32, bool, i64);
+    type Row = (
+        String,
+        String,
+        i64,
+        i64,
+        i32,
+        i64,
+        i64,
+        i64,
+        i64,
+        i32,
+        i32,
+        i32,
+        bool,
+        i64,
+    );
     let rows = Spi::connect(|client| {
         let mut out: Vec<Row> = Vec::new();
         if let Ok(table) = client.select(
@@ -891,10 +1034,20 @@ fn pgmqtt_connections() -> TableIterator<
             &[],
         ) {
             for row in table {
-                let g_str  = |n: &str| row.get_by_name::<String, _>(n).ok().flatten().unwrap_or_default();
-                let g_i64  = |n: &str| row.get_by_name::<i64, _>(n).ok().flatten().unwrap_or(0);
-                let g_i32  = |n: &str| row.get_by_name::<i32, _>(n).ok().flatten().unwrap_or(0);
-                let g_bool = |n: &str| row.get_by_name::<bool, _>(n).ok().flatten().unwrap_or(false);
+                let g_str = |n: &str| {
+                    row.get_by_name::<String, _>(n)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                let g_i64 = |n: &str| row.get_by_name::<i64, _>(n).ok().flatten().unwrap_or(0);
+                let g_i32 = |n: &str| row.get_by_name::<i32, _>(n).ok().flatten().unwrap_or(0);
+                let g_bool = |n: &str| {
+                    row.get_by_name::<bool, _>(n)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false)
+                };
                 out.push((
                     g_str("client_id"),
                     g_str("transport"),
@@ -939,34 +1092,59 @@ fn pgmqtt_prometheus_metrics() -> String {
     // live in-process atomics, since this function runs in a user backend.
     let snap = Spi::connect(|client| {
         let mut s = crate::metrics::MetricsSnapshot::default();
-        if let Ok(mut rows) = client.select(
-            "SELECT * FROM pgmqtt_metrics_current LIMIT 1", None, &[],
-        ) {
+        if let Ok(mut rows) =
+            client.select("SELECT * FROM pgmqtt_metrics_current LIMIT 1", None, &[])
+        {
             if let Some(row) = rows.next() {
                 macro_rules! g {
                     ($field:ident) => {
-                        s.$field = row.get_by_name::<i64, _>(stringify!($field))
-                            .ok().flatten().unwrap_or(0);
+                        s.$field = row
+                            .get_by_name::<i64, _>(stringify!($field))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
                     };
                     ($field:ident, $col:expr) => {
-                        s.$field = row.get_by_name::<i64, _>($col)
-                            .ok().flatten().unwrap_or(0);
+                        s.$field = row.get_by_name::<i64, _>($col).ok().flatten().unwrap_or(0);
                     };
                 }
-                g!(captured_at_unix, "captured_at"); g!(started_at_unix, "started_at"); g!(last_reset_at_unix, "last_reset_at");
-                g!(connections_accepted); g!(connections_rejected); g!(connections_current);
-                g!(disconnections_clean); g!(disconnections_unclean); g!(wills_fired);
-                g!(sessions_created); g!(sessions_resumed); g!(sessions_expired);
-                g!(msgs_received); g!(msgs_received_qos0); g!(msgs_received_qos1);
-                g!(bytes_received); g!(msgs_sent); g!(bytes_sent); g!(msgs_dropped_queue_full);
-                g!(pubacks_sent); g!(pubacks_received);
-                g!(subscribe_ops); g!(unsubscribe_ops);
-                g!(cdc_events_processed); g!(cdc_msgs_published);
-                g!(cdc_render_errors); g!(cdc_slot_errors); g!(cdc_persist_errors);
+                g!(captured_at_unix, "captured_at");
+                g!(started_at_unix, "started_at");
+                g!(last_reset_at_unix, "last_reset_at");
+                g!(connections_accepted);
+                g!(connections_rejected);
+                g!(connections_current);
+                g!(disconnections_clean);
+                g!(disconnections_unclean);
+                g!(wills_fired);
+                g!(sessions_created);
+                g!(sessions_resumed);
+                g!(sessions_expired);
+                g!(msgs_received);
+                g!(msgs_received_qos0);
+                g!(msgs_received_qos1);
+                g!(bytes_received);
+                g!(msgs_sent);
+                g!(bytes_sent);
+                g!(msgs_dropped_queue_full);
+                g!(pubacks_sent);
+                g!(pubacks_received);
+                g!(subscribe_ops);
+                g!(unsubscribe_ops);
+                g!(cdc_events_processed);
+                g!(cdc_msgs_published);
+                g!(cdc_render_errors);
+                g!(cdc_slot_errors);
+                g!(cdc_persist_errors);
                 g!(cdc_ring_buffer_dropped);
-                g!(inbound_writes_ok); g!(inbound_writes_failed); g!(inbound_retries);
-                g!(inbound_dead_letters); g!(db_batches_committed);
-                g!(db_session_errors); g!(db_message_errors); g!(db_subscription_errors);
+                g!(inbound_writes_ok);
+                g!(inbound_writes_failed);
+                g!(inbound_retries);
+                g!(inbound_dead_letters);
+                g!(db_batches_committed);
+                g!(db_session_errors);
+                g!(db_message_errors);
+                g!(db_subscription_errors);
             }
         }
         Ok::<_, spi::Error>(s)
@@ -983,7 +1161,11 @@ extension_sql!(
     REVOKE EXECUTE ON FUNCTION pgmqtt_prometheus_metrics() FROM PUBLIC;
     "#,
     name = "revoke_metrics_from_public",
-    requires = [pgmqtt_metrics, pgmqtt_connections, pgmqtt_prometheus_metrics],
+    requires = [
+        pgmqtt_metrics,
+        pgmqtt_connections,
+        pgmqtt_prometheus_metrics
+    ],
 );
 
 // ---------------------------------------------------------------------------
@@ -1138,12 +1320,45 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.password_auth_enabled",
+        c"Enable MQTT username/password authentication against Postgres roles (pg_authid SCRAM-SHA-256)",
+        c"",
+        &PASSWORD_AUTH_ENABLED,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.password_auth_required",
+        c"Require valid username/password on every MQTT CONNECT (only effective when password_auth_enabled = on)",
+        c"",
+        &PASSWORD_AUTH_REQUIRED,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_string_guc(
+        c"pgmqtt.password_auth_role_filter",
+        c"Optional SQL LIKE pattern (e.g. 'mqtt\\_%') restricting which roles may authenticate via MQTT. Empty = any login role.",
+        c"",
+        &PASSWORD_AUTH_ROLE_FILTER,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.acl_default_deny",
+        c"Deny a password-authenticated role that has no covering pgmqtt_acls row (default on, since 0.3.0). Set off for legacy fail-open behavior. Only effective with the 'acl' license feature.",
+        c"",
+        &ACL_DEFAULT_DENY,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
     GucRegistry::define_int_guc(
         c"pgmqtt.metrics_snapshot_interval",
         c"Seconds between metric snapshot flushes to pgmqtt_metrics_snapshots (0 = disabled)",
         c"",
         &METRICS_SNAPSHOT_INTERVAL,
-        0, 86400,
+        0,
+        86400,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
@@ -1152,7 +1367,8 @@ pub unsafe extern "C" fn _PG_init() {
         c"Days to retain rows in pgmqtt_metrics_snapshots (0 = keep forever, default 3)",
         c"",
         &METRICS_RETENTION_DAYS,
-        0, 3650,
+        0,
+        3650,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
@@ -1161,7 +1377,8 @@ pub unsafe extern "C" fn _PG_init() {
         c"Seconds between pgmqtt_connections_cache refreshes (0 = disabled)",
         c"",
         &METRICS_CONNECTIONS_CACHE_INTERVAL,
-        0, 3600,
+        0,
+        3600,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

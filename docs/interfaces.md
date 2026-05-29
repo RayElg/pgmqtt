@@ -378,3 +378,122 @@ Columns:
 - `error_message`: The error that caused the dead-letter.
 - `retry_count`: How many retries were attempted before dead-lettering.
 - `dead_lettered_at`: When this entry was created.
+
+---
+
+## Admin Commands
+
+The broker drains the `pgmqtt_admin_commands` table every tick and dispatches kick/reload actions against live connections. Three SQL functions enqueue commands:
+
+### 9. `pgmqtt_disconnect_client`
+
+Disconnect a single MQTT client by `client_id`.
+
+**Signature:**
+```sql
+pgmqtt_disconnect_client(
+    client_id text,
+    reason_code int DEFAULT 135
+) RETURNS bigint
+```
+
+Returns the inserted command row's `id`. Execution is asynchronous: the BGW drains the queue on a fixed ~100 ms cadence. The Will message, if any, fires — except when the client's current `pub_claims` / `pgmqtt_acls` no longer cover the Will topic (e.g. after a `pgmqtt_reload_acls`), in which case it is silently dropped.
+
+The default `reason_code` is `0x87` (NOT_AUTHORIZED). Pass a different MQTT 5 reason code per [§3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208) if needed (e.g. `0x8E` SESSION_TAKEN_OVER). MQTT 3.1.1 has no server→client DISCONNECT packet, so 3.1.1 clients see the socket close without a reason code.
+
+**Example:**
+```sql
+-- Compromised device — kick now, rotate password elsewhere.
+SELECT pgmqtt_disconnect_client('device-42');
+```
+
+---
+
+### 10. `pgmqtt_disconnect_role`
+
+Disconnect every MQTT client that authenticated as the given Postgres role via password auth.
+
+**Signature:**
+```sql
+pgmqtt_disconnect_role(
+    role_name text,
+    reason_code int DEFAULT 135
+) RETURNS bigint
+```
+
+Returns the inserted command row's `id`. Anonymous and JWT-authenticated clients are unaffected.
+
+Kicked clients with a persistent session (`session_expiry_interval > 0`) keep their session and subscriptions. On reconnect, persisted subscriptions are re-validated against the role's *current* `pgmqtt_acls` and any rows no longer covered are pruned. If you want to fully expire the session as well, also delete the row from `pgmqtt_sessions`.
+
+**Example:**
+```sql
+-- Force-reconnect everyone using a role after rotating its password.
+ALTER ROLE mqtt_devices PASSWORD 'new-secret';
+SELECT pgmqtt_disconnect_role('mqtt_devices');
+```
+
+---
+
+### 11. `pgmqtt_reload_acls`
+
+Re-read `pgmqtt_acls` for the named client and overwrite its in-memory allowlist without disconnecting. Use `'*'` to refresh every password-authenticated client.
+
+**Signature:**
+```sql
+pgmqtt_reload_acls(
+    target text
+) RETURNS bigint
+```
+
+Returns the inserted command row's `id`. No-op for clients that did not authenticate via password auth (JWT claims are immutable for the session lifetime).
+
+Side effects of a refresh:
+
+- **Subscriptions are pruned.** Any active subscription whose topic filter is no longer covered by the refreshed `sub` rules is removed from the in-memory tree and `pgmqtt_subscriptions`. The client is not notified — MQTT has no server-initiated UNSUBSCRIBE — so they will simply stop receiving traffic on that filter.
+- **Stored Wills are re-checked.** If the client connected with a Will whose topic is no longer covered by the refreshed `pub` rules, the Will is dropped from the connection's state and will not fire on subsequent disconnect.
+
+**Example:**
+```sql
+-- Revoked a role's topic permission and want it to take effect immediately.
+DELETE FROM pgmqtt_acls WHERE role_name = 'mqtt_devices' AND topic_filter = 'private/#';
+SELECT pgmqtt_reload_acls('*');
+```
+
+---
+
+### Permissions
+
+All three admin functions are revoked from `PUBLIC` at install time. Grant explicitly to operators:
+
+```sql
+GRANT EXECUTE ON FUNCTION pgmqtt_disconnect_client(text, int) TO oncall_role;
+GRANT EXECUTE ON FUNCTION pgmqtt_disconnect_role(text, int)   TO oncall_role;
+GRANT EXECUTE ON FUNCTION pgmqtt_reload_acls(text)            TO oncall_role;
+```
+
+---
+
+### `pgmqtt_acls`
+
+Per-role per-topic ACL allowlist. Consulted on CONNECT when the client authenticates via password auth. Enforced only when the active enterprise license includes the `acl` feature — see [enterprise.md → Topic-Level Access Control](enterprise.md#topic-level-access-control).
+
+Columns:
+- `role_name`: Postgres role name (part of composite PK).
+- `topic_filter`: MQTT topic filter — supports `+` and `#` wildcards (part of composite PK).
+- `can_publish`: Whether the role may PUBLISH to matching topics.
+- `can_subscribe`: Whether the role may SUBSCRIBE to matching topics.
+
+ACLs are loaded once on CONNECT and cached on the connection. Use `pgmqtt_reload_acls` to refresh a live connection without disconnecting it.
+
+### `pgmqtt_admin_commands`
+
+Unlogged command queue drained by the background worker every tick. Populated by the `pgmqtt_disconnect_client`, `pgmqtt_disconnect_role`, and `pgmqtt_reload_acls` SQL functions.
+
+Columns:
+- `id`: Auto-incrementing primary key (bigserial).
+- `kind`: Command type — `'disconnect_client'`, `'disconnect_role'`, or `'reload_acls'`.
+- `target`: Client ID, role name, or `'*'` depending on the command kind.
+- `reason_code`: MQTT 5 reason code (smallint). NULL for `reload_acls`.
+- `issued_at`: Timestamp when the command was enqueued.
+
+Unlogged because the BGW loses in-memory state across a crash anyway — a dropped command simply needs to be reissued.
