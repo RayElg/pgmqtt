@@ -94,18 +94,26 @@ pub fn prepare_hot_path_statements() {
     });
 
     match result {
-        Ok(plans) => PLANS.with(|cell| *cell.borrow_mut() = Some(plans)),
+        Ok(plans) => PLANS.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut slot) => *slot = Some(plans),
+            Err(_) => pgrx::log!("pgmqtt: hot-path plans cell busy; keeping prior plans"),
+        }),
         Err(e) => pgrx::log!("pgmqtt: failed to prepare hot-path statements: {}", e),
     }
 }
 
 /// Run `f` with the session-level prepared plans.
 ///
-/// Returns `None` if `prepare_hot_path_statements` has not been called yet;
-/// callers should fall back to inline SQL in that case.
+/// Returns `None` if `prepare_hot_path_statements` has not been called yet
+/// (or if the cell is unexpectedly borrowed); callers fall back to inline SQL
+/// in that case.
 pub fn with_plans<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&HotPathPlans) -> R,
 {
-    PLANS.with(|cell| cell.borrow().as_ref().map(f))
+    PLANS.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|plans| plans.as_ref().map(f))
+    })
 }

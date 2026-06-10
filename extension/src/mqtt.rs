@@ -474,7 +474,19 @@ pub enum InboundPacket {
 /// Parse a packet. `protocol_version` is used for post-CONNECT packets
 /// to decide whether properties sections exist (v5) or not (v3.1.1).
 /// Pass 5 when parsing the initial CONNECT (CONNECT self-detects its version).
+///
+/// Panic boundary: this is the single entry point for attacker-controlled
+/// bytes, so any panic in the parsers below (e.g. a missed bounds check)
+/// is contained here and surfaces as MalformedPacket — disconnecting one
+/// client instead of unwinding through the BGW and restarting the broker.
+/// The parsers are pure Rust (no pg_sys calls), so no Postgres error can
+/// longjmp across this catch_unwind.
 pub fn parse_packet(buf: &[u8], protocol_version: u8) -> Result<(InboundPacket, usize)> {
+    std::panic::catch_unwind(|| parse_packet_inner(buf, protocol_version))
+        .unwrap_or_else(|_| Err(MqttError::MalformedPacket("parser panicked".into())))
+}
+
+fn parse_packet_inner(buf: &[u8], protocol_version: u8) -> Result<(InboundPacket, usize)> {
     let (ptype, flags, remaining, hdr_size) = parse_fixed_header(buf)?;
     let total = hdr_size + remaining;
     if buf.len() < total {

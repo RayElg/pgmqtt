@@ -200,7 +200,7 @@ The following limits are compiled into the extension binary and cannot be change
 | Limit | Value | Description |
 |-------|-------|-------------|
 | Max concurrent connections (community) | **1,000** | Enterprise licenses can raise this via the license payload. |
-| Max subscriptions per client | **100** | Additional SUBSCRIBE requests beyond this are rejected with an error reason code. |
+| Max subscriptions per client | **1,000** | Additional SUBSCRIBE requests beyond this are rejected with an error reason code. |
 | Client receive maximum (default) | **65,535** | MQTT 5.0 default; clients may negotiate a lower value via the CONNECT `Receive Maximum` property. |
 
 ## Message & Packet Limits
@@ -227,7 +227,7 @@ The following limits are compiled into the extension binary and cannot be change
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Poll interval (latch) | **80 ms** | How often the background worker wakes to accept connections, poll clients, and drain CDC. |
+| Poll interval (latch) | **5 ms** (default) | How often the background worker wakes to accept connections, poll clients, and drain CDC. Configurable via `pgmqtt.tick_interval_ms` (1–1000 ms) — see [configuration.md → Performance Tuning](configuration.md#performance-tuning). |
 | Client read/write timeout | **2 seconds** | Timeout for individual client I/O operations. |
 | CONNECT handshake timeout | **5 seconds** | Maximum time to wait for the initial MQTT CONNECT packet from a new connection. |
 | Keep-alive enforcement | **1.5 &times; keep_alive** | Clients are disconnected if no packet is received within 1.5&times; their negotiated keep-alive interval (per MQTT 5.0 §3.1.2.10). A keep-alive of 0 disables the timeout. |

@@ -319,7 +319,9 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => unreachable!("filtered by resolve_single_value"),
+        // resolve_single_value maps Null → SQL NULL before reaching here, but
+        // stay total rather than panic if a future caller forgets that.
+        serde_json::Value::Null => String::new(),
         // For objects/arrays, return JSON text
         other => other.to_string(),
     }
@@ -335,6 +337,11 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
 /// order as `column_names`).  When present, each `$N` placeholder is emitted
 /// as `$N::type` so that text-typed SPI parameters are correctly cast to
 /// the target column type (e.g. `numeric`, `integer`, `boolean`).
+///
+/// Returns `Err` when the mapping violates an op invariant (e.g. upsert
+/// without conflict_columns). `pgmqtt_add_inbound_mapping` validates these at
+/// creation time, but rows edited directly in `pgmqtt_inbound_mappings`
+/// bypass that — the loader must be able to skip them without panicking.
 pub fn generate_sql(
     schema: &str,
     table: &str,
@@ -342,7 +349,7 @@ pub fn generate_sql(
     column_types: &[String],
     op: &InboundOp,
     conflict_columns: Option<&[String]>,
-) -> String {
+) -> Result<String, String> {
     let qualified = format!(
         "{}.{}",
         quote_ident(schema),
@@ -361,17 +368,15 @@ pub fn generate_sql(
         .collect();
 
     match op {
-        InboundOp::Insert => {
-            format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                qualified,
-                cols.join(", "),
-                placeholders.join(", ")
-            )
-        }
+        InboundOp::Insert => Ok(format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            qualified,
+            cols.join(", "),
+            placeholders.join(", ")
+        )),
         InboundOp::Upsert => {
             let conflict_cols = conflict_columns
-                .expect("upsert requires conflict_columns");
+                .ok_or_else(|| "op 'upsert' requires conflict_columns".to_string())?;
             let conflict_quoted: Vec<String> = conflict_cols.iter().map(|c| quote_ident(c)).collect();
             let update_set: Vec<String> = cols
                 .iter()
@@ -380,45 +385,44 @@ pub fn generate_sql(
                 .collect();
             if update_set.is_empty() {
                 // All columns are conflict columns — DO NOTHING
-                format!(
+                Ok(format!(
                     "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
                     qualified,
                     cols.join(", "),
                     placeholders.join(", "),
                     conflict_quoted.join(", ")
-                )
+                ))
             } else {
-                format!(
+                Ok(format!(
                     "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
                     qualified,
                     cols.join(", "),
                     placeholders.join(", "),
                     conflict_quoted.join(", "),
                     update_set.join(", ")
-                )
+                ))
             }
         }
         InboundOp::Delete => {
             let where_cols = conflict_columns
-                .expect("delete requires conflict_columns");
-            let where_clauses: Vec<String> = where_cols
-                .iter()
-                .map(|c| {
-                    let pos = column_names.iter().position(|n| n == c)
-                        .expect("conflict column must be in column_map");
-                    let typ = &column_types[pos];
-                    if typ == "text" || typ == "character varying" || typ == "varchar" {
-                        format!("{} = ${}", quote_ident(c), pos + 1)
-                    } else {
-                        format!("{} = ${}::{}", quote_ident(c), pos + 1, typ)
-                    }
-                })
-                .collect();
-            format!(
+                .ok_or_else(|| "op 'delete' requires conflict_columns".to_string())?;
+            let mut where_clauses: Vec<String> = Vec::with_capacity(where_cols.len());
+            for c in where_cols {
+                let pos = column_names.iter().position(|n| n == c).ok_or_else(|| {
+                    format!("conflict column '{}' is not in column_map", c)
+                })?;
+                let typ = &column_types[pos];
+                if typ == "text" || typ == "character varying" || typ == "varchar" {
+                    where_clauses.push(format!("{} = ${}", quote_ident(c), pos + 1));
+                } else {
+                    where_clauses.push(format!("{} = ${}::{}", quote_ident(c), pos + 1, typ));
+                }
+            }
+            Ok(format!(
                 "DELETE FROM {} WHERE {}",
                 qualified,
                 where_clauses.join(" AND ")
-            )
+            ))
         }
     }
 }

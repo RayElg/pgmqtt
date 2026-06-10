@@ -33,8 +33,22 @@ Controls which TCP/WebSocket ports the broker binds at startup.
 | `pgmqtt.mqtts_port` | int | `8883` | MQTTS listener port |
 | `pgmqtt.wss_enabled` | bool | `off` | Bind the WSS (WebSocket + TLS) listener — requires `tls_cert_file` and `tls_key_file` |
 | `pgmqtt.wss_port` | int | `9002` | WSS listener port |
+| `pgmqtt.http_enabled` | bool | `on` | Bind the HTTP healthcheck listener |
+| `pgmqtt.http_port` | int | `8080` | HTTP healthcheck listener port |
+
+The healthcheck is served from the broker's own event loop: a `200` on `GET /health` means the broker is actually ticking, not merely that the process exists. The port stays closed while the node is a streaming replica and opens on promotion, so load balancers can use it to route MQTT traffic to the primary.
 
 > **Restart required.** Listener settings are read once at BGW startup. `pg_reload_conf()` stores the new value in PostgreSQL's GUC system but the broker does not rebind until the BGW is restarted.
+
+---
+
+## Worker Database
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pgmqtt.database` | string | `postgres` | Database the MQTT+CDC background worker connects to. All pgmqtt tables, mappings, and the replication slot live in this database. |
+
+> **Restart required.** Read once when the `pgmqtt_mqtt` worker starts.
 
 ---
 

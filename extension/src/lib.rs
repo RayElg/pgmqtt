@@ -75,15 +75,20 @@ use std::ffi::CString;
 
 static LICENSE_KEY: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+/// Database the MQTT+CDC worker connects to (read once at BGW start).
+static DATABASE_NAME: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
 static MQTT_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 static WS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 static MQTTS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static WSS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static HTTP_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 static MQTT_PORT: GucSetting<i32> = GucSetting::<i32>::new(1883);
 static WS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9001);
 static MQTTS_PORT: GucSetting<i32> = GucSetting::<i32>::new(8883);
 static WSS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9002);
+static HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(8080);
 
 static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -148,6 +153,18 @@ pub fn get_license_key_guc() -> String {
         .get()
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+pub fn get_database_guc() -> String {
+    DATABASE_NAME
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "postgres".to_string())
+}
+
+pub fn get_http_port_guc() -> u16 {
+    HTTP_PORT.get() as u16
 }
 
 pub fn get_jwt_public_key_guc() -> String {
@@ -215,10 +232,12 @@ pub struct PortConfig {
     pub ws_port: u16,
     pub mqtts_port: u16,
     pub wss_port: u16,
+    pub http_port: u16,
     pub mqtt_enabled: bool,
     pub ws_enabled: bool,
     pub mqtts_enabled: bool,
     pub wss_enabled: bool,
+    pub http_enabled: bool,
     pub tls_cert_file: String,
     pub tls_key_file: String,
 }
@@ -229,10 +248,12 @@ pub fn get_port_gucs() -> PortConfig {
         ws_port: WS_PORT.get() as u16,
         mqtts_port: MQTTS_PORT.get() as u16,
         wss_port: WSS_PORT.get() as u16,
+        http_port: get_http_port_guc(),
         mqtt_enabled: MQTT_ENABLED.get(),
         ws_enabled: WS_ENABLED.get(),
         mqtts_enabled: MQTTS_ENABLED.get(),
         wss_enabled: WSS_ENABLED.get(),
+        http_enabled: HTTP_ENABLED.get(),
         tls_cert_file: get_tls_cert_file_guc(),
         tls_key_file: get_tls_key_file_guc(),
     }
@@ -1208,12 +1229,38 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
+    GucRegistry::define_string_guc(
+        c"pgmqtt.database",
+        c"Database the MQTT+CDC background worker connects to (default 'postgres'; requires BGW restart)",
+        c"",
+        &DATABASE_NAME,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
     GucRegistry::define_int_guc(
         c"pgmqtt.mqtt_port",
         c"MQTT TCP port",
         c"",
         &MQTT_PORT,
         0,
+        65535,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.http_enabled",
+        c"Enable the HTTP healthcheck listener",
+        c"",
+        &HTTP_ENABLED,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.http_port",
+        c"HTTP healthcheck listener port (requires BGW restart)",
+        c"",
+        &HTTP_PORT,
+        1,
         65535,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
@@ -1446,45 +1493,15 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
-    // Database name for the MQTT+CDC worker
-    let db_name = "postgres";
-    let db_name_cstr = std::ffi::CString::new(db_name)
-        .unwrap_or_else(|e| pgrx::error!("CString::new failed: {}", e));
-    let db_name_datum = ffi_safe::cstr_to_datum(db_name_cstr.as_ptr());
-
-    // HTTP healthcheck server (port 8080)
-    BackgroundWorkerBuilder::new("pgmqtt_http")
-        .set_function("pgmqtt_http_worker_main")
-        .set_library("pgmqtt")
-        .enable_shmem_access(None)
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(5)))
-        .load();
-
-    // MQTT broker + CDC consumer (port 1883) — single process for shared state
+    // MQTT broker + CDC consumer + HTTP healthcheck — single process for shared
+    // state. Database and ports are read from GUCs in the worker process at start.
     BackgroundWorkerBuilder::new("pgmqtt_mqtt")
         .set_function("pgmqtt_mqtt_worker_main")
         .set_library("pgmqtt")
         .enable_spi_access()
         .set_start_time(BgWorkerStartTime::RecoveryFinished)
         .set_restart_time(Some(Duration::from_secs(5)))
-        .set_argument(Some(db_name_datum))
         .load();
-
-    // Keep the CString alive
-    std::mem::forget(db_name_cstr);
-}
-
-// ---------------------------------------------------------------------------
-// HTTP healthcheck worker
-// ---------------------------------------------------------------------------
-
-#[pg_guard]
-#[no_mangle]
-pub unsafe extern "C-unwind" fn pgmqtt_http_worker_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    pgrx::log!("pgmqtt_http: starting on port 8080");
-    server::run_http(8080);
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,11 +1510,11 @@ pub unsafe extern "C-unwind" fn pgmqtt_http_worker_main(_arg: pg_sys::Datum) {
 
 #[pg_guard]
 #[no_mangle]
-pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
-    let db_name = ffi_safe::datum_to_str(arg);
+pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(_arg: pg_sys::Datum) {
+    let db_name = get_database_guc();
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
+    BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
 
     pgrx::log!("pgmqtt mqtt+cdc: starting, connected to '{}'", db_name);
 
@@ -1605,11 +1622,9 @@ unsafe extern "C-unwind" fn pg_decode_change(
     if rel_name == "pgmqtt_topic_mappings" {
         let columns = extract_columns(relation, change);
         ring_buffer::push(ring_buffer::RingEvent::MappingUpdate { op, columns });
-        let msg = std::ffi::CString::new("mapping_update")
-            .unwrap_or_else(|e| pgrx::error!("CString::new failed: {}", e));
         unsafe {
             pg_sys::OutputPluginPrepareWrite(ctx, true);
-            pg_sys::appendStringInfoString((*ctx).out, msg.as_ptr());
+            pg_sys::appendStringInfoString((*ctx).out, c"mapping_update".as_ptr());
             pg_sys::OutputPluginWrite(ctx, true);
         }
         return;
@@ -1642,8 +1657,11 @@ unsafe extern "C-unwind" fn pg_decode_change(
     }));
 
     // The output plugin MUST produce output for pg_logical_slot_get_changes to advance.
-    let msg = std::ffi::CString::new(format!("{}", op))
-        .unwrap_or_else(|e| pgrx::error!("CString::new failed: {}", e));
+    let msg: &std::ffi::CStr = match op {
+        "INSERT" => c"INSERT",
+        "UPDATE" => c"UPDATE",
+        _ => c"DELETE",
+    };
     unsafe {
         pg_sys::OutputPluginPrepareWrite(ctx, true);
         pg_sys::appendStringInfoString((*ctx).out, msg.as_ptr());

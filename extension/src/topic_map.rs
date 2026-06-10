@@ -44,7 +44,7 @@ static MAPPINGS: Mutex<Option<Vec<TopicMapping>>> = Mutex::new(None);
 /// Replace the in-process cache with a fresh set of mappings.
 /// Called by the consumer worker after loading from the DB via SPI.
 pub fn set_mappings(mappings: Vec<TopicMapping>) {
-    let mut lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let mut lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     *lock = Some(mappings);
 }
 
@@ -57,7 +57,7 @@ pub fn get() -> Option<Vec<TopicMapping>> {
 /// Apply a WAL-decoded INSERT or UPDATE to the in-process cache.
 /// Upserts by (schema, table, name) — safe to call during WAL replay on restart.
 pub fn wal_upsert(mapping: TopicMapping) {
-    let mut lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let mut lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     let mappings = lock.get_or_insert_with(Vec::new);
     match mappings
         .iter_mut()
@@ -71,7 +71,7 @@ pub fn wal_upsert(mapping: TopicMapping) {
 /// Apply a WAL-decoded DELETE to the in-process cache.
 /// No-op if the mapping is not found (safe for idempotent WAL replay).
 pub fn wal_remove(schema: &str, table: &str, name: &str) {
-    let mut lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let mut lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mappings) = lock.as_mut() {
         mappings.retain(|m| !(m.schema == schema && m.table == table && m.name == name));
     }
@@ -81,7 +81,7 @@ pub fn wal_remove(schema: &str, table: &str, name: &str) {
 /// Used to guard fast-path filter removal: if multiple mapping_names point at
 /// the same table, removing one should not remove the table from the filter.
 pub fn has_any_mapping(schema: &str, table: &str) -> bool {
-    let lock = MAPPINGS.lock().expect("topic_map: poisoned mutex");
+    let lock = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     lock.as_ref()
         .map(|m| m.iter().any(|e| e.schema == schema && e.table == table))
         .unwrap_or(false)

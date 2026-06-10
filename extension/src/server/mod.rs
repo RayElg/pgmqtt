@@ -239,7 +239,10 @@ fn db_load_sessions_on_startup() {
                                 // Queued — enforce byte cap so a restart can't bypass it.
                                 let payload_data: Vec<u8> = payload.unwrap_or_default();
                                 if sess.queue_bytes.saturating_add(payload_data.len()) > queue_cap {
-                                    startup_overflow.lock().unwrap().push((client_id.clone(), message_id));
+                                    startup_overflow
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push((client_id.clone(), message_id));
                                     overflow_count += 1;
                                 } else {
                                     sess.queue_push_back(MqttMessage {
@@ -308,7 +311,7 @@ fn db_load_sessions_on_startup() {
         });
     });
 
-    let startup_overflow = startup_overflow.into_inner().unwrap();
+    let startup_overflow = startup_overflow.into_inner().unwrap_or_else(|e| e.into_inner());
     if !startup_overflow.is_empty() {
         execute_session_db_actions(
             startup_overflow
@@ -531,14 +534,20 @@ fn load_inbound_mappings() {
                         continue;
                     }
 
-                    let sql = inbound_map::generate_sql(
+                    let sql = match inbound_map::generate_sql(
                         &ts,
                         &tt,
                         &col_names,
                         &col_types,
                         &inbound_op,
                         cc.as_deref(),
-                    );
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log!("pgmqtt: skipping inbound mapping '{}': {}", mn, e);
+                            continue;
+                        }
+                    };
 
                     mappings.push(inbound_map::InboundMapping {
                         mapping_name: Arc::from(mn.as_str()),
@@ -1005,38 +1014,13 @@ impl MqttClient {
     }
 }
 
-// ── HTTP server ──────────────────────────────────────────────────────────────
-
-/// Run the HTTP-only healthcheck server (port 8080).
-pub fn run_http(port: u16) {
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => {
-            log!("pgmqtt http: failed to bind {}: {}", addr, e);
-            return;
-        }
-    };
-
-    if let Err(e) = listener.set_nonblocking(true) {
-        log!("pgmqtt http: failed to set non-blocking: {}", e);
-        return;
-    }
-
-    log!("pgmqtt http: listening on {}", addr);
-
-    while BackgroundWorker::wait_latch(Some(latch_interval())) {
-        if BackgroundWorker::sighup_received() {
-            log!("pgmqtt http: SIGHUP received");
-            unsafe {
-                pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
-            }
-        }
-        drain_http_connections(&listener);
-    }
-
-    log!("pgmqtt http: shutting down");
-}
+// ── HTTP healthcheck ─────────────────────────────────────────────────────────
+//
+// Served from the broker's own tick loop, so a 200 on GET /health means the
+// event loop is actually ticking — not merely that a sibling process is alive.
+// Because the listener only binds after BgWorkerStartTime::RecoveryFinished,
+// the port is closed on streaming replicas and opens on promotion; load
+// balancers use this to route MQTT traffic to the primary.
 
 fn drain_http_connections(listener: &TcpListener) {
     loop {
@@ -1228,6 +1212,28 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         None
     };
 
+    // Bind HTTP healthcheck listener (optional)
+    let http_listener = if ports.http_enabled {
+        let addr = format!("0.0.0.0:{}", ports.http_port);
+        match TcpListener::bind(&addr) {
+            Ok(l) => {
+                if let Err(e) = l.set_nonblocking(true) {
+                    log!("pgmqtt http: failed to set non-blocking: {}", e);
+                    return;
+                }
+                log!("pgmqtt http: listening on {} (healthcheck)", addr);
+                Some(l)
+            }
+            Err(e) => {
+                log!("pgmqtt http: failed to bind {}: {}", addr, e);
+                return;
+            }
+        }
+    } else {
+        log!("pgmqtt http: healthcheck listener disabled");
+        None
+    };
+
     // Load TLS configuration if any secure listener is enabled
     let tls_config = if ports.mqtts_enabled || ports.wss_enabled {
         match build_tls_config(&ports.tls_cert_file, &ports.tls_key_file) {
@@ -1305,6 +1311,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
                     execute_session_db_actions(admin_sess_actions);
                 }
             }
+        }
+
+        // Answer healthcheck probes first: a 200 here certifies the loop is ticking.
+        if let Some(ref listener) = http_listener {
+            drain_http_connections(listener);
         }
 
         // ── MQTT: accept raw TCP, accept WebSocket, poll ──
@@ -3861,11 +3872,21 @@ fn deliver_messages(
                             batch_entries.push((sub_id.clone(), None));
                         }
                     } else {
-                        // alloc_packet_id cannot return None here: inflight.len() < 800
-                        // is far below the 65535 packet_id space.  expect() is fine.
-                        let pid = session
-                            .alloc_packet_id()
-                            .expect("unreachable: inflight slot free implies free packet_id");
+                        // alloc_packet_id cannot return None here (inflight.len() < 800 is far
+                        // below the 65535 packet_id space), but queue rather than crash the
+                        // broker if that invariant is ever broken.
+                        let Some(pid) = session.alloc_packet_id() else {
+                            session.queue_push_back(MqttMessage {
+                                id: msg.id,
+                                topic: msg.topic.clone(),
+                                payload: msg.payload.clone(),
+                                qos: delivery_qos,
+                            });
+                            if msg.id.is_some() {
+                                batch_entries.push((sub_id.clone(), None));
+                            }
+                            continue;
+                        };
                         session.inflight.insert(
                             pid,
                             (
@@ -4119,18 +4140,15 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
     let sig_bytes =
         crate::license::base64_url_decode(sig_b64).map_err(|_| "bad sig base64".to_string())?;
 
-    if sig_bytes.len() != 64 {
-        return Err("signature must be 64 bytes".into());
-    }
     let sig_arr: [u8; 64] = sig_bytes
         .try_into()
-        .expect("unreachable: length already checked to be exactly 64");
+        .map_err(|_| "signature must be 64 bytes".to_string())?;
     let signature = Signature::from_bytes(&sig_arr);
 
     // Verify signature over "header.payload" (slice the original token to avoid allocation)
     let last_dot = token
         .rfind('.')
-        .expect("unreachable: token already confirmed to have 3 dot-separated parts");
+        .ok_or_else(|| "invalid JWT format".to_string())?;
     let signed_data = &token[..last_dot];
     let verifying_key =
         VerifyingKey::from_bytes(pubkey_bytes).map_err(|e| format!("bad public key: {}", e))?;
