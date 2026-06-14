@@ -71,25 +71,18 @@ impl RingBuffer {
 
 static RING: Mutex<Option<RingBuffer>> = Mutex::new(None);
 
-/// Lazily initialise the global ring buffer (idempotent).
-fn ensure_init(guard: &mut Option<RingBuffer>) {
-    if guard.is_none() {
-        *guard = Some(RingBuffer::new(DEFAULT_CAPACITY));
-    }
-}
-
 /// Push a change event into the global ring buffer.
 pub fn push(event: RingEvent) {
-    let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
-    ensure_init(&mut lock);
-    lock.as_mut().unwrap().push(event);
+    let mut lock = RING.lock().unwrap_or_else(|e| e.into_inner());
+    lock.get_or_insert_with(|| RingBuffer::new(DEFAULT_CAPACITY))
+        .push(event);
 }
 
 /// Drain all buffered events, returning them in FIFO order.
 pub fn drain() -> Vec<RingEvent> {
-    let mut lock = RING.lock().expect("ring_buffer: poisoned mutex");
-    ensure_init(&mut lock);
-    lock.as_mut().unwrap().drain()
+    let mut lock = RING.lock().unwrap_or_else(|e| e.into_inner());
+    lock.get_or_insert_with(|| RingBuffer::new(DEFAULT_CAPACITY))
+        .drain()
 }
 
 // ── Mapped-table fast-path filter ────────────────────────────────────────────
@@ -118,7 +111,7 @@ fn make_key(schema: &str, table: &str) -> String {
 
 /// Replace the entire mapped-table set (called once at BGW startup).
 pub fn mapped_tables_init(tables: impl IntoIterator<Item = (String, String)>) {
-    *mapped_tables().write().expect("mapped_tables: poisoned") =
+    *mapped_tables().write().unwrap_or_else(|e| e.into_inner()) =
         tables.into_iter().map(|(s, t)| make_key(&s, &t)).collect();
 }
 
@@ -126,7 +119,7 @@ pub fn mapped_tables_init(tables: impl IntoIterator<Item = (String, String)>) {
 pub fn mapped_table_add(schema: &str, table: &str) {
     mapped_tables()
         .write()
-        .expect("mapped_tables: poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(make_key(schema, table));
 }
 
@@ -134,7 +127,7 @@ pub fn mapped_table_add(schema: &str, table: &str) {
 pub fn mapped_table_remove(schema: &str, table: &str) {
     mapped_tables()
         .write()
-        .expect("mapped_tables: poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&make_key(schema, table));
 }
 
@@ -142,7 +135,7 @@ pub fn mapped_table_remove(schema: &str, table: &str) {
 pub fn is_table_mapped(schema: &str, table: &str) -> bool {
     mapped_tables()
         .read()
-        .expect("mapped_tables: poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .contains(&make_key(schema, table))
 }
 

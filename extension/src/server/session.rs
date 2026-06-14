@@ -119,9 +119,6 @@ pub fn with_sessions<F, R>(f: F) -> R
 where
     F: FnOnce(&mut HashMap<String, MqttSession>) -> R,
 {
-    let mut lock = SESSIONS.lock().expect("sessions: poisoned mutex");
-    if lock.is_none() {
-        *lock = Some(HashMap::new());
-    }
-    f(lock.as_mut().unwrap())
+    let mut lock = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    f(lock.get_or_insert_with(HashMap::new))
 }

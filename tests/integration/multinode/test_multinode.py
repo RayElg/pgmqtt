@@ -31,7 +31,8 @@ def test_read_replica_pauses_mqtt():
         print("Replica is up.")
 
         # Check that the health port (8080) is not responding on the replica
-        # This confirms pgmqtt_http hasn't started (due to BgWorkerStartTime::RecoveryFinished)
+        # This confirms the pgmqtt_mqtt broker worker (which serves /health from
+        # its tick loop) hasn't started (due to BgWorkerStartTime::RecoveryFinished)
         try:
             urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=5)
             assert False, "HTTP healthcheck responded on replica before being promoted!"

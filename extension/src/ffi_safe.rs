@@ -59,26 +59,3 @@ pub unsafe fn change_operation(change: *mut pg_sys::ReorderBufferChange) -> Opti
         _ => None,
     }
 }
-
-/// Convert a Datum pointer (from FFI) to a Rust string.
-///
-/// # Safety
-/// - `arg` must be a null pointer, or a valid pointer to a null-terminated C string.
-/// - PostgreSQL guarantees Datum pointers passed to background workers are valid.
-pub unsafe fn datum_to_str(arg: pg_sys::Datum) -> &'static str {
-    if arg.is_null() {
-        "postgres"
-    } else {
-        let cstr = CStr::from_ptr(std::mem::transmute::<pg_sys::Datum, *const std::os::raw::c_char>(arg));
-        cstr.to_str().unwrap_or("postgres")
-    }
-}
-
-/// Transmute a C string pointer to a PostgreSQL Datum.
-///
-/// # Safety
-/// - `ptr` must be a valid, non-null pointer to a null-terminated C string.
-/// - The pointer must remain valid for the lifetime of the Datum.
-pub unsafe fn cstr_to_datum(ptr: *const std::os::raw::c_char) -> pg_sys::Datum {
-    std::mem::transmute::<*const std::os::raw::c_char, pg_sys::Datum>(ptr)
-}

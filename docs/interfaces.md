@@ -8,7 +8,7 @@ This document describes the SQL-callable interfaces and configuration tables use
 
 ### 1. `pgmqtt_add_outbound_mapping`
 
-Registers a new logical decoding mapping for a given table.
+Registers a new logical decoding mapping for a given table. Multiple mappings per (schema, table) are supported via distinct `mapping_name` values, enabling parallel publish to multiple topics — see [topic-mapping-migration.md](topic-mapping-migration.md).
 
 **Signature:**
 ```sql
@@ -18,6 +18,7 @@ pgmqtt_add_outbound_mapping(
     topic_template text,
     payload_template text,
     qos integer DEFAULT 0,
+    mapping_name text DEFAULT NULL,
     template_type text DEFAULT 'jinja2'
 ) RETURNS text
 ```
@@ -28,6 +29,7 @@ pgmqtt_add_outbound_mapping(
 - `topic_template`: A Jinja2-compatible template string used to determine the MQTT topic for each change.
 - `payload_template`: A Jinja2-compatible template string defining what the MQTT message body will contain.
 - `qos`: Optional. The Quality of Service level for messages generated from this mapping (0 or 1). Defaults to 0.
+- `mapping_name`: Optional. Identifier distinguishing multiple mappings for the same table. `NULL` is treated as `'default'`. Re-adding with the same name updates the mapping in place.
 - `template_type`: Optional. The template engine to use for rendering topic and payload templates. Defaults to `'jinja2'`.
 
 **Example:**
@@ -39,26 +41,38 @@ SELECT pgmqtt_add_outbound_mapping(
     '{{ columns | tojson }}',
     1
 );
+
+-- Add a second mapping for the same table (fires in parallel):
+SELECT pgmqtt_add_outbound_mapping(
+    'public',
+    'events',
+    'events/v2/{{ op | lower }}',
+    '{"id": "{{ columns.id }}"}',
+    0,
+    'v2'
+);
 ```
 
 ---
 
 ### 2. `pgmqtt_remove_outbound_mapping`
 
-Removes an existing topic mapping. Note that any changes already in the internal ring buffer for this mapping may still be dispatched.
+Removes an existing topic mapping by name. Note that any changes already in the internal ring buffer for this mapping may still be dispatched.
 
 **Signature:**
 ```sql
 pgmqtt_remove_outbound_mapping(
     schema_name text,
-    table_name text
+    table_name text,
+    mapping_name text DEFAULT NULL
 ) RETURNS boolean
 ```
-Returns `true` if the mapping was found and successfully deleted, or `false` otherwise.
+Returns `true` if the mapping was found and successfully deleted, or `false` otherwise. `mapping_name` defaults to `'default'` when `NULL`; to remove all mappings for a table, call once per mapping name.
 
 **Example:**
 ```sql
-SELECT pgmqtt_remove_outbound_mapping('public', 'events');
+SELECT pgmqtt_remove_outbound_mapping('public', 'events');          -- removes 'default'
+SELECT pgmqtt_remove_outbound_mapping('public', 'events', 'v2');    -- removes 'v2'
 ```
 
 ---
@@ -79,9 +93,9 @@ SELECT * FROM pgmqtt_list_outbound_mappings();
 ```
 Output:
 ```text
-  schema_name | table_name |       topic_template      |    payload_template   | qos | template_type
- -------------+------------+---------------------------+-----------------------+-----+--------------
-  public      | events     | events/{{ op | lower }}   | {{ columns | tojson }} |   1 | jinja2
+  schema_name | table_name | mapping_name |       topic_template      |    payload_template    | qos | template_type
+ -------------+------------+--------------+---------------------------+------------------------+-----+--------------
+  public      | events     | default      | events/{{ op | lower }}   | {{ columns | tojson }} |   1 | jinja2
 ```
 
 ---

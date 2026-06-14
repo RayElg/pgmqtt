@@ -31,7 +31,10 @@ use std::num::NonZeroU32;
 // `scram_iterations`. The dummy StoredKey is all-zeros — a real PBKDF2 output
 // has 1-in-2^256 odds of matching, so the compare reliably fails on this path.
 const DUMMY_SCRAM_SALT: &[u8] = b"pgmqtt-dummy-scram-salt----0000\0";
-const DUMMY_SCRAM_ITERATIONS: u32 = 4096;
+const DUMMY_SCRAM_ITERATIONS: NonZeroU32 = match NonZeroU32::new(4096) {
+    Some(n) => n,
+    None => unreachable!(),
+};
 const DUMMY_SCRAM_STORED_KEY: [u8; 32] = [0u8; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +87,7 @@ pub fn verify(username: &str, password: &[u8]) -> AuthOutcome {
         Some(v) => (&v.salt, v.iterations, &v.stored_key),
         None => (
             DUMMY_SCRAM_SALT,
-            NonZeroU32::new(DUMMY_SCRAM_ITERATIONS).expect("nonzero"),
+            DUMMY_SCRAM_ITERATIONS,
             &DUMMY_SCRAM_STORED_KEY,
         ),
     };

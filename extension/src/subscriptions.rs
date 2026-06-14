@@ -293,11 +293,8 @@ fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SubState) -> R,
 {
-    let mut lock = SUBS.lock().expect("subscriptions: poisoned mutex");
-    if lock.is_none() {
-        *lock = Some(SubState::new());
-    }
-    f(lock.as_mut().unwrap())
+    let mut lock = SUBS.lock().unwrap_or_else(|e| e.into_inner());
+    f(lock.get_or_insert_with(SubState::new))
 }
 
 // ---------------------------------------------------------------------------
