@@ -53,8 +53,6 @@ const QUEUE_WARNING_THRESHOLD: usize = 10_000;
 /// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
 const MAX_QUEUE_SIZE: usize = 50_000;
 
-
-
 // Individual db_* functions were refactored into execute_session_db_actions.
 
 /// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
@@ -87,9 +85,13 @@ fn with_subtransaction<T>(
         })
         .execute();
     if result.is_ok() {
-        unsafe { pgrx::pg_sys::ReleaseCurrentSubTransaction(); }
+        unsafe {
+            pgrx::pg_sys::ReleaseCurrentSubTransaction();
+        }
     } else if !rolled_back_by_pg.load(Ordering::Relaxed) {
-        unsafe { pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction(); }
+        unsafe {
+            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+        }
     }
     result
 }
@@ -311,7 +313,9 @@ fn db_load_sessions_on_startup() {
         });
     });
 
-    let startup_overflow = startup_overflow.into_inner().unwrap_or_else(|e| e.into_inner());
+    let startup_overflow = startup_overflow
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
     if !startup_overflow.is_empty() {
         execute_session_db_actions(
             startup_overflow
@@ -635,11 +639,27 @@ fn process_inbound_pending() {
         /// No pending rows ready.
         Empty,
         /// Row processed successfully.
-        Ok { message_id: i64, mapping_name: String },
+        Ok {
+            message_id: i64,
+            mapping_name: String,
+        },
         /// Mapping no longer exists in the current config.
-        MappingGone { message_id: i64, mapping_name: String, retry_count: i32, topic: String, payload: Vec<u8> },
+        MappingGone {
+            message_id: i64,
+            mapping_name: String,
+            retry_count: i32,
+            topic: String,
+            payload: Vec<u8>,
+        },
         /// Target write failed; error is returned for classification outside the transaction.
-        Failed { message_id: i64, mapping_name: String, retry_count: i32, topic: String, payload: Vec<u8>, error: pgrx::spi::Error },
+        Failed {
+            message_id: i64,
+            mapping_name: String,
+            retry_count: i32,
+            topic: String,
+            payload: Vec<u8>,
+            error: pgrx::spi::Error,
+        },
     }
 
     let mut processed = 0;
@@ -664,14 +684,18 @@ fn process_inbound_pending() {
                 };
 
                 let message_id: i64 = row.get_by_name("message_id").ok().flatten().unwrap_or(0);
-                let mapping_name: String =
-                    row.get_by_name("mapping_name").ok().flatten().unwrap_or_default();
-                let retry_count: i32 =
-                    row.get_by_name("retry_count").ok().flatten().unwrap_or(0);
-                let topic: String =
-                    row.get_by_name("topic").ok().flatten().unwrap_or_default();
-                let payload: Vec<u8> =
-                    row.get_by_name("payload").ok().flatten().unwrap_or_default();
+                let mapping_name: String = row
+                    .get_by_name("mapping_name")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let retry_count: i32 = row.get_by_name("retry_count").ok().flatten().unwrap_or(0);
+                let topic: String = row.get_by_name("topic").ok().flatten().unwrap_or_default();
+                let payload: Vec<u8> = row
+                    .get_by_name("payload")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
 
                 let matches = inbound_map::try_match(&topic, &payload);
                 let target_match = matches
@@ -681,7 +705,11 @@ fn process_inbound_pending() {
                 let (_, match_result) = match target_match {
                     None => {
                         return Ok(RowOutcome::MappingGone {
-                            message_id, mapping_name, retry_count, topic, payload,
+                            message_id,
+                            mapping_name,
+                            retry_count,
+                            topic,
+                            payload,
                         });
                     }
                     Some(t) => t,
@@ -706,19 +734,31 @@ fn process_inbound_pending() {
                     .unwrap_or(false);
                 if !table_exists {
                     return Ok(RowOutcome::MappingGone {
-                        message_id, mapping_name, retry_count, topic, payload,
+                        message_id,
+                        mapping_name,
+                        retry_count,
+                        topic,
+                        payload,
                     });
                 }
 
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result
                     .values
                     .iter()
-                    .map(|a| { let opt: Option<&str> = a.as_deref(); opt.into() })
+                    .map(|a| {
+                        let opt: Option<&str> = a.as_deref();
+                        opt.into()
+                    })
                     .collect();
 
                 if let Err(e) = client.update(&*match_result.sql, None, &spi_args) {
                     return Ok(RowOutcome::Failed {
-                        message_id, mapping_name, retry_count, topic, payload, error: e,
+                        message_id,
+                        mapping_name,
+                        retry_count,
+                        topic,
+                        payload,
+                        error: e,
                     });
                 }
 
@@ -729,14 +769,20 @@ fn process_inbound_pending() {
                     &[message_id.into(), mapping_name.as_str().into()],
                 )?;
                 db_action::cleanup_orphaned_message(client, message_id)?;
-                Ok(RowOutcome::Ok { message_id, mapping_name })
+                Ok(RowOutcome::Ok {
+                    message_id,
+                    mapping_name,
+                })
             })
         })
         .unwrap_or(RowOutcome::Empty);
 
         match outcome {
             RowOutcome::Empty => break,
-            RowOutcome::Ok { message_id, mapping_name } => {
+            RowOutcome::Ok {
+                message_id,
+                mapping_name,
+            } => {
                 crate::metrics::inc(&crate::metrics::get().inbound_writes_ok);
                 log!(
                     "pgmqtt inbound: processed message {} for mapping '{}'",
@@ -745,18 +791,40 @@ fn process_inbound_pending() {
                 );
                 processed += 1;
             }
-            RowOutcome::MappingGone { message_id, mapping_name, retry_count, topic, payload } => {
+            RowOutcome::MappingGone {
+                message_id,
+                mapping_name,
+                retry_count,
+                topic,
+                payload,
+            } => {
                 dead_letter_inbound(
-                    message_id, &mapping_name, retry_count,
-                    "mapping no longer exists", &topic, &payload,
+                    message_id,
+                    &mapping_name,
+                    retry_count,
+                    "mapping no longer exists",
+                    &topic,
+                    &payload,
                 );
                 processed += 1;
             }
-            RowOutcome::Failed { message_id, mapping_name, retry_count, topic, payload, error } => {
+            RowOutcome::Failed {
+                message_id,
+                mapping_name,
+                retry_count,
+                topic,
+                payload,
+                error,
+            } => {
                 crate::metrics::inc(&crate::metrics::get().inbound_writes_failed);
                 handle_inbound_failure(
-                    message_id, &mapping_name, retry_count,
-                    &error, MAX_RETRIES, &topic, &payload,
+                    message_id,
+                    &mapping_name,
+                    retry_count,
+                    &error,
+                    MAX_RETRIES,
+                    &topic,
+                    &payload,
                 );
                 processed += 1;
             }
@@ -782,7 +850,14 @@ fn handle_inbound_failure(
     let error_msg = format!("{error}");
 
     if !retryable || retry_count >= max_retries {
-        dead_letter_inbound(message_id, mapping_name, retry_count, &error_msg, topic, payload);
+        dead_letter_inbound(
+            message_id,
+            mapping_name,
+            retry_count,
+            &error_msg,
+            topic,
+            payload,
+        );
     } else {
         crate::metrics::inc(&crate::metrics::get().inbound_retries);
         log!(
@@ -1492,7 +1567,7 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 /// only advances when **all** QOS ≥ 1 messages from that batch have been
 /// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
 /// cost if a batch fails; larger values reduce per-batch transaction overhead.
-const CDC_BATCH_SIZE: usize = 256;
+const CDC_BATCH_SIZE: usize = 4096;
 
 /// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
 /// batches, persisting QOS ≥ 1 messages within the same transaction.
@@ -1842,7 +1917,9 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
                                                 topic_str,
                                                 e
                                             );
-                                            crate::metrics::inc(&crate::metrics::get().cdc_persist_errors);
+                                            crate::metrics::inc(
+                                                &crate::metrics::get().cdc_persist_errors,
+                                            );
                                             return (Vec::new(), batch_count, false);
                                         }
                                     }
@@ -2531,7 +2608,11 @@ fn finish_connect(
         session_present,
         mqtt::reason::SUCCESS,
         v5,
-        if v5 { Some(broker_max_packet_size()) } else { None },
+        if v5 {
+            Some(broker_max_packet_size())
+        } else {
+            None
+        },
     );
     if transport.write_all(&connack).is_err() {
         log!("pgmqtt mqtt: failed to send CONNACK to '{}'", client_id);
@@ -2575,15 +2656,18 @@ fn finish_connect(
         let oversized: Vec<(u16, Option<i64>)> = pids
             .iter()
             .filter_map(|pid| {
-                session.inflight.get(pid).and_then(|(topic, payload, msg_id, _)| {
-                    let pkt =
-                        mqtt::build_publish(topic, payload, 1, Some(*pid), true, false, v5);
-                    if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
-                        Some((*pid, *msg_id))
-                    } else {
-                        None
-                    }
-                })
+                session
+                    .inflight
+                    .get(pid)
+                    .and_then(|(topic, payload, msg_id, _)| {
+                        let pkt =
+                            mqtt::build_publish(topic, payload, 1, Some(*pid), true, false, v5);
+                        if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
+                            Some((*pid, *msg_id))
+                        } else {
+                            None
+                        }
+                    })
             })
             .collect();
         for (pid, msg_id) in oversized {
@@ -2626,7 +2710,15 @@ fn finish_connect(
                     session.queue_push_front(queued);
                     break;
                 };
-                let pkt = mqtt::build_publish(&queued.topic, &queued.payload, 1, Some(pid), false, false, v5);
+                let pkt = mqtt::build_publish(
+                    &queued.topic,
+                    &queued.payload,
+                    1,
+                    Some(pid),
+                    false,
+                    false,
+                    v5,
+                );
                 if matches!(client_max_pkt, Some(m) if pkt.len() > m as usize) {
                     // MQTT-3.1.2.24-2: behave as if delivered.
                     if let Some(mid) = queued.id {
@@ -2734,10 +2826,17 @@ fn dispatch_admin_command(
                 let _ = client
                     .transport
                     .write_all(&mqtt::build_disconnect(reason, client.v5()));
-                log!("pgmqtt admin: disconnecting '{}' (reason 0x{:02x})", client_id, reason);
+                log!(
+                    "pgmqtt admin: disconnecting '{}' (reason 0x{:02x})",
+                    client_id,
+                    reason
+                );
                 disconnect_client(&client_id, clients, pending_publishes, session_db_actions);
             } else {
-                log!("pgmqtt admin: disconnect_client '{}': no such client", client_id);
+                log!(
+                    "pgmqtt admin: disconnect_client '{}': no such client",
+                    client_id
+                );
             }
         }
         Command::DisconnectRole { role_name, reason } => {
@@ -2751,7 +2850,10 @@ fn dispatch_admin_command(
                 })
                 .collect();
             if targets.is_empty() {
-                log!("pgmqtt admin: disconnect_role '{}': no matching clients", role_name);
+                log!(
+                    "pgmqtt admin: disconnect_role '{}': no matching clients",
+                    role_name
+                );
             } else {
                 log!(
                     "pgmqtt admin: disconnect_role '{}': kicking {} client(s)",
@@ -2785,10 +2887,9 @@ fn dispatch_admin_command(
                             if let Some(rules) = by_role.get(role) {
                                 client.sub_claims = rules.sub.clone();
                                 client.pub_claims = rules.pub_.clone();
-                                let drop_will = client
-                                    .will
-                                    .as_ref()
-                                    .is_some_and(|w| !will_authorized(&client.pub_claims, &w.topic));
+                                let drop_will = client.will.as_ref().is_some_and(|w| {
+                                    !will_authorized(&client.pub_claims, &w.topic)
+                                });
                                 if drop_will {
                                     if let Some(w) = client.will.take() {
                                         log!(
@@ -3839,7 +3940,8 @@ fn deliver_messages(
                     if session.inflight.len() >= inflight_limit {
                         let queue_byte_cap = crate::get_max_queue_bytes_per_client_guc();
                         if session.queue.len() >= MAX_QUEUE_SIZE
-                            || session.queue_bytes.saturating_add(msg.payload.len()) > queue_byte_cap
+                            || session.queue_bytes.saturating_add(msg.payload.len())
+                                > queue_byte_cap
                         {
                             if crate::get_debug_log_guc() {
                                 pgrx::log!(
@@ -3913,7 +4015,9 @@ fn deliver_messages(
                                 "pgmqtt: dropping {}-byte PUBLISH for '{}' (exceeds client max_packet_size={:?})",
                                 pkt.len(), sub_id, client.max_packet_size,
                             );
-                        } else if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                        } else if client.write_buf.len() + pkt.len()
+                            > crate::get_max_client_buffer_bytes_guc()
+                        {
                             pgrx::log!(
                                 "pgmqtt: client '{}' write buffer full (QoS 1). Disconnecting.",
                                 sub_id
@@ -3922,7 +4026,9 @@ fn deliver_messages(
                         } else {
                             match client.try_write(&pkt) {
                                 Ok(()) => client.record_msg_sent(msg.payload.len()),
-                                Err(()) => { to_remove.push(sub_id.clone()); }
+                                Err(()) => {
+                                    to_remove.push(sub_id.clone());
+                                }
                             }
                         }
                     }
@@ -3938,13 +4044,17 @@ fn deliver_messages(
                     );
                     if client.exceeds_max_packet(pkt.len()) {
                         crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
-                    } else if client.write_buf.len() + pkt.len() > crate::get_max_client_buffer_bytes_guc() {
+                    } else if client.write_buf.len() + pkt.len()
+                        > crate::get_max_client_buffer_bytes_guc()
+                    {
                         // QoS 0 is at-most-once: drop rather than disconnect.
                         crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                     } else {
                         match client.try_write(&pkt) {
                             Ok(()) => client.record_msg_sent(msg.payload.len()),
-                            Err(()) => { to_remove.push(sub_id.clone()); }
+                            Err(()) => {
+                                to_remove.push(sub_id.clone());
+                            }
                         }
                     }
                 }
@@ -3956,7 +4066,8 @@ fn deliver_messages(
                     with_sessions(|sessions| {
                         if let Some(session) = sessions.get_mut(sub_id) {
                             if session.queue.len() >= MAX_QUEUE_SIZE
-                                || session.queue_bytes.saturating_add(msg.payload.len()) > queue_byte_cap
+                                || session.queue_bytes.saturating_add(msg.payload.len())
+                                    > queue_byte_cap
                             {
                                 crate::metrics::inc(&crate::metrics::get().msgs_dropped_queue_full);
                                 return;
@@ -4023,7 +4134,10 @@ fn redeliver_unacked_messages(
                 continue; // MQTT-3.1.2.24-1
             }
             if client.write_buf.len() + pkt.len() > max_buf {
-                log!("pgmqtt mqtt: client '{}' write buffer full during redelivery. Disconnecting.", cid);
+                log!(
+                    "pgmqtt mqtt: client '{}' write buffer full during redelivery. Disconnecting.",
+                    cid
+                );
                 to_remove.push(cid);
             } else if client.try_write(&pkt).is_err() {
                 to_remove.push(cid);
@@ -4242,7 +4356,9 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
              ) \
              INSERT INTO pgmqtt_metrics_snapshots (snapshot_at,{cols}) \
              SELECT $1,{vals} FROM upsert",
-            cols = col_list, vals = vals_list, sets = sets,
+            cols = col_list,
+            vals = vals_list,
+            sets = sets,
         )
     });
 

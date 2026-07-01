@@ -220,7 +220,7 @@ The following limits are compiled into the extension binary and cannot be change
 | CDC ring buffer capacity | **8,192** events | Fixed-capacity ring buffer for CDC change events. Oldest events are dropped on overflow (logged every 100 drops). |
 | Per-topic QoS 0 buffer capacity | **4,096** messages | Bounded ring buffer per topic for QoS 0 CDC messages. Oldest messages are dropped on overflow. |
 | Per-topic QoS 1+ buffer | **unbounded** | QoS 1+ messages are queued without a hard cap (a warning is logged every 1,000 messages). |
-| CDC batch size | **256** rows | Maximum number of WAL changes consumed per poll cycle via `pg_logical_slot_get_changes`. |
+| CDC batch size | **4096** rows | Maximum number of WAL changes consumed per poll cycle via `pg_logical_slot_get_changes`. |
 | Inbound pending batch size | **50** rows | Maximum number of pending inbound writes processed per cycle. |
 
 ## Timing
