@@ -1,11 +1,6 @@
-//! Cross-process handoff from the `pgmqtt_cdc` worker to the `pgmqtt_mqtt`
-//! worker, backed by real PostgreSQL shared memory.
-//!
-//! Rust's ordinary statics (`Mutex<...>`, as used by `ring_buffer`) only work
-//! within a single OS process. Once CDC decoding moves into its own
-//! background worker, the resulting messages have to cross a process
-//! boundary to reach the sockets owned by `pgmqtt_mqtt`. What crosses, and
-//! how, is split by durability — not everything belongs in shared memory:
+//! Cross-process signals between the pgmqtt workers, backed by PostgreSQL
+//! shared memory. What crosses here, and what doesn't, is split by
+//! durability — not everything belongs in shared memory:
 //!
 //! - **QoS >= 1 messages are never carried in shared memory at all.** They
 //!   are already durably persisted to `pgmqtt_messages` by the CDC worker,
@@ -133,6 +128,40 @@ pub enum WorkerCommand {
     DisconnectClient { client_id: String, reason: u8 },
     DisconnectRole { role_name: String, reason: u8 },
     ReloadAcls { target: String },
+}
+
+impl From<&crate::admin_commands::Command> for WorkerCommand {
+    fn from(cmd: &crate::admin_commands::Command) -> Self {
+        use crate::admin_commands::Command;
+        match cmd {
+            Command::DisconnectClient { client_id, reason } => WorkerCommand::DisconnectClient {
+                client_id: client_id.clone(),
+                reason: *reason,
+            },
+            Command::DisconnectRole { role_name, reason } => WorkerCommand::DisconnectRole {
+                role_name: role_name.clone(),
+                reason: *reason,
+            },
+            Command::ReloadAcls { target } => WorkerCommand::ReloadAcls {
+                target: target.clone(),
+            },
+        }
+    }
+}
+
+impl From<WorkerCommand> for crate::admin_commands::Command {
+    fn from(wc: WorkerCommand) -> Self {
+        use crate::admin_commands::Command;
+        match wc {
+            WorkerCommand::DisconnectClient { client_id, reason } => {
+                Command::DisconnectClient { client_id, reason }
+            }
+            WorkerCommand::DisconnectRole { role_name, reason } => {
+                Command::DisconnectRole { role_name, reason }
+            }
+            WorkerCommand::ReloadAcls { target } => Command::ReloadAcls { target },
+        }
+    }
 }
 
 #[derive(Copy, Clone)]

@@ -1,38 +1,23 @@
 //! CDC slot consumption: WAL decoding, mapping/template rendering, and
-//! QOS >= 1 persistence, shared by both process topologies (see
-//! `crate::license::Feature::MultiProcess`):
+//! QOS >= 1 persistence, shared by both process topologies.
 //!
-//! - **Community (single process):** `server::run_standalone` calls
-//!   [`cdc_tick_core`] inline, in the same tick as socket I/O, with
-//!   [`CdcQueueMode::DeliverAll`] — every rendered message goes to the sink
-//!   for direct in-process delivery, exactly the original combined-worker
-//!   behavior. No shared memory, no outbox rows.
-//! - **Enterprise (two processes):** the dedicated `pgmqtt_cdc` worker
-//!   (`run_cdc`) calls [`cdc_tick_core`] with [`CdcQueueMode::OutboxQos1`].
-//!   Persisted messages (QOS >= 1, plus any QOS 0 message too large for the
-//!   shared-memory ring) are queued to `pgmqtt_cdc_outbox` **inside the
-//!   same transaction that advances the replication slot**, making the
-//!   cross-process handoff exactly as durable as the messages themselves:
-//!   no fixed-capacity buffer to overflow, nothing lost on a crash, and
-//!   insertion order (= WAL order) preserved by the serial ids. Only small
-//!   QOS 0 messages — fire-and-forget, never persisted — reach the sink,
-//!   which pushes them through `crate::shmem_bridge`'s inline ring.
+//! Community runs [`cdc_tick_core`] inline in the socket loop
+//! ([`CdcQueueMode::DeliverAll`]: every message goes to the sink for direct
+//! delivery). Enterprise runs it in the dedicated `pgmqtt_cdc` worker
+//! ([`CdcQueueMode::OutboxQos1`]: persisted messages are queued to
+//! `pgmqtt_cdc_outbox` inside the same transaction that advances the slot —
+//! the handoff is exactly as durable as the messages, with id order = WAL
+//! order; only small fire-and-forget QOS 0 messages reach the sink, bound
+//! for `crate::shmem_bridge`'s inline ring).
 //!
-//! The WAL-drain/persist/atomicity logic in `cdc_tick_core` is identical
-//! either way; only where a finished message goes differs.
-//!
-//! In the enterprise topology, this worker has no visibility into
-//! `crate::subscriptions` (that state lives in the other process), so it can
-//! no longer skip persisting a message just because nobody is subscribed
-//! yet. `deliver_messages` in `server::mod` reclaims any QOS >= 1 row that
-//! turns out to have zero subscribers at delivery time, which preserves the
-//! no-orphan-rows invariant regardless of topology.
+//! In `OutboxQos1` mode this worker has no subscriber visibility (that
+//! state lives in the other process), so it persists unconditionally;
+//! delivery-side reclamation preserves the no-orphan-rows invariant.
 
 use super::{db_action, with_subtransaction, MqttMessage};
 use crate::ring_buffer;
 use crate::topic_map;
 use pgrx::bgworkers::BackgroundWorker;
-use pgrx::datum::DatumWithOid;
 use pgrx::log;
 use pgrx::spi::{self, Spi};
 
@@ -56,36 +41,18 @@ pub(crate) enum CdcQueueMode {
     OutboxQos1,
 }
 
-/// Run the CDC tick loop (enterprise, `pgmqtt_cdc` worker only): wake on the
-/// shared BGW latch, drain the WAL slot every `pgmqtt.cdc_every_n_ticks`
-/// ticks, queue persisted messages through `pgmqtt_cdc_outbox`, and hand
-/// small QOS 0 messages to `pgmqtt_mqtt` via the shared-memory ring.
-///
-/// This worker is the DB-side half of the split, so it also absorbs the
-/// other database pipelines that don't need socket state, keeping their
-/// fsyncs (and their failure modes) off the socket loop:
-///
-/// - **The QoS 1 inbound pump** (`process_inbound_pending`): up to 50
-///   single-row transactions per tick under load — each a synchronous
-///   commit — and the known crash surface of target-table DDL racing the
-///   pending drain. Here, that crash restarts this worker without touching
-///   client connections.
-/// - **The WAL flush beacon**: `pgmqtt_mqtt` commits asynchronously and
-///   defers PUBACKs/delivery on the flush LSN; when nothing else is
-///   advancing the flush, it asks this worker to issue the one small
-///   synchronous commit that group-flushes everything (see
-///   `crate::shmem_bridge::request_wal_flush`).
+/// The `pgmqtt_cdc` worker's tick loop (enterprise only). Besides slot
+/// consumption it absorbs the other DB-only pipelines, keeping their fsyncs
+/// and failure modes off the socket loop: the QoS 1 inbound pump (whose
+/// known target-table DDL crash then restarts this worker without touching
+/// client connections) and the WAL flush beacon behind `pgmqtt_mqtt`'s
+/// asynchronous commits.
 pub fn run_cdc(slot_name: &str) {
     // Record the boot topology in this process too: the QoS 0 routing
     // below consults it (multi-worker sends everything through the
-    // outbox). -1 marks "not a socket worker" — this process never drains
-    // a command ring or owns an outbox cursor.
-    super::ACTIVE_WORKER_SLOT.store(-1, std::sync::atomic::Ordering::Relaxed);
-    super::ACTIVE_SOCKET_WORKERS.store(
-        crate::socket_worker_count(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    super::setup_replication_origin("pgmqtt_cdc");
+    // outbox).
+    super::topology::set(-1, crate::socket_worker_count());
+    super::topology::setup_replication_origin("pgmqtt_cdc");
 
     let mut tick: u64 = 0;
     let mut last_inbound_reload = std::time::Instant::now();
@@ -106,15 +73,11 @@ pub fn run_cdc(slot_name: &str) {
         }
 
         // Flush beacon first: pgmqtt_mqtt has deferred PUBACKs waiting on
-        // this, and pg_logical_emit_message decodes to nothing (the output
-        // plugin registers no message callback) so it cannot feed back into
-        // the CDC pipeline below. The default synchronous commit is the
-        // whole point: it forces a flush of all earlier WAL, including the
-        // socket worker's async commits.
+        // this. The synchronous commit is the whole point — it forces a
+        // flush of all earlier WAL, including the socket worker's async
+        // commits.
         if crate::shmem_bridge::take_wal_flush_request() {
-            BackgroundWorker::transaction(|| {
-                let _ = Spi::run("SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')");
-            });
+            super::wal::force_flush();
         }
 
         if last_inbound_reload.elapsed() >= std::time::Duration::from_millis(500) {
@@ -139,42 +102,24 @@ pub fn run_cdc(slot_name: &str) {
     log!("pgmqtt cdc: SIGTERM received, shutting down");
 }
 
-/// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
-/// batches, persisting QOS ≥ 1 messages within the same transaction.
-///
-/// `sink` is called with each batch's sink-routed messages (all of them in
-/// `DeliverAll` mode; only small QOS 0 ones in `OutboxQos1` mode) as soon as
-/// that batch's transaction commits — not accumulated and called once with
-/// the whole WAL backlog. This matters regardless of topology: even the
-/// community single-process caller wants a batch delivered as soon as it's
-/// durable rather than held until the entire backlog drains. In the
-/// enterprise topology it additionally bounds the burst size any one
-/// `crate::shmem_bridge` push has to absorb.
+/// Drain the WAL slot in atomic batches, persisting QOS ≥ 1 messages within
+/// the same transaction.
 ///
 /// # Atomicity guarantee
 ///
-/// For each batch the sequence is:
-///   1. `pg_logical_slot_get_changes(..., upto_nchanges = CDC_BATCH_SIZE)`
-///      fires the output plugin for each event, which pushes raw `ChangeEvent`s
-///      into the in-memory `ring_buffer`.
-///   2. The ring buffer is drained; every QOS ≥ 1 rendered message is
-///      `INSERT`ed into `pgmqtt_messages` **within the same transaction**.
-///      In `OutboxQos1` mode, all persisted ids are also queued to
-///      `pgmqtt_cdc_outbox` in this same transaction.
-///   3. On commit, the slot's `confirmed_flush_lsn` advances to cover exactly
-///      those events — and only those events.
+/// Each batch is one transaction: the slot advance
+/// (`pg_logical_slot_get_changes`), the `pgmqtt_messages` inserts, and (in
+/// `OutboxQos1` mode) the outbox enqueue commit or roll back together. A
+/// failed batch leaves the slot unmoved and the events are re-read next
+/// tick — at-least-once, with no window where a persisted message exists
+/// without its outbox row (or vice versa), so a crash of either worker or
+/// the postmaster never strands a message.
 ///
-/// A crash between the SPI calls is impossible: they share one transaction.
-/// If any insert fails the whole batch rolls back; the slot does not advance;
-/// the same events will be re-read next tick (at-least-once delivery). In
-/// `OutboxQos1` mode this extends across the process boundary: a message is
-/// either fully invisible (batch rolled back) or durably persisted *and*
-/// durably queued for delivery — there is no window where one exists without
-/// the other, so a crash of either worker (or the whole postmaster) never
-/// strands a persisted message.
-///
-/// Small QOS 0 messages are not persisted; they are collected during the
-/// transaction and passed to the sink after commit (fire-and-forget).
+/// `sink` fires per batch right after that batch's commit, not once for the
+/// whole backlog: a single bulk INSERT can span many batches, and
+/// incremental delivery bounds the burst any one push has to absorb.
+/// Small QOS 0 messages are never persisted; they reach the sink after
+/// commit, fire-and-forget.
 pub(crate) fn cdc_tick_core(
     slot_name: &str,
     mode: CdcQueueMode,
@@ -283,22 +228,9 @@ pub(crate) fn cdc_tick_core(
         });
     }
 
-    // ── Batched, atomic CDC drain loop ───────────────────────────────────────
-    //
-    // BackgroundWorker::transaction requires UnwindSafe + RefUnwindSafe, which
-    // &mut T does NOT satisfy.  The fix: all mutable state lives *inside* the
-    // closure (local variables, not captured).  The closure returns a
-    // (messages, queued, batch_count, ok) tuple that we destructure after the
-    // commit.
-    //
-    // Each batch's sink messages are pushed right after its own transaction
-    // commits — NOT accumulated across the whole WAL backlog and pushed once
-    // at the end. A single bulk INSERT can span many CDC_BATCH_SIZE-sized
-    // batches; pushing incrementally caps the burst any one push has to
-    // absorb at one batch's worth (instead of the entire backlog) and gives
-    // the independent pgmqtt_mqtt process's per-tick drain a chance to
-    // interleave, rather than receiving the whole backlog in one tight loop
-    // after this function would otherwise return.
+    // BackgroundWorker::transaction requires UnwindSafe, which &mut T does
+    // not satisfy — so all mutable state lives inside the closure and comes
+    // back out through the returned tuple.
     loop {
         let (to_publish, outbox_queued, batch_count, batch_ok) = BackgroundWorker::transaction(
             move || -> (Vec<MqttMessage>, usize, usize, bool) {
@@ -306,12 +238,10 @@ pub(crate) fn cdc_tick_core(
                 let mut outbox_ids: Vec<i64> = Vec::new();
                 let mut batch_count: usize = 0;
 
-                // ── Step 1: advance the slot by at most CDC_BATCH_SIZE events ──
-                //
-                // The output plugin (pg_decode_change) fires synchronously for each
-                // row, pushing a ChangeEvent into ring_buffer.  Because this runs
-                // inside the same transaction as the inserts below, the slot's
-                // confirmed_flush_lsn only moves forward on COMMIT.
+                // Step 1: advance the slot by at most CDC_BATCH_SIZE events.
+                // The output plugin pushes each event into ring_buffer; the
+                // slot's confirmed_flush_lsn only moves forward when this
+                // transaction (inserts included) commits.
                 let advance_query = format!(
                     "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
                     slot_name, CDC_BATCH_SIZE
@@ -351,17 +281,15 @@ pub(crate) fn cdc_tick_core(
                     }
                 }
 
-                // ── Step 2: drain ring_buffer; process events in WAL order ──────
-                //
-                // MappingUpdate events apply mapping deltas both to the in-process
-                // cache and to pgmqtt_slot_mappings within this transaction, so the
-                // checkpoint stays atomically consistent with confirmed_flush_lsn.
+                // Step 2: drain ring_buffer in WAL order. MappingUpdate
+                // events apply to both the in-process cache and
+                // pgmqtt_slot_mappings within this transaction, keeping the
+                // checkpoint atomically consistent with confirmed_flush_lsn.
                 let events = ring_buffer::drain();
 
                 for event in &events {
                     match event {
                         ring_buffer::RingEvent::MappingUpdate { op, columns } => {
-                            // Helper to pull a column value by name.
                             let col = |name: &str| -> String {
                                 columns
                                     .iter()
@@ -452,21 +380,12 @@ pub(crate) fn cdc_tick_core(
                             for rendered in rendered_messages {
                                 let topic_str = rendered.topic.clone();
 
-                                // Unlike the pre-split loop, this worker has no
-                                // subscriber visibility in OutboxQos1 mode (that
-                                // state lives in the pgmqtt_mqtt process) — every
-                                // rendered message is persisted/queued
-                                // unconditionally, and deliver_messages() reclaims
-                                // the row on the other end if it turns out nobody
-                                // is subscribed.
-
                                 // A QOS 0 message too large for the shared-memory
                                 // ring takes the persisted outbox path instead of
-                                // being dropped; the delivery worker reclaims the
-                                // row after the one delivery attempt. With several
-                                // socket workers, ALL QoS 0 goes through the outbox
-                                // — the inline ring has a single consumer, and the
-                                // outbox is the one medium every worker reads.
+                                // being dropped. With several socket workers, ALL
+                                // QoS 0 spills — the inline ring has a single
+                                // consumer, and the outbox is the one medium every
+                                // worker reads.
                                 let spill_qos0 = matches!(mode, CdcQueueMode::OutboxQos1)
                                     && rendered.qos == 0
                                     && (crate::server::multi_worker()
@@ -476,11 +395,10 @@ pub(crate) fn cdc_tick_core(
                                         ));
 
                                 if rendered.qos > 0 || spill_qos0 {
-                                    // Persist within this transaction — committed atomically
-                                    // with the slot advance above.  The subtransaction ensures a
-                                    // PostgreSQL error inside persist_message is caught and counted
-                                    // without crashing the background worker; the outer batch still
-                                    // rolls back so events are retried on the next tick.
+                                    // The subtransaction catches a PostgreSQL
+                                    // error inside persist_message without
+                                    // crashing the worker; the outer batch
+                                    // still rolls back so events are retried.
                                     let result = with_subtransaction(|| {
                                         pgrx::spi::Spi::connect_mut(|client| {
                                             let msg_id = db_action::persist_message(
@@ -556,25 +474,15 @@ pub(crate) fn cdc_tick_core(
                     }
                 }
 
-                // ── Step 3 (OutboxQos1 only): queue persisted ids for delivery ──
-                //
-                // One batched insert, inside this same transaction: the slot
-                // advance, the message rows, and the pending-delivery queue
-                // rows all commit (or roll back) together. This is the whole
-                // cross-process handoff for persisted messages — the delivery
-                // worker reads pgmqtt_cdc_outbox in id (= WAL) order.
+                // Step 3 (OutboxQos1 only): queue persisted ids for
+                // delivery, still inside this transaction — the whole
+                // cross-process handoff commits or rolls back with the slot
+                // advance and the message rows.
                 if !outbox_ids.is_empty() {
                     let queued = outbox_ids.len();
                     let insert_result = with_subtransaction(|| {
                         pgrx::spi::Spi::connect_mut(|client| {
-                            let args: Vec<DatumWithOid> = vec![outbox_ids.clone().into()];
-                            client
-                                .update(
-                                    "INSERT INTO pgmqtt_cdc_outbox (id) SELECT unnest($1::bigint[])",
-                                    None,
-                                    &args,
-                                )
-                                .map(|_| ())
+                            super::outbox::enqueue(client, &outbox_ids)
                         })
                     });
                     if let Err(e) = insert_result {
@@ -593,8 +501,6 @@ pub(crate) fn cdc_tick_core(
                 (to_publish, 0, batch_count, true)
             },
         );
-        // ↑ COMMIT: slot LSN advances IFF all QOS ≥ 1 inserts committed.
-        //   batch_ok=false means the transaction rolled back; slot unchanged.
 
         if !batch_ok {
             log!("pgmqtt cdc: batch transaction failed or rolled back — events will be retried");

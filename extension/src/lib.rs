@@ -1545,29 +1545,18 @@ pub unsafe extern "C" fn _PG_init() {
     // (the extension must be loaded via shared_preload_libraries).
     crate::metrics::init_shared();
 
-    // Process topology is decided once, here, from the license key GUC value
-    // already resolved by the time _PG_init runs (config-file GUCs are
-    // parsed before shared_preload_libraries load). It cannot change without
-    // a full postmaster restart — background workers registered here are
-    // fixed for the life of the postmaster, unlike per-request feature
-    // checks elsewhere in this file.
+    // Process topology is decided once, here, from the license key GUC
+    // (config-file GUCs are parsed before shared_preload_libraries load).
+    // Background workers registered in _PG_init are fixed for the life of
+    // the postmaster, so unlike every other license feature this one needs
+    // a full PostgreSQL restart to change.
     //
-    // Community: a single "pgmqtt_mqtt" worker does everything — sockets,
-    // delivery, AND CDC slot consumption inline (server::run_standalone) —
-    // exactly the original combined-worker design. No shared memory beyond
-    // the metrics counters above.
-    //
-    // Enterprise ('multiprocess' feature): "pgmqtt_mqtt" is delivery-only
-    // (server::run_delivery) and a second "pgmqtt_cdc" worker owns the
-    // replication slot, so a slow or backlogged WAL drain can no longer
-    // stall socket I/O. Persisted (QOS >= 1) messages cross the process
-    // boundary through the durable pgmqtt_cdc_outbox table, queued in the
-    // same transaction that advances the slot; only small QOS 0 messages
-    // and wakeup doorbells go through crate::shmem_bridge (see that
-    // module for the durability split). The CDC worker also absorbs the
-    // other DB-only pipelines — the QoS 1 inbound pump and the WAL flush
-    // beacon behind pgmqtt_mqtt's asynchronous commits — so no fsync ever
-    // blocks the socket loop (see server::cdc_worker::run_cdc).
+    // Community: one "pgmqtt_mqtt" worker does everything, CDC inline
+    // (server::run_standalone). Enterprise ('multiprocess'): "pgmqtt_mqtt"
+    // is delivery-only and a separate "pgmqtt_cdc" worker owns the slot
+    // plus the other DB-only pipelines, so a backlogged WAL drain or an
+    // fsync can never stall socket I/O (see server::cdc_worker::run_cdc
+    // and crate::shmem_bridge for the handoff design).
     let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
     if multiprocess {
         crate::shmem_bridge::init();

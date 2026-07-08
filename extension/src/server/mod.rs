@@ -2,9 +2,13 @@
 
 mod cdc_worker;
 pub mod db_action;
+mod outbox;
+mod publish;
 mod readiness;
 pub mod session;
+mod topology;
 pub mod transport;
+mod wal;
 
 use crate::inbound_map;
 use crate::mqtt;
@@ -12,7 +16,9 @@ use crate::subscriptions;
 pub use cdc_worker::run_cdc;
 pub use db_action::{execute_session_db_actions, execute_session_db_actions_async, SessionDbAction};
 pub use session::{with_sessions, MqttMessage, MqttSession};
+pub(crate) use topology::{multi_worker, worker_slot};
 pub use transport::Transport;
+use publish::{publish_messages_batch, publish_messages_batch_deferred, PendingPublish};
 
 use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
@@ -58,123 +64,6 @@ const MAX_QUEUE_SIZE: usize = 50_000;
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
-// ── Worker topology (set once by the run_* entry points) ────────────────────
-//
-// Process-local: each worker records its own slot and the boot-time worker
-// count so deep call paths (CONNECT takeover, deliver_messages, the CDC
-// worker's QoS 0 routing) can consult the topology without threading it
-// through every signature.
-static ACTIVE_WORKER_SLOT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static ACTIVE_SOCKET_WORKERS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-
-pub(crate) fn worker_slot() -> i32 {
-    ACTIVE_WORKER_SLOT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The socket-worker count this postmaster booted with. `> 1` switches the
-/// cross-worker paths on: outbox cursors instead of delete-on-delivery,
-/// client publishes routed through the outbox, GC-owned orphan cleanup,
-/// takeover/admin broadcast rings.
-pub(crate) fn multi_worker() -> bool {
-    ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed) > 1
-}
-
-fn admin_to_worker_command(cmd: &crate::admin_commands::Command) -> crate::shmem_bridge::WorkerCommand {
-    use crate::admin_commands::Command;
-    use crate::shmem_bridge::WorkerCommand;
-    match cmd {
-        Command::DisconnectClient { client_id, reason } => WorkerCommand::DisconnectClient {
-            client_id: client_id.clone(),
-            reason: *reason,
-        },
-        Command::DisconnectRole { role_name, reason } => WorkerCommand::DisconnectRole {
-            role_name: role_name.clone(),
-            reason: *reason,
-        },
-        Command::ReloadAcls { target } => WorkerCommand::ReloadAcls {
-            target: target.clone(),
-        },
-    }
-}
-
-fn worker_to_admin_command(wc: crate::shmem_bridge::WorkerCommand) -> crate::admin_commands::Command {
-    use crate::admin_commands::Command;
-    use crate::shmem_bridge::WorkerCommand;
-    match wc {
-        WorkerCommand::DisconnectClient { client_id, reason } => {
-            Command::DisconnectClient { client_id, reason }
-        }
-        WorkerCommand::DisconnectRole { role_name, reason } => {
-            Command::DisconnectRole { role_name, reason }
-        }
-        WorkerCommand::ReloadAcls { target } => Command::ReloadAcls { target },
-    }
-}
-
-/// Bind a listener, with `SO_REUSEPORT` when several socket workers share
-/// the same ports (the kernel then load-balances incoming connections
-/// across the workers' accept queues). Single-worker topologies use a
-/// plain bind, exactly as before.
-fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
-    if !multi_worker() {
-        return TcpListener::bind(addr);
-    }
-    let parsed: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
-    let std::net::SocketAddr::V4(v4) = parsed else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "only IPv4 listen addresses are supported",
-        ));
-    };
-    unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let close_err = |fd: i32| -> std::io::Error {
-            let err = std::io::Error::last_os_error();
-            libc::close(fd);
-            err
-        };
-        let one: libc::c_int = 1;
-        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
-            if libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                opt,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                return Err(close_err(fd));
-            }
-        }
-        let sin = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: v4.port().to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_be_bytes(v4.ip().octets()).to_be(),
-            },
-            sin_zero: [0; 8],
-        };
-        if libc::bind(
-            fd,
-            &sin as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ) != 0
-        {
-            return Err(close_err(fd));
-        }
-        if libc::listen(fd, 128) != 0 {
-            return Err(close_err(fd));
-        }
-        use std::os::unix::io::FromRawFd;
-        Ok(TcpListener::from_raw_fd(fd))
-    }
-}
-
 /// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
 /// savepoint is released; on `Err` (whether a Rust error or a PG longjmp
 /// caught by `catch_others`), the savepoint is rolled back and the error is
@@ -214,79 +103,6 @@ fn with_subtransaction<T>(
         }
     }
     result
-}
-
-/// Tag every transaction this worker session commits with a named
-/// replication origin, and register the origin's id in shared memory so
-/// the logical decoding plugin can skip the worker's own WAL *before* it
-/// enters the reorder buffer (`pg_decode_filter_by_origin` in lib.rs).
-///
-/// Without this, every message row, outbox row, and piece of session
-/// bookkeeping the workers write is decoded on the next slot read and
-/// then discarded by table-name — several reorder-buffer records of pure
-/// overhead per delivered message. User writes (no origin) and foreign
-/// logical-replication origins are unaffected: only ids registered here
-/// are filtered.
-///
-/// Failure is logged and tolerated — the broker is fully correct without
-/// origin tagging, just slower to decode under write load.
-pub(crate) fn setup_replication_origin(name: &str) {
-    let ident = BackgroundWorker::transaction(|| {
-        with_subtransaction(|| {
-            pgrx::spi::Spi::connect_mut(|client| {
-                // Startup writes are serialized with the partner worker's
-                // slot creation under the migration advisory lock — a write
-                // transaction in flight while the slot searches for its
-                // decoding start point can wedge that worker through a fast
-                // shutdown (see ensure_replication_slot in lib.rs).
-                let _ = client.select(
-                    &format!(
-                        "SELECT pg_advisory_xact_lock({})",
-                        crate::SCHEMA_MIGRATION_LOCK_KEY
-                    ),
-                    None,
-                    &[],
-                );
-                let args: Vec<pgrx::datum::DatumWithOid> = vec![name.into()];
-                client.update(
-                    "SELECT pg_replication_origin_create($1) \
-                     WHERE NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = $1)",
-                    None,
-                    &args,
-                )?;
-                // Attaches the origin to this session exclusively; every
-                // commit from here on carries its id in WAL.
-                client.update(
-                    "SELECT pg_replication_origin_session_setup($1)",
-                    None,
-                    &args,
-                )?;
-                let args: Vec<pgrx::datum::DatumWithOid> = vec![name.into()];
-                client
-                    .select(
-                        "SELECT roident::int FROM pg_replication_origin WHERE roname = $1",
-                        None,
-                        &args,
-                    )?
-                    .first()
-                    .get_one::<i32>()
-            })
-        })
-    });
-    match ident {
-        Ok(Some(id)) if id > 0 => {
-            crate::metrics::register_worker_origin(id as u16);
-            log!("pgmqtt: replication origin '{}' attached (id {})", name, id);
-        }
-        other => {
-            log!(
-                "pgmqtt: could not set up replication origin '{}' ({:?}) — \
-                 own WAL will be decoded and discarded by name instead of filtered",
-                name,
-                other
-            );
-        }
-    }
 }
 
 /// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
@@ -1415,8 +1231,7 @@ method not allowed";
 ///   durable `pgmqtt_cdc_outbox` queue (woken by a shared-memory doorbell),
 ///   small QOS 0 messages from `crate::shmem_bridge`'s inline ring.
 pub fn run_standalone(ports: crate::PortConfig, slot_name: &str) {
-    ACTIVE_WORKER_SLOT.store(0, std::sync::atomic::Ordering::Relaxed);
-    ACTIVE_SOCKET_WORKERS.store(1, std::sync::atomic::Ordering::Relaxed);
+    topology::set(0, 1);
     run_loop(ports, CdcMode::Standalone(slot_name));
 }
 
@@ -1424,8 +1239,7 @@ pub fn run_standalone(ports: crate::PortConfig, slot_name: &str) {
 /// `slot` 0 owns the singleton duties (HTTP healthcheck, metrics flush,
 /// sweeps, outbox GC); with `workers > 1` the cross-worker paths engage.
 pub fn run_delivery(ports: crate::PortConfig, slot: i32, workers: i32) {
-    ACTIVE_WORKER_SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
-    ACTIVE_SOCKET_WORKERS.store(workers.max(1), std::sync::atomic::Ordering::Relaxed);
+    topology::set(slot, workers);
     run_loop(ports, CdcMode::Bridged);
 }
 
@@ -1451,7 +1265,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     } else {
         format!("pgmqtt_mqtt_{}", slot)
     };
-    setup_replication_origin(&origin_name);
+    topology::setup_replication_origin(&origin_name);
 
     // Marking every "connected" session as disconnected is only valid at
     // postmaster boot, when no client can be connected anywhere. A restart
@@ -1468,114 +1282,38 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
         crate::statements::prepare_hot_path_statements();
     });
 
-    // Bind MQTT TCP listener (optional)
-    let mqtt_listener = if ports.mqtt_enabled {
-        let addr = format!("0.0.0.0:{}", ports.mqtt_port);
-        match bind_listener(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt mqtt: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt mqtt: listening on {} (raw TCP)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt mqtt: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt mqtt: TCP listener disabled");
-        None
+    let Ok(mqtt_listener) =
+        topology::bind(ports.mqtt_enabled, ports.mqtt_port, "pgmqtt mqtt", "TCP", "raw TCP")
+    else {
+        return;
     };
-
-    // Bind WebSocket listener (optional)
-    let ws_listener = if ports.ws_enabled {
-        let addr = format!("0.0.0.0:{}", ports.ws_port);
-        match bind_listener(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt ws: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt ws: listening on {} (WebSocket)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt ws: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt ws: WebSocket listener disabled");
-        None
+    let Ok(ws_listener) = topology::bind(
+        ports.ws_enabled,
+        ports.ws_port,
+        "pgmqtt ws",
+        "WebSocket",
+        "WebSocket",
+    ) else {
+        return;
     };
-
-    // Bind MQTT TLS listener (optional)
-    let mqtts_listener = if ports.mqtts_enabled {
-        let addr = format!("0.0.0.0:{}", ports.mqtts_port);
-        match bind_listener(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt mqtts: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt mqtts: listening on {} (TLS)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt mqtts: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt mqtts: TLS listener disabled");
-        None
+    let Ok(mqtts_listener) =
+        topology::bind(ports.mqtts_enabled, ports.mqtts_port, "pgmqtt mqtts", "TLS", "TLS")
+    else {
+        return;
     };
-
-    // Bind WSS listener (optional)
-    let wss_listener = if ports.wss_enabled {
-        let addr = format!("0.0.0.0:{}", ports.wss_port);
-        match bind_listener(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt wss: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt wss: listening on {} (WSS)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt wss: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt wss: WSS listener disabled");
-        None
+    let Ok(wss_listener) =
+        topology::bind(ports.wss_enabled, ports.wss_port, "pgmqtt wss", "WSS", "WSS")
+    else {
+        return;
     };
-
-    // Bind HTTP healthcheck listener (optional)
-    let http_listener = if ports.http_enabled {
-        let addr = format!("0.0.0.0:{}", ports.http_port);
-        match bind_listener(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt http: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt http: listening on {} (healthcheck)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt http: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt http: healthcheck listener disabled");
-        None
+    let Ok(http_listener) = topology::bind(
+        ports.http_enabled,
+        ports.http_port,
+        "pgmqtt http",
+        "healthcheck",
+        "healthcheck",
+    ) else {
+        return;
     };
 
     // Load TLS configuration if any secure listener is enabled
@@ -1621,27 +1359,13 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
     let mut last_connections_flush = std::time::Instant::now();
-    // Bridged-mode outbox state. `outbox_pending` starts true so the first
-    // tick always queries pgmqtt_cdc_outbox: rows queued before a restart
-    // (of this worker or the whole postmaster) are recovered without
-    // depending on the shared-memory doorbell, which does not survive a
-    // postmaster crash.
-    let mut outbox_pending = matches!(cdc_mode, CdcMode::Bridged);
-    let mut outbox_doorbell_seen: u64 = 0;
-    let mut last_outbox_safety_check = std::time::Instant::now();
-    let mut last_outbox_gc = std::time::Instant::now();
-    // Multi-worker delivery cursor over pgmqtt_cdc_outbox (see the Bridged
-    // arm below). Seeded from the cursors table so a restarted worker
-    // resumes where its predecessor durably left off.
-    let mut outbox_cursor: i64 = 0;
-    if multi && matches!(cdc_mode, CdcMode::Bridged) {
-        outbox_cursor = seed_outbox_cursor(slot);
-    }
-    // Bridged-mode async-commit state: batches persisted with
-    // synchronous_commit=off whose delivery/PUBACKs wait for the WAL flush
-    // pointer. Always empty in Standalone mode.
-    let mut deferred_publishes: std::collections::VecDeque<DeferredRelease> =
-        std::collections::VecDeque::new();
+    // Bridged-mode state: the outbox drain and the async-commit release
+    // queue. Both idle in Standalone mode.
+    let mut bridged_outbox = match cdc_mode {
+        CdcMode::Bridged => Some(outbox::Drain::new()),
+        CdcMode::Standalone(_) => None,
+    };
+    let mut deferred_publishes = publish::DeferredQueue::new();
     while BackgroundWorker::wait_latch(Some(latch_interval())) {
         tick = tick.wrapping_add(1);
 
@@ -1679,8 +1403,8 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                     if multi {
                         crate::shmem_bridge::broadcast_command(
                             slot,
-                            ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed),
-                            &admin_to_worker_command(&cmd),
+                            topology::socket_workers(),
+                            &(&cmd).into(),
                         );
                     }
                     dispatch_admin_command(
@@ -1709,7 +1433,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                 let mut admin_pubs = Vec::new();
                 for wc in ring_cmds {
                     dispatch_admin_command(
-                        worker_to_admin_command(wc),
+                        wc.into(),
                         &mut clients,
                         &mut admin_pubs,
                         &mut admin_sess_actions,
@@ -1815,161 +1539,15 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
             }
             CdcMode::Bridged => {
                 // Enterprise: deliver what the separate pgmqtt_cdc worker
-                // queued. This runs every tick (not gated by
-                // pgmqtt.cdc_every_n_ticks — that GUC now paces the CDC
-                // worker's own slot polling, not delivery).
-                //
-                // Persisted messages (QOS >= 1 and oversize QOS 0) sit in
-                // pgmqtt_cdc_outbox, queued there in the same transaction
-                // that advanced the slot. The shared-memory doorbell is only
-                // a wakeup hint that lets idle ticks skip the SPI query;
-                // correctness never depends on it (first-tick query above,
-                // plus a slow safety re-check for belt and braces — e.g. a
-                // failed end-of-tick action transaction leaves rows queued
-                // with no new doorbell coming).
-                let doorbell = crate::shmem_bridge::outbox_doorbell_seq();
-                if last_outbox_safety_check.elapsed() >= Duration::from_secs(30) {
-                    last_outbox_safety_check = std::time::Instant::now();
-                    outbox_pending = true;
-                }
-                if outbox_pending || doorbell != outbox_doorbell_seen {
-                    outbox_doorbell_seen = doorbell;
-                    let (outbox_ids, outbox_messages) =
-                        fetch_cdc_outbox_batch(if multi { Some(outbox_cursor) } else { None });
-                    // One batch per tick keeps this loop's CDC work bounded
-                    // even against a huge backlog (the lesson of the old
-                    // unbounded cdc_tick drain); a full fetch means more may
-                    // be waiting, so keep fetching on subsequent ticks
-                    // without needing another doorbell.
-                    outbox_pending = outbox_ids.len() >= cdc_worker::CDC_BATCH_SIZE;
-                    if !outbox_messages.is_empty() {
-                        deliver_messages(
-                            &outbox_messages,
-                            &mut clients,
-                            &mut publishes,
-                            &mut session_db_actions,
-                        );
-                        // Oversize-QOS-0 spill rows get no session_messages
-                        // tracking (QOS 0 has no PUBACK), so nothing else
-                        // would ever reclaim them: clean up right after the
-                        // one delivery attempt. (Multi-worker: the slot-0
-                        // GC owns all reclamation instead — another worker
-                        // may not have delivered this row yet.)
-                        if !multi {
-                            for msg in &outbox_messages {
-                                if msg.qos == 0 {
-                                    if let Some(message_id) = msg.id {
-                                        session_db_actions.push(
-                                            SessionDbAction::CleanupOrphanedMessage { message_id },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(&max_id) = outbox_ids.last() {
-                        if multi {
-                            // Advance this worker's cursor; rows are shared
-                            // with the other workers and reclaimed by the
-                            // slot-0 GC once every cursor has passed them.
-                            // Committed with this tick's delivery state — a
-                            // crash re-fetches from the old cursor
-                            // (at-least-once), so the local cursor can
-                            // advance immediately.
-                            outbox_cursor = outbox_cursor.max(max_id);
-                            session_db_actions.push(SessionDbAction::AdvanceOutboxCursor {
-                                worker_slot: slot,
-                                last_id: max_id,
-                            });
-                        } else {
-                            // Single worker: committed atomically with this
-                            // tick's delivery state (execute_session_db_actions
-                            // below): a crash before that commit leaves the
-                            // rows queued and they are re-fetched and
-                            // re-delivered — at-least-once.
-                            session_db_actions
-                                .push(SessionDbAction::DrainCdcOutbox { ids: outbox_ids });
-                        }
-                    }
-                }
-
-                // Slot-0 housekeeping (multi-worker): reclaim outbox rows
-                // every worker has delivered, and orphaned message rows
-                // along with them.
-                if multi && is_primary && last_outbox_gc.elapsed() >= Duration::from_secs(1) {
-                    last_outbox_gc = std::time::Instant::now();
-                    gc_outbox_below_min_cursor();
-                }
-                // Small QOS 0 messages travel through shared memory only;
-                // draining is a lock + memcpy when the ring is empty, which
-                // is the common case.
-                let bridged_inline = crate::shmem_bridge::drain_inline();
-                if !bridged_inline.is_empty() {
-                    let inline_messages: Vec<MqttMessage> = bridged_inline
-                        .into_iter()
-                        .map(|(topic, payload)| MqttMessage {
-                            id: None,
-                            topic: Arc::from(topic.as_str()),
-                            payload: Arc::from(payload),
-                            qos: 0,
-                        })
-                        .collect();
-                    deliver_messages(
-                        &inline_messages,
-                        &mut clients,
-                        &mut publishes,
-                        &mut session_db_actions,
-                    );
+                // queued. Runs every tick — pgmqtt.cdc_every_n_ticks paces
+                // the CDC worker's slot polling, not delivery.
+                if let Some(drain) = bridged_outbox.as_mut() {
+                    drain.tick(&mut clients, &mut publishes, &mut session_db_actions);
                 }
             }
         }
 
-        // Release deferred publishes whose WAL is now durably flushed:
-        // deliver to subscribers and send the owed PUBACKs. Watermarks are
-        // monotonic, so releasing from the front preserves publish order.
-        // If the flush pointer hasn't caught up, ask the CDC worker to
-        // force it with one small synchronous commit — the fsync happens
-        // in that process, never on this loop.
-        if !deferred_publishes.is_empty() {
-            let mut flush = read_lsn("pg_current_wal_flush_lsn()");
-            // Local fallback: if the oldest batch has outlived the normal
-            // beacon round trip, stop waiting on the off-loop flush path
-            // and pay one synchronous flush here — bounded, rare, and
-            // strictly better than a wal_writer_delay-sized PUBACK tail.
-            if deferred_publishes.front().is_some_and(|d| {
-                flush.map_or(true, |f| d.watermark > f)
-                    && d.queued_at.elapsed() >= deferred_flush_fallback_after()
-            }) {
-                BackgroundWorker::transaction(|| {
-                    let _ = pgrx::spi::Spi::run(
-                        "SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')",
-                    );
-                });
-                flush = read_lsn("pg_current_wal_flush_lsn()");
-            }
-            while deferred_publishes
-                .front()
-                .is_some_and(|d| flush.is_some_and(|f| d.watermark <= f))
-            {
-                let released = deferred_publishes.pop_front().expect("front checked");
-                deliver_messages(
-                    &released.messages,
-                    &mut clients,
-                    &mut publishes,
-                    &mut session_db_actions,
-                );
-                for (client_id, pid) in released.pubacks {
-                    if let Some(client) = clients.get_mut(&client_id) {
-                        let puback = mqtt::build_puback(pid);
-                        let _ = client.transport.write_all(&puback);
-                        crate::metrics::inc(&crate::metrics::get().pubacks_sent);
-                    }
-                }
-            }
-            if !deferred_publishes.is_empty() {
-                crate::shmem_bridge::request_wal_flush();
-            }
-        }
+        deferred_publishes.release_due(&mut clients, &mut publishes, &mut session_db_actions);
 
         // Periodically resend unacked QoS 1 messages (5s timeout; checking every 1s is sufficient)
         if last_redeliver_check.elapsed() >= Duration::from_secs(1) {
@@ -2056,32 +1634,8 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
 
     // Anything still deferred gets flushed and released before teardown:
     // clients are about to be disconnected, so the owed PUBACKs and
-    // deliveries go out now. One synchronous no-op commit guarantees every
-    // earlier async commit is durable (we're exiting — blocking is fine).
-    if !deferred_publishes.is_empty() {
-        BackgroundWorker::transaction(|| {
-            let _ = pgrx::spi::Spi::run("SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')");
-        });
-        let mut shutdown_cascade = Vec::new();
-        for released in deferred_publishes.drain(..) {
-            deliver_messages(
-                &released.messages,
-                &mut clients,
-                &mut shutdown_cascade,
-                &mut shutdown_db_actions,
-            );
-            for (client_id, pid) in released.pubacks {
-                if let Some(client) = clients.get_mut(&client_id) {
-                    let puback = mqtt::build_puback(pid);
-                    let _ = client.transport.write_all(&puback);
-                    crate::metrics::inc(&crate::metrics::get().pubacks_sent);
-                }
-            }
-        }
-        if !shutdown_cascade.is_empty() {
-            publish_messages_batch(shutdown_cascade, &mut clients, &mut shutdown_db_actions);
-        }
-    }
+    // deliveries go out now.
+    deferred_publishes.release_all(&mut clients, &mut shutdown_db_actions);
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
@@ -2724,7 +2278,7 @@ fn finish_connect(
         // caveat, bounded by one tick of that worker.
         crate::shmem_bridge::broadcast_command(
             worker_slot(),
-            ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed),
+            topology::socket_workers(),
             &crate::shmem_bridge::WorkerCommand::DisconnectClient {
                 client_id: client_id.clone(),
                 reason: 0x8E,
@@ -2993,20 +2547,6 @@ fn finish_connect(
             disconnect_client(&client_id, clients, pending_publishes, session_db_actions);
         }
     }
-}
-
-struct PendingPublish {
-    topic: Arc<str>,
-    payload: Arc<[u8]>,
-    qos: u8,
-    retain: bool,
-    log_sender: String,
-    packet_id: Option<u16>,
-    /// Mapping names that matched this publish for inbound table writes.
-    /// Only populated for QoS >= 1; used by publish_messages_batch to insert
-    /// tracking rows into pgmqtt_inbound_pending atomically with message
-    /// persistence.
-    inbound_mappings: Vec<Arc<str>>,
 }
 
 /// Dispatch a single admin command against the live client map.
@@ -3395,490 +2935,6 @@ fn poll_mqtt_clients(
     to_remove.dedup();
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
-    }
-}
-
-/// Split a tick's publishes into DB-persistent (QoS >= 1 or retained) and
-/// transient (QoS 0, non-retained) sets.
-fn split_publishes(pending: Vec<PendingPublish>) -> (Vec<PendingPublish>, Vec<PendingPublish>) {
-    let mut persistent = Vec::new();
-    let mut transient = Vec::new();
-    for p in pending {
-        if p.qos > 0 || p.retain {
-            persistent.push(p);
-        } else {
-            transient.push(p);
-        }
-    }
-    (persistent, transient)
-}
-
-/// Persist a run of plain (non-retain) publishes with one set-based INSERT.
-///
-/// `unnest ... WITH ORDINALITY ... ORDER BY ord` inserts rows in array order,
-/// so the sequence assigns ascending ids in that order and the sorted
-/// RETURNING ids map one-to-one onto the run.
-fn persist_plain_run(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    run: &[PendingPublish],
-    to_publish: &mut Vec<MqttMessage>,
-    inbound_rows: &mut Vec<(i64, Arc<str>)>,
-) -> Result<(), pgrx::spi::Error> {
-    if run.is_empty() {
-        return Ok(());
-    }
-    let topics: Vec<&str> = run.iter().map(|p| &*p.topic).collect();
-    let payloads: Vec<&[u8]> = run.iter().map(|p| &*p.payload).collect();
-    let qos: Vec<i32> = run.iter().map(|p| p.qos as i32).collect();
-    let args: Vec<pgrx::datum::DatumWithOid> =
-        vec![topics.into(), payloads.into(), qos.into()];
-    // NULLIF keeps the empty-payload representation identical to
-    // db_action::persist_message (empty -> NULL).
-    let table = client.update(
-        "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
-         SELECT u.topic, NULLIF(u.payload, ''::bytea), u.qos, false \
-         FROM unnest($1::text[], $2::bytea[], $3::int[]) \
-              WITH ORDINALITY AS u(topic, payload, qos, ord) \
-         ORDER BY u.ord \
-         RETURNING id",
-        None,
-        &args,
-    )?;
-    let mut ids: Vec<i64> = Vec::with_capacity(run.len());
-    for row in table {
-        if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
-            ids.push(id);
-        }
-    }
-    if ids.len() != run.len() {
-        return Err(pgrx::spi::Error::SpiError(
-            pgrx::spi::SpiErrorCodes::NoAttribute,
-        ));
-    }
-    ids.sort_unstable();
-    for (p, &id) in run.iter().zip(&ids) {
-        for mapping_name in &p.inbound_mappings {
-            inbound_rows.push((id, mapping_name.clone()));
-        }
-        if crate::get_debug_log_guc() {
-            log!(
-                "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                p.log_sender,
-                p.topic,
-                p.qos
-            );
-        }
-        to_publish.push(MqttMessage {
-            id: Some(id),
-            topic: p.topic.clone(),
-            payload: p.payload.clone(),
-            qos: p.qos,
-        });
-    }
-    Ok(())
-}
-
-/// Persist one batch of QoS >= 1 / retained publishes in a single
-/// transaction; returns the persisted messages ready for delivery and
-/// whether the transaction committed.
-///
-/// With `synchronous = false` (enterprise multiprocess only), the commit
-/// skips its own WAL flush (`SET LOCAL synchronous_commit = off`): the rows
-/// are immediately visible and correctly ordered, but the caller MUST NOT
-/// emit client-visible effects (PUBACKs, QoS >= 1 delivery) until
-/// `pg_current_wal_flush_lsn()` passes the transaction — see
-/// [`DeferredRelease`].
-fn persist_publish_batch(
-    persistent: &[PendingPublish],
-    synchronous: bool,
-) -> (Vec<MqttMessage>, bool) {
-    let multi = multi_worker();
-    BackgroundWorker::transaction(|| {
-        let mut to_publish = Vec::new();
-        pgrx::spi::Spi::connect_mut(|client| {
-            if !synchronous {
-                let _ = client.select(
-                    "SELECT set_config('synchronous_commit', 'off', true)",
-                    None,
-                    &[],
-                );
-            }
-            let mut inbound_rows: Vec<(i64, Arc<str>)> = Vec::new();
-            let mut i = 0;
-            while i < persistent.len() {
-                if !persistent[i].retain {
-                    // Set-based fast path: a run of consecutive plain
-                    // publishes becomes a single INSERT. Chunking by runs
-                    // (rather than partitioning the whole batch) keeps
-                    // sequence-id order equal to batch order across a
-                    // retain/plain mix — id order is delivery order.
-                    let start = i;
-                    while i < persistent.len() && !persistent[i].retain {
-                        i += 1;
-                    }
-                    persist_plain_run(
-                        client,
-                        &persistent[start..i],
-                        &mut to_publish,
-                        &mut inbound_rows,
-                    )?;
-                    continue;
-                }
-                let p = &persistent[i];
-                i += 1;
-                let mut msg_id_opt: Option<i64> = None;
-
-                // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
-                // non-retained row at QoS 1 so the forwarded clear has DB
-                // backing for reconnect redelivery.
-                if p.retain && p.payload.is_empty() {
-                    let topic_ref: &str = &p.topic;
-                    let args: Vec<pgrx::datum::DatumWithOid> =
-                        vec![topic_ref.into()];
-                    let table = client.update(
-                        "DELETE FROM pgmqtt_retained WHERE topic = $1 RETURNING message_id",
-                        None,
-                        &args,
-                    )?;
-                    for row in table {
-                        if let Ok(Some(old_id)) = row.get_by_name::<i64, _>("message_id") {
-                            db_action::cleanup_orphaned_message(client, old_id)?;
-                        }
-                    }
-                    if p.qos > 0 {
-                        let msg_id = db_action::persist_message(
-                            client,
-                            &p.topic,
-                            &p.payload,
-                            p.qos,
-                            false,
-                        )?;
-                        msg_id_opt = Some(msg_id);
-                    }
-                } else {
-                    // Normal publish: persist the message and update retained index.
-                    let msg_id = db_action::persist_message(
-                        client,
-                        &p.topic,
-                        &p.payload,
-                        p.qos,
-                        p.retain,
-                    )?;
-                    msg_id_opt = Some(msg_id);
-
-                    if p.retain {
-                        let topic_ref: &str = &p.topic;
-                        let args: Vec<pgrx::datum::DatumWithOid> =
-                            vec![topic_ref.into(), msg_id.into()];
-                        let table = client.update(
-                            "WITH old AS ( \
-                                 SELECT message_id AS old_id FROM pgmqtt_retained WHERE topic = $1 \
-                             ), upsert AS ( \
-                                 INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
-                                 ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id \
-                                 RETURNING 1 \
-                             ) \
-                             SELECT old_id FROM old, upsert",
-                            None,
-                            &args,
-                        )?;
-                        let mut old_msg_id: Option<i64> = None;
-                        for row in table {
-                            if let Ok(Some(id)) = row.get_by_name::<i64, _>("old_id") {
-                                old_msg_id = Some(id);
-                            }
-                        }
-                        if let Some(old_id) = old_msg_id {
-                            if old_id != msg_id {
-                                db_action::cleanup_orphaned_message(client, old_id)?;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(msg_id) = msg_id_opt {
-                    for mapping_name in &p.inbound_mappings {
-                        inbound_rows.push((msg_id, mapping_name.clone()));
-                    }
-                }
-
-                if crate::get_debug_log_guc() {
-                    log!(
-                        "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                        p.log_sender,
-                        p.topic,
-                        p.qos
-                    );
-                }
-                to_publish.push(MqttMessage {
-                    id: msg_id_opt,
-                    topic: p.topic.clone(),
-                    payload: p.payload.clone(),
-                    qos: p.qos,
-                });
-            }
-
-            // Inbound-pending tracking rows (virtual subscriber), committed
-            // atomically with the messages so the PUBACK reflects durable
-            // intent to process.
-            if !inbound_rows.is_empty() {
-                let msg_ids: Vec<i64> = inbound_rows.iter().map(|(id, _)| *id).collect();
-                let mappings: Vec<&str> = inbound_rows.iter().map(|(_, m)| &**m).collect();
-                let args: Vec<pgrx::datum::DatumWithOid> =
-                    vec![msg_ids.into(), mappings.into()];
-                client.update(
-                    "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
-                     SELECT u.message_id, u.mapping_name \
-                     FROM unnest($1::bigint[], $2::text[]) AS u(message_id, mapping_name) \
-                     ON CONFLICT DO NOTHING",
-                    None,
-                    &args,
-                )?;
-            }
-
-            // Multi-worker: every persisted publish also goes on the shared
-            // outbox, in this same transaction, so every socket worker's
-            // subscribers see it (this worker included — no direct local
-            // delivery in that topology). Mirrors the CDC worker's enqueue.
-            if multi {
-                let outbox_ids: Vec<i64> =
-                    to_publish.iter().filter_map(|m| m.id).collect();
-                if !outbox_ids.is_empty() {
-                    let args: Vec<pgrx::datum::DatumWithOid> = vec![outbox_ids.into()];
-                    client.update(
-                        "INSERT INTO pgmqtt_cdc_outbox (id) SELECT unnest($1::bigint[]) \
-                         ON CONFLICT DO NOTHING",
-                        None,
-                        &args,
-                    )?;
-                }
-            }
-            Ok::<_, pgrx::spi::Error>(())
-        })?;
-        Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
-    })
-    .unwrap_or((Vec::new(), false))
-}
-
-/// Deliver transient (QoS 0, non-retained) publishes immediately — they
-/// have no durability contract, so nothing gates them on a WAL flush in
-/// either topology. Returns any cascading will-publishes for the caller to
-/// route back through its own (sync or deferred) publish path.
-fn deliver_transient(
-    transient: Vec<PendingPublish>,
-    clients: &mut HashMap<String, MqttClient>,
-    session_db_actions: &mut Vec<SessionDbAction>,
-) -> Vec<PendingPublish> {
-    let transient_msgs: Vec<MqttMessage> = transient
-        .into_iter()
-        .map(|p| {
-            log!(
-                "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
-                p.log_sender,
-                p.topic
-            );
-            MqttMessage {
-                id: None,
-                topic: p.topic,
-                payload: p.payload,
-                qos: 0,
-            }
-        })
-        .collect();
-    let mut cascade = Vec::new();
-    deliver_messages(&transient_msgs, clients, &mut cascade, session_db_actions);
-    cascade
-}
-
-fn publish_messages_batch(
-    pending: Vec<PendingPublish>,
-    clients: &mut HashMap<String, MqttClient>,
-    session_db_actions: &mut Vec<SessionDbAction>,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    // Multi-worker: everything (QoS 0 included) is persisted and routed
-    // through the shared outbox so every worker's subscribers see it; no
-    // direct local delivery (this worker picks it up from the outbox like
-    // the rest). An explicit trade: QoS 0 loses its no-DB fast path when
-    // socket_workers > 1.
-    let multi = multi_worker();
-    let (persistent, transient) = if multi {
-        (pending, Vec::new())
-    } else {
-        split_publishes(pending)
-    };
-
-    if !persistent.is_empty() {
-        let (to_publish, ok) = persist_publish_batch(&persistent, true);
-
-        if ok {
-            let mut cascade = Vec::new();
-            if multi {
-                // Delivery flows through the outbox; wake the fetchers.
-                crate::shmem_bridge::ring_outbox_doorbell();
-            } else {
-                // Deliver directly to subscribers.
-                deliver_messages(&to_publish, clients, &mut cascade, session_db_actions);
-            }
-
-            // Send PUBACKs only after successful commit — MQTT at-least-once semantics.
-            for p in persistent {
-                if p.qos == 1 {
-                    if let Some(pid) = p.packet_id {
-                        if let Some(client) = clients.get_mut(&p.log_sender) {
-                            let puback = mqtt::build_puback(pid);
-                            let _ = client.transport.write_all(&puback);
-                            crate::metrics::inc(&crate::metrics::get().pubacks_sent);
-                        }
-                    }
-                }
-            }
-
-            // Handle will messages from cascading disconnects (rare: socket
-            // write failure during delivery).  Bounded by number of clients.
-            if !cascade.is_empty() {
-                publish_messages_batch(cascade, clients, session_db_actions);
-            }
-        }
-    }
-
-    if !transient.is_empty() {
-        let cascade = deliver_transient(transient, clients, session_db_actions);
-        if !cascade.is_empty() {
-            publish_messages_batch(cascade, clients, session_db_actions);
-        }
-    }
-}
-
-/// One batch of asynchronously-committed publishes whose client-visible
-/// effects (delivery to subscribers, PUBACKs to the publishers) are parked
-/// until `pg_current_wal_flush_lsn()` reaches `watermark` — the point at
-/// which the batch's commit record is durably on disk. Watermarks are
-/// captured in commit order, so FIFO release preserves publish order.
-struct DeferredRelease {
-    watermark: u64,
-    /// When the batch was parked — drives the local flush fallback in
-    /// `run_loop` if the off-loop flush path stalls.
-    queued_at: std::time::Instant,
-    messages: Vec<MqttMessage>,
-    /// `(client_id, packet_id)` PUBACKs owed once durable.
-    pubacks: Vec<(String, u16)>,
-}
-
-/// How long a [`DeferredRelease`] may wait before the socket loop stops
-/// trusting the off-loop flush path (CDC-worker beacon, WAL writer, other
-/// backends' commits) and pays one synchronous flush itself. The beacon
-/// round trip normally completes within ~3 ticks; past this threshold the
-/// CDC worker is stalled or restarting, or the WAL writer is on its default
-/// 200 ms cadence — and one bounded fsync here beats a 200 ms PUBACK tail.
-/// Worst case this degrades to the pre-split behavior (a sync commit on
-/// the loop), never below it.
-fn deferred_flush_fallback_after() -> Duration {
-    std::cmp::max(latch_interval() * 4, Duration::from_millis(20))
-}
-
-/// Enterprise (Bridged) variant of [`publish_messages_batch`]: persists
-/// with an asynchronous commit and parks delivery + PUBACKs as a
-/// [`DeferredRelease`] instead of blocking the socket loop on the WAL
-/// flush. The release check in `run_loop` emits the parked effects once
-/// the flush pointer catches up (typically 1–2 ticks; the CDC worker is
-/// asked to force a flush if it doesn't advance on its own). Only sound
-/// with the process split: in the single-worker topology the CDC tick's
-/// own synchronous commits would force catch-up flushes on this same loop,
-/// paying the fsync anyway.
-///
-/// Transient messages still deliver immediately, so a same-publisher QoS 0
-/// message can overtake an earlier QoS 1 message — MQTT ordering
-/// guarantees are per-QoS-flow, so this is permitted (and already happened
-/// across ticks).
-fn publish_messages_batch_deferred(
-    pending: Vec<PendingPublish>,
-    clients: &mut HashMap<String, MqttClient>,
-    session_db_actions: &mut Vec<SessionDbAction>,
-    deferred: &mut std::collections::VecDeque<DeferredRelease>,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    // See publish_messages_batch: multi-worker routes everything through
-    // the shared outbox instead of delivering locally.
-    let multi = multi_worker();
-    let (persistent, transient) = if multi {
-        (pending, Vec::new())
-    } else {
-        split_publishes(pending)
-    };
-
-    if !persistent.is_empty() {
-        let (messages, ok) = persist_publish_batch(&persistent, false);
-        if ok {
-            if multi {
-                // Rows are visible to all workers' cursor fetches already
-                // (async commit defers only durability, not visibility);
-                // PUBACKs still wait on the flush watermark below.
-                crate::shmem_bridge::ring_outbox_doorbell();
-            }
-            let pubacks = persistent
-                .iter()
-                .filter(|p| p.qos == 1)
-                .filter_map(|p| p.packet_id.map(|pid| (p.log_sender.clone(), pid)))
-                .collect();
-            deferred.push_back(DeferredRelease {
-                watermark: capture_wal_insert_watermark(),
-                queued_at: std::time::Instant::now(),
-                messages: if multi { Vec::new() } else { messages },
-                pubacks,
-            });
-        }
-    }
-
-    if !transient.is_empty() {
-        let cascade = deliver_transient(transient, clients, session_db_actions);
-        if !cascade.is_empty() {
-            publish_messages_batch_deferred(cascade, clients, session_db_actions, deferred);
-        }
-    }
-}
-
-/// Parse PostgreSQL's textual LSN ("16/B374D848") into a comparable u64.
-fn parse_lsn(s: &str) -> Option<u64> {
-    let (hi, lo) = s.split_once('/')?;
-    Some((u64::from_str_radix(hi, 16).ok()? << 32) | u64::from_str_radix(lo, 16).ok()?)
-}
-
-/// Evaluate a WAL LSN expression in a read-only transaction (no WAL write,
-/// no flush wait) and return it as a comparable u64.
-fn read_lsn(expr: &str) -> Option<u64> {
-    let query = format!("SELECT {}::text", expr);
-    BackgroundWorker::transaction(|| {
-        pgrx::spi::Spi::connect(|client| {
-            client.select(&query, None, &[])?.first().get_one::<String>()
-        })
-        .ok()
-        .flatten()
-    })
-    .and_then(|s| parse_lsn(&s))
-}
-
-/// WAL position that covers everything committed so far — read *after* an
-/// asynchronous commit, it bounds that transaction's commit record. If the
-/// read fails (should not happen), force a synchronous flush on the spot
-/// and return 0 so the batch is releasable immediately with durability
-/// already guaranteed.
-fn capture_wal_insert_watermark() -> u64 {
-    match read_lsn("pg_current_wal_insert_lsn()") {
-        Some(lsn) => lsn,
-        None => {
-            log!("pgmqtt: failed to read WAL insert LSN — forcing a synchronous flush instead");
-            BackgroundWorker::transaction(|| {
-                let _ = pgrx::spi::Spi::run(
-                    "SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')",
-                );
-            });
-            0
-        }
     }
 }
 
@@ -4418,214 +3474,6 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
             expired_ids.len() as u64,
         );
     }
-}
-
-/// Fetch the next batch of CDC-persisted messages pending delivery, in id
-/// (= WAL commit) order. The `pgmqtt_cdc` worker queued these ids to
-/// `pgmqtt_cdc_outbox` in the same transaction that persisted the rows and
-/// advanced the slot; this is the one extra SPI round-trip the split costs
-/// on the delivery side, batched into a single query per tick.
-///
-/// Returns `(fetched_outbox_ids, messages)`. The two can differ: a dangling
-/// outbox id whose message row no longer exists (shouldn't happen, but the
-/// tables are deliberately not FK-linked) is still returned in the id list
-/// so the caller's `DrainCdcOutbox` reaps it instead of re-scanning it
-/// forever.
-/// Ensure this worker has a cursor row and return its position. A brand-new
-/// slot starts at the minimum of the existing cursors (never behind the GC
-/// watermark, so it can't be handed already-reclaimed rows); the very first
-/// boot starts everyone at 0. Serialized under the startup advisory lock
-/// like every other worker-startup write.
-fn seed_outbox_cursor(slot: i32) -> i64 {
-    BackgroundWorker::transaction(|| {
-        pgrx::spi::Spi::connect_mut(|client| {
-            let _ = client.select(
-                &format!(
-                    "SELECT pg_advisory_xact_lock({})",
-                    crate::SCHEMA_MIGRATION_LOCK_KEY
-                ),
-                None,
-                &[],
-            );
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![slot.into()];
-            client.update(
-                "INSERT INTO pgmqtt_outbox_cursors (worker_slot, last_id) \
-                 VALUES ($1, COALESCE((SELECT MIN(last_id) FROM pgmqtt_outbox_cursors), 0)) \
-                 ON CONFLICT (worker_slot) DO NOTHING",
-                None,
-                &args,
-            )?;
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![slot.into()];
-            client
-                .select(
-                    "SELECT last_id FROM pgmqtt_outbox_cursors WHERE worker_slot = $1",
-                    None,
-                    &args,
-                )?
-                .first()
-                .get_one::<i64>()
-        })
-    })
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-}
-
-/// Slot-0 GC (multi-worker): delete outbox rows every worker's cursor has
-/// passed, reclaiming orphaned message rows (no session_messages /
-/// retained / inbound references) along the way — this replaces the
-/// per-delivery cleanup that a single worker can do safely but N workers
-/// cannot. Bounded per pass; runs on a ~1s cadence.
-fn gc_outbox_below_min_cursor() {
-    BackgroundWorker::transaction(|| {
-        pgrx::spi::Spi::connect_mut(|client| {
-            let swept = client.update(
-                &format!(
-                    "DELETE FROM pgmqtt_cdc_outbox \
-                     WHERE id IN (\
-                         SELECT id FROM pgmqtt_cdc_outbox \
-                         WHERE id <= (SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors) \
-                         ORDER BY id LIMIT {}) \
-                     RETURNING id",
-                    cdc_worker::CDC_BATCH_SIZE
-                ),
-                None,
-                &[],
-            )?;
-            let ids: Vec<i64> = swept
-                .into_iter()
-                .filter_map(|row| row.get_by_name::<i64, _>("id").ok().flatten())
-                .collect();
-            for id in ids {
-                let _ = db_action::cleanup_orphaned_message(client, id);
-            }
-            Ok::<_, pgrx::spi::Error>(())
-        })
-    })
-    .unwrap_or_else(|e| {
-        log!("pgmqtt: outbox GC failed: {}", e);
-    });
-}
-
-fn fetch_cdc_outbox_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
-    // `after`: multi-worker cursor mode — rows stay for the other workers
-    // and are reclaimed by the slot-0 GC. `None`: single-worker mode — the
-    // caller deletes delivered ids.
-    BackgroundWorker::transaction(|| {
-        pgrx::spi::Spi::connect(|client| {
-            let mut ids = Vec::new();
-            let mut out = Vec::new();
-            if let Some(cursor) = after {
-                // Multi-worker: every worker scans every outbox row, so
-                // payloads are the read amplification. Fetch ids + topics
-                // first and pull full rows only for topics this worker's
-                // own subscription tree matches. Safe where the 9a5783e
-                // fast path was not: the cursor still advances over
-                // non-matching ids, so only *local* delivery is skipped —
-                // other workers judge against their own trees, and
-                // reclamation stays with the slot-0 GC either way.
-                // has_subscribers() is side-effect-free (no $share
-                // round-robin advance), so deliver_messages' later
-                // match_topic is unaffected. False positives only cost a
-                // payload fetch; false negatives can't happen (same trie +
-                // shared-group walk).
-                let query = format!(
-                    "SELECT o.id, m.topic \
-                     FROM pgmqtt_cdc_outbox o \
-                     LEFT JOIN pgmqtt_messages m ON m.id = o.id \
-                     WHERE o.id > {} \
-                     ORDER BY o.id \
-                     LIMIT {}",
-                    cursor,
-                    cdc_worker::CDC_BATCH_SIZE
-                );
-                let mut wanted: Vec<i64> = Vec::new();
-                let table = client.select(&query, None, &[])?;
-                for row in table {
-                    let id: i64 = match row.get_by_name("id")? {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    ids.push(id);
-                    let topic: Option<String> = row.get_by_name("topic")?;
-                    let Some(topic) = topic else {
-                        // Dangling id — message row gone. Cursor moves past.
-                        continue;
-                    };
-                    if subscriptions::has_subscribers(&topic) {
-                        wanted.push(id);
-                    }
-                }
-                if !wanted.is_empty() {
-                    let args: Vec<pgrx::datum::DatumWithOid> = vec![wanted.into()];
-                    let table = client.select(
-                        // ORDER BY id keeps delivery order = outbox order.
-                        "SELECT id, topic, payload, qos FROM pgmqtt_messages \
-                         WHERE id = ANY($1::bigint[]) ORDER BY id",
-                        None,
-                        &args,
-                    )?;
-                    for row in table {
-                        let id: i64 = match row.get_by_name("id")? {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let topic: Option<String> = row.get_by_name("topic")?;
-                        let Some(topic) = topic else {
-                            continue;
-                        };
-                        let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
-                        let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
-                        out.push(MqttMessage {
-                            id: Some(id),
-                            topic: Arc::from(topic.as_str()),
-                            payload: Arc::from(payload),
-                            qos: qos as u8,
-                        });
-                    }
-                }
-            } else {
-                // Single worker deletes on delivery, so each row is fetched
-                // exactly once — and it needs every message regardless of
-                // local matches: the no-subscriber orphan reclaim and the
-                // oversize-QoS-0 spill cleanup both key off this batch.
-                let query = format!(
-                    "SELECT o.id, m.topic, m.payload, m.qos \
-                     FROM pgmqtt_cdc_outbox o \
-                     LEFT JOIN pgmqtt_messages m ON m.id = o.id \
-                     ORDER BY o.id \
-                     LIMIT {}",
-                    cdc_worker::CDC_BATCH_SIZE
-                );
-                let table = client.select(&query, None, &[])?;
-                for row in table {
-                    let id: i64 = match row.get_by_name("id")? {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    ids.push(id);
-                    let topic: Option<String> = row.get_by_name("topic")?;
-                    let Some(topic) = topic else {
-                        // Dangling id — message row gone. Reap via the id list.
-                        continue;
-                    };
-                    let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
-                    let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
-                    out.push(MqttMessage {
-                        id: Some(id),
-                        topic: Arc::from(topic.as_str()),
-                        payload: Arc::from(payload),
-                        qos: qos as u8,
-                    });
-                }
-            }
-            Ok::<_, pgrx::spi::Error>((ids, out))
-        })
-    })
-    .unwrap_or_else(|e| {
-        log!("pgmqtt: failed to fetch pending CDC outbox batch: {}", e);
-        (Vec::new(), Vec::new())
-    })
 }
 
 /// Deliver a batch of messages to matching subscribers.
