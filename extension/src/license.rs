@@ -26,6 +26,13 @@ pub enum Feature {
     Jwt,
     Metrics,
     Acl,
+    /// Split CDC slot consumption into a separate `pgmqtt_cdc` background
+    /// worker process, bridged to `pgmqtt_mqtt` via shared memory
+    /// (`crate::shmem_bridge`), instead of one combined process. Checked
+    /// once at `_PG_init` (decides which BGWs get registered) and again by
+    /// `pgmqtt_mqtt_worker_main` at its own startup — both reads see the
+    /// same GUC snapshot from the same postmaster boot, see lib.rs.
+    MultiProcess,
 }
 
 impl Feature {
@@ -35,6 +42,7 @@ impl Feature {
             Feature::Jwt => "jwt",
             Feature::Metrics => "metrics",
             Feature::Acl => "acl",
+            Feature::MultiProcess => "multiprocess",
         }
     }
 }
@@ -82,7 +90,7 @@ fn active_public_key() -> &'static [u8; 32] {
 }
 
 /// Known feature names for validation.
-const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "acl"];
+const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "acl", "multiprocess"];
 
 fn validate_license_with_key(token: &str, pubkey_bytes: &[u8; 32]) -> LicenseStatus {
     let token = token.trim();

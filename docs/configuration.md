@@ -80,6 +80,8 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 
 Hot-reloadable — updated token takes effect after `pg_reload_conf()` without restarting.
 
+> **Exception: the `multiprocess` feature.** Process topology (whether the dedicated `pgmqtt_cdc` worker exists) is decided once at PostgreSQL startup, because background workers can only be registered while the server is starting. Adding or removing `multiprocess` from the license therefore requires a **full PostgreSQL restart** — `pg_reload_conf()` updates the license for every other feature check but cannot start or stop the second worker. See [enterprise.md → Multi-Process CDC](enterprise.md#multi-process-cdc).
+
 ---
 
 ## JWT Authentication
@@ -180,7 +182,7 @@ Controls the BGW event loop cadence and CDC read frequency. These are the primar
 |-----|------|---------|-------|-------------|
 | `pgmqtt.tick_interval_ms` | int | `5` | 1 – 1000 | BGW poll interval in milliseconds. Lower values reduce publish/subscribe latency at the cost of more frequent wakeups. The original default was 80 ms; 5 ms is recommended for most workloads. |
 | `pgmqtt.max_client_buffer_bytes` | int | `1048576` | 65536 – 16777216 | Per-client socket buffer cap applied in both directions. **Inbound:** the broker stops reading from a publisher once this many bytes are buffered between ticks — excess stays in the kernel TCP buffer and is consumed on the next tick; a publisher that sustains this rate across ticks is disconnected. **Outbound:** when a slow subscriber's unsent write buffer reaches this size, QoS 1 delivery disconnects the subscriber and QoS 0 delivery drops the message. |
-| `pgmqtt.cdc_every_n_ticks` | int | `1` | 1 – 1000 | Run the CDC slot read every N ticks. At the 5 ms default tick, `n=16` means CDC runs every ~80 ms. Raising this value reduces WAL decode CPU and `execute_session_db_actions` fsync overhead at the cost of increased CDC delivery latency (up to `n × tick_interval_ms`). Profiling shows `n=16` delivers **+67 % subscriber throughput** on write-heavy QoS 1 workloads. |
+| `pgmqtt.cdc_every_n_ticks` | int | `1` | 1 – 1000 | Run the CDC slot read every N ticks. At the 5 ms default tick, `n=16` means CDC runs every ~80 ms. Raising this value reduces WAL decode CPU and `execute_session_db_actions` fsync overhead at the cost of increased CDC delivery latency (up to `n × tick_interval_ms`). Profiling shows `n=16` delivers **+67 % subscriber throughput** on write-heavy QoS 1 workloads. With the enterprise `multiprocess` feature this paces the `pgmqtt_cdc` worker's slot polling only; the `pgmqtt_mqtt` worker drains the shared-memory bridge on every tick regardless, so raising it no longer delays socket work — see [enterprise.md → Multi-Process CDC](enterprise.md#multi-process-cdc). |
 | `pgmqtt.debug_log` | bool | `off` | — | Emit verbose per-message and per-CDC-event log lines. Off by default; enabling at high message rates adds `elog(LOG)` overhead on every PUBLISH/PUBACK/CDC event. |
 
 ### Recommended settings for throughput-sensitive workloads

@@ -221,13 +221,15 @@ The following limits are compiled into the extension binary and cannot be change
 | Per-topic QoS 0 buffer capacity | **4,096** messages | Bounded ring buffer per topic for QoS 0 CDC messages. Oldest messages are dropped on overflow. |
 | Per-topic QoS 1+ buffer | **unbounded** | QoS 1+ messages are queued without a hard cap (a warning is logged every 1,000 messages). |
 | CDC batch size | **4096** rows | Maximum number of WAL changes consumed per poll cycle via `pg_logical_slot_get_changes`. |
+| CDC outbox fetch (multiprocess) | **4096** rows/tick | With the enterprise `multiprocess` feature, `pgmqtt_mqtt` fetches at most this many pending `pgmqtt_cdc_outbox` messages per tick — the queue itself is unbounded (table-backed, lossless). |
+| Inline QoS 0 bridge ring (multiprocess) | **8,192** messages, topic ≤ 256 B / payload ≤ 1 KB | Shared-memory ring for small QoS 0 CDC messages between `pgmqtt_cdc` and `pgmqtt_mqtt`. Oldest dropped on overflow (counted in `cdc_bridge_dropped`); oversize QoS 0 messages take the lossless outbox path instead. |
 | Inbound pending batch size | **50** rows | Maximum number of pending inbound writes processed per cycle. |
 
 ## Timing
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| Poll interval (latch) | **5 ms** (default) | How often the background worker wakes to accept connections, poll clients, and drain CDC. Configurable via `pgmqtt.tick_interval_ms` (1–1000 ms) — see [configuration.md → Performance Tuning](configuration.md#performance-tuning). |
+| Poll interval (latch) | **5 ms** (default) | How often the background worker wakes to accept connections, poll clients, and drain CDC. Configurable via `pgmqtt.tick_interval_ms` (1–1000 ms) — see [configuration.md → Performance Tuning](configuration.md#performance-tuning). With the enterprise `multiprocess` feature, both workers (`pgmqtt_mqtt` and `pgmqtt_cdc`) tick at this interval independently. |
 | Client read/write timeout | **2 seconds** | Timeout for individual client I/O operations. |
 | CONNECT handshake timeout | **5 seconds** | Maximum time to wait for the initial MQTT CONNECT packet from a new connection. |
 | Keep-alive enforcement | **1.5 &times; keep_alive** | Clients are disconnected if no packet is received within 1.5&times; their negotiated keep-alive interval (per MQTT 5.0 §3.1.2.10). A keep-alive of 0 disables the timeout. |

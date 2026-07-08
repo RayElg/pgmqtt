@@ -113,6 +113,19 @@ pub enum SessionDbAction {
         client_id: String,
         topic_filter: String,
     },
+    /// Reclaim a persisted message that turned out to have no subscribers at
+    /// delivery time (no-op if it's still retained or otherwise referenced).
+    CleanupOrphanedMessage {
+        message_id: i64,
+    },
+    /// Remove delivered ids from `pgmqtt_cdc_outbox` (enterprise
+    /// multiprocess). Queued in the same tick that delivered the messages,
+    /// so the dequeue commits atomically with the delivery state — if this
+    /// transaction never commits, the ids stay queued and the messages are
+    /// re-fetched and re-delivered (at-least-once).
+    DrainCdcOutbox {
+        ids: Vec<i64>,
+    },
 }
 
 /// Execute all queued DB actions in a single atomic transaction.
@@ -303,6 +316,30 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
                         ) {
                             crate::metrics::inc(&m.db_subscription_errors);
                             pgrx::log!("pgmqtt: failed to delete subscription for '{}' from '{}': {}", client_id, topic_filter, e);
+                        }
+                    }
+                    SessionDbAction::CleanupOrphanedMessage { message_id } => {
+                        if let Err(e) = cleanup_orphaned_message(client, message_id) {
+                            crate::metrics::inc(&m.db_message_errors);
+                            pgrx::log!(
+                                "pgmqtt: failed to clean up orphaned message {} (no subscribers at delivery time): {}",
+                                message_id, e
+                            );
+                        }
+                    }
+                    SessionDbAction::DrainCdcOutbox { ids } => {
+                        let count = ids.len();
+                        let args: Vec<DatumWithOid> = vec![ids.into()];
+                        if let Err(e) = client.update(
+                            "DELETE FROM pgmqtt_cdc_outbox WHERE id = ANY($1::bigint[])",
+                            None,
+                            &args,
+                        ) {
+                            crate::metrics::inc(&m.db_message_errors);
+                            pgrx::log!(
+                                "pgmqtt: failed to dequeue {} delivered CDC outbox ids: {}",
+                                count, e
+                            );
                         }
                     }
                 }

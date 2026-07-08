@@ -11,6 +11,7 @@ This document covers the enterprise-only features of pgmqtt: **license managemen
 - [JWT Authentication](#jwt-authentication)
 - [Topic-Level Access Control](#topic-level-access-control)
 - [TLS (MQTTS / WSS)](#tls-mqtts--wss)
+- [Multi-Process CDC](#multi-process-cdc)
 - [Port Management](#port-management)
 - [Observability & Metrics](#observability--metrics)
 - [SQL Functions](#sql-functions)
@@ -43,6 +44,7 @@ This document covers the enterprise-only features of pgmqtt: **license managemen
 | Prometheus exposition | No | Yes (`metrics` feature) |
 | Metrics hook functions | No | Yes (`metrics` feature) |
 | NOTIFY streaming | No | Yes (`metrics` feature) |
+| Dedicated CDC worker process | No | Yes (`multiprocess` feature) |
 | License grace period | N/A | Yes |
 | `pgmqtt_license_status()` | Returns `community` | Returns `active`/`grace`/`expired` |
 
@@ -83,7 +85,7 @@ The signature is computed over the raw JSON payload bytes using Ed25519. Tokens 
 | `customer` | string | Customer identifier |
 | `expires_at` | i64 | Unix timestamp — license expiration |
 | `grace_expires_at` | i64 | Unix timestamp — hard cutoff after grace period |
-| `features` | string[] | Enabled features: `"tls"`, `"jwt"`, `"acl"`, `"metrics"` |
+| `features` | string[] | Enabled features: `"tls"`, `"jwt"`, `"acl"`, `"metrics"`, `"multiprocess"` |
 | `max_connections` | usize | Maximum concurrent MQTT connections |
 
 Unrecognized feature names in the `features` array will produce a warning log.
@@ -332,6 +334,44 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 
 ---
 
+## Multi-Process CDC
+
+Requires an enterprise license with the `multiprocess` feature, present **at PostgreSQL startup**.
+
+### Overview
+
+Without this feature, a single `pgmqtt_mqtt` background worker does everything: socket I/O, message delivery, and CDC replication-slot consumption, all interleaved in one tick loop. Under sustained heavy write load on CDC-mapped tables, draining the WAL backlog competes with servicing connected clients — a long drain delays accepting connections and delivering messages.
+
+With `multiprocess`, CDC moves into its own `pgmqtt_cdc` background worker:
+
+- **`pgmqtt_cdc`** owns the logical replication slot. It decodes WAL, renders topic mappings, and persists QoS ≥ 1 messages — exactly the same atomic batch pipeline as before, just in its own process. A slow or backlogged WAL drain can no longer stall socket I/O.
+- **`pgmqtt_mqtt`** keeps the sockets and becomes delivery-only for CDC traffic. It drains the handoff on every tick, regardless of `pgmqtt.cdc_every_n_ticks` (that GUC paces the CDC worker's slot polling instead).
+
+Both workers appear in `pg_stat_activity` with `backend_type` values `pgmqtt_mqtt` and `pgmqtt_cdc`.
+
+### The cross-process handoff
+
+How a message crosses the process boundary depends on its durability class:
+
+| Path | Carries | Mechanism | Loss behavior |
+|------|---------|-----------|---------------|
+| Outbox (`pgmqtt_cdc_outbox`) | QoS ≥ 1 messages, plus any QoS 0 message too large for the inline ring | Message ids are queued **in the same transaction that persists the rows and advances the replication slot**; `pgmqtt_mqtt` fetches them in id (= WAL) order and dequeues in the same transaction that records delivery state | **Lossless.** There is no fixed capacity to overflow and the queue survives crashes of either worker or the whole server; a crash mid-delivery re-delivers (at-least-once, per MQTT QoS 1 semantics) |
+| Inline ring (shared memory) | QoS 0 messages with topic ≤ 256 bytes and payload ≤ 1,024 bytes | Fixed-capacity ring (8,192 messages); a shared-memory doorbell also wakes the delivery worker for outbox work without idle polling | Drops the oldest message on sustained overflow — QoS 0 is fire-and-forget, and this keeps never-persisted messages off the WAL entirely |
+
+Inline-ring drops increment the `cdc_bridge_dropped` counter (see [Observability & Metrics](#observability--metrics)). A nonzero value means the QoS 0 write rate exceeded what the ring absorbs while `pgmqtt_mqtt` was busy or stuck; QoS ≥ 1 traffic is never affected.
+
+### Restart required
+
+Process topology is decided **once, at PostgreSQL startup**: background workers can only be registered while the server is starting, so `_PG_init` reads `pgmqtt.license_key` at that moment to decide whether to register the second worker. `ALTER SYSTEM SET pgmqtt.license_key` + `pg_reload_conf()` updates the license for every runtime feature check, but adding or removing `multiprocess` only takes effect after a **full PostgreSQL restart**. Until then the broker keeps its current topology.
+
+### Behavioral notes
+
+- **Delivery guarantees are unchanged.** QoS ≥ 1 CDC messages are persisted *and queued for delivery* atomically with the slot advance (at-least-once, end to end); QoS 0 remains fire-and-forget.
+- **No-subscriber cleanup moved.** The CDC worker cannot see subscriptions (that state lives in the `pgmqtt_mqtt` process), so it persists every rendered QoS ≥ 1 message; `pgmqtt_mqtt` reclaims any row that turns out to have zero subscribers at delivery time. No orphaned rows either way.
+- **`pgmqtt.cdc_every_n_ticks` changes meaning.** It paces only the CDC worker's slot polling; bridge draining and delivery in `pgmqtt_mqtt` run every tick. Raising it still reduces WAL-decode overhead but no longer trades away socket responsiveness.
+
+---
+
 ## Port Management
 
 Each listener can be independently enabled or disabled.
@@ -395,6 +435,8 @@ The flush interval, retention, and all other behavior are controlled via GUCs (s
 | | `cdc_render_errors` | counter | Template rendering failures (bad mapping config) |
 | | `cdc_slot_errors` | counter | Replication slot I/O errors |
 | | `cdc_persist_errors` | counter | Message persist failures (DB write in CDC path) |
+| | `cdc_ring_buffer_dropped` | counter | CDC events dropped by the decode ring buffer on overflow (data loss signal) |
+| | `cdc_bridge_dropped` | counter | QoS 0 messages dropped by the `pgmqtt_cdc` → `pgmqtt_mqtt` shared-memory inline ring on overflow (`multiprocess` feature) |
 | Inbound | `inbound_writes_ok` | counter | Successful MQTT-to-DB writes |
 | | `inbound_writes_failed` | counter | Failed MQTT-to-DB writes |
 | | `inbound_retries` | counter | Write retries |
