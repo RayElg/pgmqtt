@@ -26,12 +26,15 @@ import time
 from proto_utils import (
     MQTT_HOST,
     MQTT_PORT,
+    MQTTControlPacket,
     ReasonCode,
     create_connect_packet,
+    create_disconnect_packet,
     create_subscribe_packet,
     recv_packet,
     validate_connack,
     validate_disconnect,
+    validate_publish,
     validate_suback,
 )
 from test_utils import compose_kill, compose_start, compose_stop, run_sql
@@ -174,40 +177,52 @@ def test_sigterm_marks_sessions_disconnected_in_db():
 
 
 def test_sigterm_fires_will_messages():
-    """Graceful shutdown triggers will messages for clients that did not send DISCONNECT."""
+    """Graceful shutdown fires wills for clients that did not send DISCONNECT;
+    a persistent subscriber receives the will after reconnecting."""
     will_topic = "will/shutdown/sigterm"
     will_payload = b"broker_shutting_down"
 
     run_sql("DELETE FROM pgmqtt_sessions WHERE client_id LIKE 'sigterm_will%';")
     run_sql(f"DELETE FROM pgmqtt_messages WHERE topic = '{will_topic}';")
 
-    # Subscriber
-    sub = mqtt_connect("sigterm_will_sub")
+    sub = mqtt_connect("sigterm_will_sub", properties={0x11: 3600})
     sub.sendall(create_subscribe_packet(1, will_topic, qos=1))
     validate_suback(recv_packet(sub, timeout=5.0), 1)
+    sub.sendall(create_disconnect_packet())
+    sub.close()
+    time.sleep(0.3)
 
-    # Client with a QoS 1 will so it is persisted to pgmqtt_messages
     will_client = mqtt_connect(
         "sigterm_will_sender",
         will_topic=will_topic,
         will_payload=will_payload,
         will_qos=1,
     )
+    assert wait_for_session("sigterm_will_sender")
 
-    sub.close()
-    will_client.close()
     compose_stop()
     compose_start()
     assert wait_for_broker(45), "Broker did not restart"
+    will_client.close()
 
-    result = run_sql(
-        f"SELECT payload FROM pgmqtt_messages WHERE topic = '{will_topic}' LIMIT 1"
+    sub2 = mqtt_connect(
+        "sigterm_will_sub", clean_start=False, properties={0x11: 3600}
     )
-    assert result, (
-        "Will message not found in pgmqtt_messages after graceful shutdown. "
-        "Broker must publish will messages for clients that did not disconnect cleanly."
+    got = None
+    deadline = time.time() + 10
+    while got is None and time.time() < deadline:
+        pkt = recv_packet(sub2, timeout=2.0)
+        if pkt is None:
+            continue
+        if (pkt[0] & 0xF0) >> 4 == MQTTControlPacket.PUBLISH:
+            topic, payload, _q, _d, _r, _pid, _props = validate_publish(pkt)
+            got = (topic, payload)
+    sub2.close()
+
+    assert got == (will_topic, will_payload), (
+        f"Persistent subscriber did not receive the will after restart: {got!r}. "
+        "Broker must fire wills for clients that did not disconnect cleanly."
     )
-    assert bytes(result[0][0]) == will_payload
 
 
 def test_sigterm_status_shows_zero_after_restart():
