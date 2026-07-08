@@ -8,7 +8,7 @@ pub mod inbound_map;
 mod init010;
 mod init020;
 mod init030;
-mod init040;
+mod init050;
 pub mod license;
 pub mod metrics;
 mod mqtt;
@@ -314,7 +314,7 @@ fn ensure_tables_exist() {
     init010::init_010();
     init020::init_020();
     init030::init_030();
-    init040::init_040();
+    init050::init_050();
 }
 
 /// Register a CDC → MQTT outbound topic mapping (persisted to DB table).

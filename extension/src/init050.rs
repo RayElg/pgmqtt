@@ -22,7 +22,7 @@ fn run_ddl(sql: &str, operation: &str) {
     Spi::run(sql).unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to {}: {}", operation, e));
 }
 
-pub fn init_040() {
+pub fn init_050() {
     // Pending-delivery queue for CDC-persisted messages (enterprise
     // multiprocess topology). Rows reference pgmqtt_messages ids, but with no
     // FK on purpose: the two tables are written by different workers and the
