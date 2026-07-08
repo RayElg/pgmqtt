@@ -232,6 +232,11 @@ def test_multiprocess_registers_two_workers(enterprise_broker):
     assert "pgmqtt_mqtt" in workers, f"pgmqtt_mqtt worker missing: {workers}"
     assert "pgmqtt_cdc" in workers, f"pgmqtt_cdc worker missing: {workers}"
 
+    # Each worker session tags its WAL with a replication origin so the
+    # decoder can skip it (filter_by_origin_cb).
+    origins = {r[0] for r in enterprise_broker.sql("SELECT roname FROM pg_replication_origin")}
+    assert {"pgmqtt_mqtt", "pgmqtt_cdc"} <= origins, origins
+
 
 def test_multiprocess_license_active(enterprise_broker):
     rows = enterprise_broker.sql("SELECT status, features FROM pgmqtt_license_status()")

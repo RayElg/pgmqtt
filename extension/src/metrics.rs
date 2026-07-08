@@ -128,6 +128,52 @@ pub struct SharedCdcCounters {
     pub inbound_writes_failed: AtomicU64,
     pub inbound_retries: AtomicU64,
     pub inbound_dead_letters: AtomicU64,
+
+    /// Replication-origin ids of pgmqtt's own worker sessions (0 = empty
+    /// slot). Registered by `server::setup_replication_origin` at worker
+    /// startup; read by the output plugin's `filter_by_origin_cb` (which
+    /// may run in any backend that reads the slot) to skip decoding WAL
+    /// the workers generated themselves. Ids are never unregistered: a
+    /// worker restart re-attaches the same named origin and therefore the
+    /// same id, and origins are never dropped while the cluster runs.
+    pub worker_origins: [AtomicU64; MAX_WORKER_ORIGINS],
+}
+
+pub const MAX_WORKER_ORIGINS: usize = 16;
+
+/// Record a worker session's replication-origin id (idempotent).
+pub fn register_worker_origin(id: u16) {
+    let id = id as u64;
+    for slot in &shared_cdc().worker_origins {
+        if slot.load(Ordering::Relaxed) == id {
+            return;
+        }
+        if slot
+            .compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        // Lost the CAS to a concurrent registration — if it stored this
+        // same id, we're done; otherwise keep scanning.
+        if slot.load(Ordering::Relaxed) == id {
+            return;
+        }
+    }
+    pgrx::log!(
+        "pgmqtt: worker origin registry full — origin {} not registered; \
+         its WAL will be decoded and discarded by name instead of filtered",
+        id
+    );
+}
+
+/// Whether `id` is one of pgmqtt's own worker-session origins.
+pub fn is_worker_origin(id: u16) -> bool {
+    let id = id as u64;
+    shared_cdc()
+        .worker_origins
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == id)
 }
 
 impl Default for SharedCdcCounters {
@@ -144,6 +190,7 @@ impl Default for SharedCdcCounters {
             inbound_writes_failed: AtomicU64::new(0),
             inbound_retries: AtomicU64::new(0),
             inbound_dead_letters: AtomicU64::new(0),
+            worker_origins: [(); MAX_WORKER_ORIGINS].map(|_| AtomicU64::new(0)),
         }
     }
 }

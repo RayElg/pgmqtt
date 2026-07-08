@@ -18,6 +18,19 @@ pub enum Transport {
 }
 
 impl Transport {
+    /// Underlying socket fd, for readiness polling (`server::readiness`).
+    /// Stable for the connection's lifetime: every variant wraps the same
+    /// accepted `TcpStream` until the transport is dropped.
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            Transport::Raw(s) => s.as_raw_fd(),
+            Transport::Ws(ws) => ws.get_ref().as_raw_fd(),
+            Transport::Tls(t) => t.sock.as_raw_fd(),
+            Transport::Wss(ws) => ws.get_ref().sock.as_raw_fd(),
+        }
+    }
+
     pub fn new_tls(
         stream: TcpStream,
         config: Arc<rustls::ServerConfig>,

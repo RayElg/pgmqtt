@@ -289,7 +289,7 @@ pub fn get_tls_key_file_guc() -> String {
 /// duplicate-key errors or deadlock (the .set_restart_time(5s) BGW retry
 /// self-heals either way, but this avoids the noise and the extra ~5s to
 /// converge on first boot).
-const SCHEMA_MIGRATION_LOCK_KEY: i64 = 0x706D71_7400_0001; // arbitrary, "pmqt" + version
+pub(crate) const SCHEMA_MIGRATION_LOCK_KEY: i64 = 0x706D71_7400_0001; // arbitrary, "pmqt" + version
 fn ensure_tables_exist() {
     let _ = pgrx::spi::Spi::run(&format!(
         "SELECT pg_advisory_xact_lock({SCHEMA_MIGRATION_LOCK_KEY})"
@@ -1578,6 +1578,22 @@ fn ensure_replication_slot(slot_name: &str) {
     );
 
     match Spi::connect(|client| {
+        // Serialize against the other worker's startup write transactions
+        // (schema migrations, replication-origin creation — all taken under
+        // this same advisory lock). Slot creation waits for every
+        // in-progress write transaction to finish before it can find a
+        // decoding start point, and that wait does not observe the BGW's
+        // SIGTERM flag — so racing a concurrent startup write can wedge
+        // this worker long enough to fail a fast shutdown (observed as
+        // one-in-a-few container boot failures: the initdb temp server's
+        // immediate shutdown hits exactly this window). Taking the lock
+        // first means no partner write transaction is in flight while the
+        // slot searches for its start point.
+        let _ = client.select(
+            &format!("SELECT pg_advisory_xact_lock({SCHEMA_MIGRATION_LOCK_KEY})"),
+            None,
+            &[],
+        );
         client.select(&create_slot_query, None, &[])?;
         Ok::<_, spi::Error>(())
     }) {
@@ -1681,6 +1697,28 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
     cb.begin_cb = Some(pg_decode_begin_txn);
     cb.commit_cb = Some(pg_decode_commit_txn);
     cb.change_cb = Some(pg_decode_change);
+    cb.filter_by_origin_cb = Some(pg_decode_filter_by_origin);
+}
+
+/// Skip decoding WAL that pgmqtt's own workers committed (message
+/// persistence, outbox bookkeeping, session state, ...). That WAL can
+/// never yield an outbound event — `pg_decode_change` already drops every
+/// `pgmqtt_*` table by name — but without this callback each such record
+/// still pays full reorder-buffer processing on every slot read. Filtering
+/// by origin rejects them before they are queued at all.
+///
+/// Origin ids are registered in shared memory by each worker session at
+/// startup (`server::setup_replication_origin`). Records with no origin
+/// (ordinary user writes) or a foreign origin (e.g. incoming logical
+/// replication) are decoded exactly as before.
+#[pg_guard]
+unsafe extern "C-unwind" fn pg_decode_filter_by_origin(
+    _ctx: *mut pg_sys::LogicalDecodingContext,
+    origin_id: pg_sys::RepOriginId,
+) -> bool {
+    // 0 == InvalidRepOriginId (a #define, not in the generated bindings):
+    // a record with no origin is an ordinary local write.
+    origin_id != 0 && crate::metrics::is_worker_origin(origin_id)
 }
 
 #[pg_guard]

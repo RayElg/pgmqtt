@@ -76,6 +76,8 @@ pub(crate) enum CdcQueueMode {
 ///   synchronous commit that group-flushes everything (see
 ///   `crate::shmem_bridge::request_wal_flush`).
 pub fn run_cdc(slot_name: &str) {
+    super::setup_replication_origin("pgmqtt_cdc");
+
     let mut tick: u64 = 0;
     let mut last_inbound_reload = std::time::Instant::now();
 

@@ -2,6 +2,7 @@
 
 mod cdc_worker;
 pub mod db_action;
+mod readiness;
 pub mod session;
 pub mod transport;
 
@@ -98,6 +99,79 @@ fn with_subtransaction<T>(
     result
 }
 
+/// Tag every transaction this worker session commits with a named
+/// replication origin, and register the origin's id in shared memory so
+/// the logical decoding plugin can skip the worker's own WAL *before* it
+/// enters the reorder buffer (`pg_decode_filter_by_origin` in lib.rs).
+///
+/// Without this, every message row, outbox row, and piece of session
+/// bookkeeping the workers write is decoded on the next slot read and
+/// then discarded by table-name — several reorder-buffer records of pure
+/// overhead per delivered message. User writes (no origin) and foreign
+/// logical-replication origins are unaffected: only ids registered here
+/// are filtered.
+///
+/// Failure is logged and tolerated — the broker is fully correct without
+/// origin tagging, just slower to decode under write load.
+pub(crate) fn setup_replication_origin(name: &str) {
+    let ident = BackgroundWorker::transaction(|| {
+        with_subtransaction(|| {
+            pgrx::spi::Spi::connect_mut(|client| {
+                // Startup writes are serialized with the partner worker's
+                // slot creation under the migration advisory lock — a write
+                // transaction in flight while the slot searches for its
+                // decoding start point can wedge that worker through a fast
+                // shutdown (see ensure_replication_slot in lib.rs).
+                let _ = client.select(
+                    &format!(
+                        "SELECT pg_advisory_xact_lock({})",
+                        crate::SCHEMA_MIGRATION_LOCK_KEY
+                    ),
+                    None,
+                    &[],
+                );
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![name.into()];
+                client.update(
+                    "SELECT pg_replication_origin_create($1) \
+                     WHERE NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = $1)",
+                    None,
+                    &args,
+                )?;
+                // Attaches the origin to this session exclusively; every
+                // commit from here on carries its id in WAL.
+                client.update(
+                    "SELECT pg_replication_origin_session_setup($1)",
+                    None,
+                    &args,
+                )?;
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![name.into()];
+                client
+                    .select(
+                        "SELECT roident::int FROM pg_replication_origin WHERE roname = $1",
+                        None,
+                        &args,
+                    )?
+                    .first()
+                    .get_one::<i32>()
+            })
+        })
+    });
+    match ident {
+        Ok(Some(id)) if id > 0 => {
+            crate::metrics::register_worker_origin(id as u16);
+            log!("pgmqtt: replication origin '{}' attached (id {})", name, id);
+        }
+        other => {
+            log!(
+                "pgmqtt: could not set up replication origin '{}' ({:?}) — \
+                 own WAL will be decoded and discarded by name instead of filtered",
+                name,
+                other
+            );
+        }
+    }
+}
+
 /// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
 ///
 /// After a crash, sessions keep `disconnected_at = NULL` because the broker never
@@ -112,6 +186,17 @@ fn with_subtransaction<T>(
 fn db_mark_sessions_disconnected_on_startup() {
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
+            // Startup write — serialized with the partner worker's slot
+            // creation, same as setup_replication_origin (see
+            // ensure_replication_slot in lib.rs for the wedge this avoids).
+            let _ = client.select(
+                &format!(
+                    "SELECT pg_advisory_xact_lock({})",
+                    crate::SCHEMA_MIGRATION_LOCK_KEY
+                ),
+                None,
+                &[],
+            );
             let _ = client.update(
                 "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE disconnected_at IS NULL",
                 None,
@@ -1230,6 +1315,7 @@ enum CdcMode<'a> {
 }
 
 fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
+    setup_replication_origin("pgmqtt_mqtt");
     db_mark_sessions_disconnected_on_startup();
     db_load_sessions_on_startup();
     load_inbound_mappings();
@@ -1376,6 +1462,10 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
 
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
+    // Readiness poller: which clients have socket data this tick, so the
+    // read pass is O(active) instead of O(connections). Falls back to
+    // polling everyone if epoll is unavailable (see server::readiness).
+    let mut poller = readiness::ReadinessPoller::new();
     // Tick counter for throttling low-priority periodic work.
     let mut tick: u64 = 0;
     // Wall-clock timers for periodic tasks — their frequency must stay stable
@@ -1495,11 +1585,15 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                 );
             }
         }
+        poller.sync(&clients);
+        let ready = poller.ready_set();
         poll_mqtt_clients(
             &mut clients,
             &mut publishes,
             &mut session_db_actions,
             &mut pending_inbound_writes,
+            ready.as_ref(),
+            &mut poller.carry,
         );
 
         // Execute inbound writes (MQTT → PostgreSQL) before CDC and message
@@ -2912,25 +3006,40 @@ fn poll_mqtt_clients(
     pending_publishes: &mut Vec<PendingPublish>,
     session_db_actions: &mut Vec<SessionDbAction>,
     pending_inbound_writes: &mut Vec<inbound_map::PendingInboundWrite>,
+    ready: Option<&std::collections::HashSet<String>>,
+    carry: &mut std::collections::HashSet<String>,
 ) {
     let mut to_remove = Vec::new();
     let max_inbound_buf = crate::get_max_client_buffer_bytes_guc();
 
     for (client_id, client) in clients.iter_mut() {
         // Flush any bytes buffered from the previous tick before reading.
+        // (In-memory no-op when nothing is buffered, so this stays a
+        // per-client pass regardless of readiness.)
         if !client.flush_write_buf() {
             to_remove.push(client_id.clone());
             continue;
         }
+
+        // Only attempt reads on clients the readiness poller flagged
+        // (`None` = fallback: poll everyone, the pre-epoll behavior).
+        // Keepalive checks and packet processing below still run for every
+        // client — they are in-memory only.
+        let may_read = ready.map_or(true, |r| r.contains(client_id));
 
         // Drain-loop read: pull all available bytes from the socket in 64 KiB
         // chunks until WouldBlock, bounded by max_client_buffer_bytes.
         // When the cap is reached we stop reading; excess data stays in the
         // kernel TCP buffer and is consumed on the next tick.
         let mut skip_processing = false;
-        loop {
-            // Stop reading if we've accumulated enough for this tick.
+        while may_read {
+            // Stop reading if we've accumulated enough for this tick. The
+            // client goes into the carry set: by definition it still has
+            // backlog (kernel buffer or transport-internal), which a
+            // level-triggered fd check alone might not surface for the
+            // TLS/WS variants.
             if client.buf.len() >= max_inbound_buf {
+                carry.insert(client_id.clone());
                 break;
             }
             let mut tmp = [0u8; READ_CHUNK_BYTES];
@@ -2946,6 +3055,10 @@ fn poll_mqtt_clients(
                 Ok(n) => {
                     client.buf.extend_from_slice(&tmp[..n]);
                     client.last_received_at = std::time::Instant::now();
+                    // Active this tick — poll again next tick even without
+                    // fresh fd readiness, in case the TLS/WS layer holds
+                    // decrypted-but-unread bytes internally.
+                    carry.insert(client_id.clone());
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break; // No more data available this tick
