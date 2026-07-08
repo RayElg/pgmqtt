@@ -233,3 +233,4 @@ The following limits are compiled into the extension binary and cannot be change
 | Client read/write timeout | **2 seconds** | Timeout for individual client I/O operations. |
 | CONNECT handshake timeout | **5 seconds** | Maximum time to wait for the initial MQTT CONNECT packet from a new connection. |
 | Keep-alive enforcement | **1.5 &times; keep_alive** | Clients are disconnected if no packet is received within 1.5&times; their negotiated keep-alive interval (per MQTT 5.0 §3.1.2.10). A keep-alive of 0 disables the timeout. |
+| QoS 1 PUBACK latency (multiprocess) | **1–3 ticks** (~5–15 ms at defaults) | With the enterprise `multiprocess` feature, PUBACKs and QoS ≥ 1 delivery wait for the WAL flush pointer to cover the (asynchronous) commit — same durability point as the single-process broker, but the fsync happens off the socket loop. See [enterprise.md → Asynchronous group commit](enterprise.md#asynchronous-group-commit). |

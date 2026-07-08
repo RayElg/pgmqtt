@@ -26,9 +26,11 @@ from proto_utils import (  # noqa: E402
     MQTTControlPacket,
     create_connect_packet,
     create_puback_packet,
+    create_publish_packet,
     create_subscribe_packet,
     recv_packet,
     validate_connack,
+    validate_puback,
     validate_publish,
     validate_suback,
 )
@@ -342,6 +344,92 @@ def test_multiprocess_single_transaction_burst_lossless(enterprise_broker):
             break
         time.sleep(0.5)
     assert remaining == 0, f"pgmqtt_cdc_outbox not drained: {remaining} rows left"
+
+
+def test_multiprocess_qos1_client_publish_deferred_puback(enterprise_broker):
+    """Client QoS 1 publishes commit asynchronously; the PUBACK is deferred
+    until the WAL flush covers the commit (forced by the CDC worker's
+    beacon when idle). The publisher must still get its PUBACK promptly and
+    the subscriber must receive the message."""
+    sub = enterprise_broker.connect_mqtt("mp-c2c-sub")
+    pub = enterprise_broker.connect_mqtt("mp-c2c-pub")
+    try:
+        _subscribe(sub, 1, "mpc2c/#", qos=1)
+        pub.sendall(
+            create_publish_packet("mpc2c/data", b"deferred-ack", qos=1, packet_id=77)
+        )
+        puback = recv_packet(pub, timeout=10.0)
+        assert puback is not None, "no PUBACK for deferred QoS 1 publish"
+        validate_puback(puback, 77)
+
+        got = _collect_publishes(sub, expect=1)
+    finally:
+        sub.close()
+        pub.close()
+
+    assert len(got) == 1, f"subscriber did not receive the publish: {got}"
+    topic, payload, qos = got[0]
+    assert (topic, payload, qos) == ("mpc2c/data", b"deferred-ack", 1)
+
+
+def test_multiprocess_inbound_pump_runs_in_cdc_worker(enterprise_broker):
+    """QoS 1 inbound-mapped publishes: the PUBACK reflects the durably
+    committed pending row (deferred on the flush watermark), and the
+    pgmqtt_cdc worker — not the socket worker — pumps the row into the
+    target table."""
+    enterprise_broker.sql("DROP TABLE IF EXISTS mp_inbound")
+    enterprise_broker.sql(
+        "CREATE TABLE mp_inbound (id serial PRIMARY KEY, device text, temperature numeric)"
+    )
+    enterprise_broker.sql(
+        """
+        SELECT pgmqtt_add_inbound_mapping(
+            'mpin/{device}/temp',
+            'mp_inbound',
+            '{"device": "{device}", "temperature": "$.temperature"}'::jsonb,
+            'insert',
+            NULL,
+            'public',
+            'mp_inbound_test'
+        )
+        """
+    )
+    # Both workers refresh their inbound mapping caches on a ~500 ms cadence.
+    time.sleep(2)
+
+    pub = enterprise_broker.connect_mqtt("mp-inbound-pub")
+    try:
+        pub.sendall(
+            create_publish_packet(
+                "mpin/dev42/temp", b'{"temperature": 21.5}', qos=1, packet_id=88
+            )
+        )
+        puback = recv_packet(pub, timeout=10.0)
+        assert puback is not None, "no PUBACK for inbound-mapped QoS 1 publish"
+        validate_puback(puback, 88)
+    finally:
+        pub.close()
+
+    deadline = time.time() + 15
+    rows = []
+    while time.time() < deadline:
+        rows = enterprise_broker.sql(
+            "SELECT device, temperature::text FROM mp_inbound"
+        )
+        if rows:
+            break
+        time.sleep(0.5)
+    assert rows == [("dev42", "21.5")], f"inbound row not pumped: {rows}"
+
+    # The pending row is consumed and the backing message reclaimed.
+    deadline = time.time() + 10
+    pending = None
+    while time.time() < deadline:
+        pending = enterprise_broker.sql("SELECT count(*) FROM pgmqtt_inbound_pending")[0][0]
+        if pending == 0:
+            break
+        time.sleep(0.5)
+    assert pending == 0, f"pgmqtt_inbound_pending not drained: {pending}"
 
 
 def test_community_boot_single_worker(community_broker):

@@ -60,8 +60,29 @@ pub(crate) enum CdcQueueMode {
 /// shared BGW latch, drain the WAL slot every `pgmqtt.cdc_every_n_ticks`
 /// ticks, queue persisted messages through `pgmqtt_cdc_outbox`, and hand
 /// small QOS 0 messages to `pgmqtt_mqtt` via the shared-memory ring.
+///
+/// This worker is the DB-side half of the split, so it also absorbs the
+/// other database pipelines that don't need socket state, keeping their
+/// fsyncs (and their failure modes) off the socket loop:
+///
+/// - **The QoS 1 inbound pump** (`process_inbound_pending`): up to 50
+///   single-row transactions per tick under load — each a synchronous
+///   commit — and the known crash surface of target-table DDL racing the
+///   pending drain. Here, that crash restarts this worker without touching
+///   client connections.
+/// - **The WAL flush beacon**: `pgmqtt_mqtt` commits asynchronously and
+///   defers PUBACKs/delivery on the flush LSN; when nothing else is
+///   advancing the flush, it asks this worker to issue the one small
+///   synchronous commit that group-flushes everything (see
+///   `crate::shmem_bridge::request_wal_flush`).
 pub fn run_cdc(slot_name: &str) {
     let mut tick: u64 = 0;
+    let mut last_inbound_reload = std::time::Instant::now();
+
+    // The inbound mapping cache is per-process; load it before first use and
+    // refresh on the same ~500 ms cadence as pgmqtt_mqtt (which keeps its own
+    // copy for matching topics at packet time).
+    super::load_inbound_mappings();
 
     while BackgroundWorker::wait_latch(Some(super::latch_interval())) {
         tick = tick.wrapping_add(1);
@@ -72,6 +93,28 @@ pub fn run_cdc(slot_name: &str) {
                 pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
             }
         }
+
+        // Flush beacon first: pgmqtt_mqtt has deferred PUBACKs waiting on
+        // this, and pg_logical_emit_message decodes to nothing (the output
+        // plugin registers no message callback) so it cannot feed back into
+        // the CDC pipeline below. The default synchronous commit is the
+        // whole point: it forces a flush of all earlier WAL, including the
+        // socket worker's async commits.
+        if crate::shmem_bridge::take_wal_flush_request() {
+            BackgroundWorker::transaction(|| {
+                let _ = Spi::run("SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')");
+            });
+        }
+
+        if last_inbound_reload.elapsed() >= std::time::Duration::from_millis(500) {
+            super::load_inbound_mappings();
+            last_inbound_reload = std::time::Instant::now();
+        }
+
+        // Every tick, not gated by cdc_every_n_ticks: PUBACKs for inbound
+        // QoS 1 publishes reflect durable intent as soon as the pending row
+        // commits, but callers still expect the target-table row promptly.
+        super::process_inbound_pending();
 
         if tick % crate::get_cdc_every_n_ticks_guc() == 0 {
             cdc_tick_core(slot_name, CdcQueueMode::OutboxQos1, |messages| {

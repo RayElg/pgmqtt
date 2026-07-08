@@ -137,6 +137,22 @@ pub enum SessionDbAction {
 /// Hot-path queries use session-level prepared statements created by
 /// `crate::statements::prepare_hot_path_statements()` at BGW startup.
 pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
+    execute_session_db_actions_inner(actions, true)
+}
+
+/// [`execute_session_db_actions`] with an asynchronous commit
+/// (`SET LOCAL synchronous_commit = off`) — enterprise multiprocess only,
+/// where the socket loop must not block on a WAL flush. Safe because every
+/// action here is reconstructible or at-least-once: a lost `DrainCdcOutbox`
+/// delete re-delivers, session/subscription state is re-upserted on the
+/// next event, and losing the final few milliseconds of bookkeeping on a
+/// postmaster crash sits inside the same recovery window as the crash
+/// itself (which also destroys the in-memory state those rows mirror).
+pub fn execute_session_db_actions_async(actions: Vec<SessionDbAction>) {
+    execute_session_db_actions_inner(actions, false)
+}
+
+fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: bool) {
     if actions.is_empty() {
         return;
     }
@@ -144,6 +160,14 @@ pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     BackgroundWorker::transaction(move || {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
             let m = crate::metrics::get();
+
+            if !synchronous {
+                let _ = client.select(
+                    "SELECT set_config('synchronous_commit', 'off', true)",
+                    None,
+                    &[],
+                );
+            }
 
             for action in actions {
                 match action {

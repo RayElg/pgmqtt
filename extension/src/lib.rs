@@ -1536,8 +1536,11 @@ pub unsafe extern "C" fn _PG_init() {
     // stall socket I/O. Persisted (QOS >= 1) messages cross the process
     // boundary through the durable pgmqtt_cdc_outbox table, queued in the
     // same transaction that advances the slot; only small QOS 0 messages
-    // and a wakeup doorbell go through crate::shmem_bridge (see that
-    // module for the durability split).
+    // and wakeup doorbells go through crate::shmem_bridge (see that
+    // module for the durability split). The CDC worker also absorbs the
+    // other DB-only pipelines — the QoS 1 inbound pump and the WAL flush
+    // beacon behind pgmqtt_mqtt's asynchronous commits — so no fsync ever
+    // blocks the socket loop (see server::cdc_worker::run_cdc).
     let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
     if multiprocess {
         crate::shmem_bridge::init();

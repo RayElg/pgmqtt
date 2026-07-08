@@ -43,16 +43,11 @@ pub struct BrokerMetrics {
     pub subscribe_ops: AtomicU64,
     pub unsubscribe_ops: AtomicU64,
 
-    // CDC / outbound pipeline counters live in `SharedCdcCounters` (real
-    // PostgreSQL shared memory) instead of here, since they are written by
-    // the separate `pgmqtt_cdc` worker process and read by `pgmqtt_mqtt`'s
-    // metrics flush — see `shared_cdc()` below.
-
-    // Inbound pipeline (MQTT -> DB)
-    pub inbound_writes_ok: AtomicU64,
-    pub inbound_writes_failed: AtomicU64,
-    pub inbound_retries: AtomicU64,
-    pub inbound_dead_letters: AtomicU64,
+    // CDC / outbound pipeline counters and inbound (MQTT -> DB) pipeline
+    // counters live in `SharedCdcCounters` (real PostgreSQL shared memory)
+    // instead of here, since with the enterprise multiprocess topology they
+    // are written by the separate `pgmqtt_cdc` worker process and read by
+    // `pgmqtt_mqtt`'s metrics flush — see `shared_cdc()` below.
 
     // DB batch operations
     pub db_batches_committed: AtomicU64,
@@ -89,10 +84,6 @@ impl BrokerMetrics {
             pubacks_received: AtomicU64::new(0),
             subscribe_ops: AtomicU64::new(0),
             unsubscribe_ops: AtomicU64::new(0),
-            inbound_writes_ok: AtomicU64::new(0),
-            inbound_writes_failed: AtomicU64::new(0),
-            inbound_retries: AtomicU64::new(0),
-            inbound_dead_letters: AtomicU64::new(0),
             db_batches_committed: AtomicU64::new(0),
             db_session_errors: AtomicU64::new(0),
             db_message_errors: AtomicU64::new(0),
@@ -128,6 +119,15 @@ pub struct SharedCdcCounters {
     /// oversize QoS 0) messages travel through the durable
     /// `pgmqtt_cdc_outbox` queue instead and are never dropped.
     pub bridge_dropped: AtomicU64,
+
+    // Inbound (MQTT -> DB) pipeline. In the enterprise multiprocess
+    // topology the QoS 1 pending pump runs in the pgmqtt_cdc worker while
+    // QoS 0 direct writes stay in pgmqtt_mqtt, so these must be visible
+    // across both processes.
+    pub inbound_writes_ok: AtomicU64,
+    pub inbound_writes_failed: AtomicU64,
+    pub inbound_retries: AtomicU64,
+    pub inbound_dead_letters: AtomicU64,
 }
 
 impl Default for SharedCdcCounters {
@@ -140,6 +140,10 @@ impl Default for SharedCdcCounters {
             persist_errors: AtomicU64::new(0),
             ring_buffer_dropped: AtomicU64::new(0),
             bridge_dropped: AtomicU64::new(0),
+            inbound_writes_ok: AtomicU64::new(0),
+            inbound_writes_failed: AtomicU64::new(0),
+            inbound_retries: AtomicU64::new(0),
+            inbound_dead_letters: AtomicU64::new(0),
         }
     }
 }
@@ -257,10 +261,10 @@ impl MetricsSnapshot {
             cdc_persist_errors: cdc.persist_errors.load(Ordering::Relaxed) as i64,
             cdc_ring_buffer_dropped: cdc.ring_buffer_dropped.load(Ordering::Relaxed) as i64,
             cdc_bridge_dropped: cdc.bridge_dropped.load(Ordering::Relaxed) as i64,
-            inbound_writes_ok: m.inbound_writes_ok.load(Ordering::Relaxed) as i64,
-            inbound_writes_failed: m.inbound_writes_failed.load(Ordering::Relaxed) as i64,
-            inbound_retries: m.inbound_retries.load(Ordering::Relaxed) as i64,
-            inbound_dead_letters: m.inbound_dead_letters.load(Ordering::Relaxed) as i64,
+            inbound_writes_ok: cdc.inbound_writes_ok.load(Ordering::Relaxed) as i64,
+            inbound_writes_failed: cdc.inbound_writes_failed.load(Ordering::Relaxed) as i64,
+            inbound_retries: cdc.inbound_retries.load(Ordering::Relaxed) as i64,
+            inbound_dead_letters: cdc.inbound_dead_letters.load(Ordering::Relaxed) as i64,
             db_batches_committed: m.db_batches_committed.load(Ordering::Relaxed) as i64,
             db_session_errors: m.db_session_errors.load(Ordering::Relaxed) as i64,
             db_message_errors: m.db_message_errors.load(Ordering::Relaxed) as i64,

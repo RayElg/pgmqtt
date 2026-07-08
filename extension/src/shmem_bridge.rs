@@ -83,6 +83,34 @@ pub fn outbox_doorbell_seq() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// WAL flush request (pgmqtt_mqtt -> pgmqtt_cdc)
+// ---------------------------------------------------------------------------
+//
+// In the enterprise topology, pgmqtt_mqtt commits its write transactions
+// with synchronous_commit = off and defers client-visible effects (PUBACKs,
+// QoS >= 1 delivery) until pg_current_wal_flush_lsn() covers them, so the
+// socket loop never blocks on an fsync. Under CDC load the flush advances
+// for free (the CDC worker's batch commits are synchronous); when it
+// doesn't, pgmqtt_mqtt raises this flag and the CDC worker issues one small
+// synchronous commit, which group-flushes all earlier WAL — the fsync
+// happens off the socket loop either way.
+
+static FLUSH_REQUEST: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pgmqtt_bridge_flush_request") };
+
+/// Ask the CDC worker to force a WAL flush soon (idempotent while pending).
+pub fn request_wal_flush() {
+    FLUSH_REQUEST.get().store(1, Ordering::Relaxed);
+}
+
+/// Consume a pending flush request (CDC worker side). Returns whether one
+/// was pending. Swap semantics coalesce any number of requests raised since
+/// the last beacon into a single synchronous commit.
+pub fn take_wal_flush_request() -> bool {
+    FLUSH_REQUEST.get().swap(0, Ordering::Relaxed) == 1
+}
+
+// ---------------------------------------------------------------------------
 // Inline ring (QoS 0, never persisted)
 // ---------------------------------------------------------------------------
 
@@ -188,5 +216,6 @@ pub fn drain_inline() -> Vec<(String, Vec<u8>)> {
 /// `_PG_init` — the extension must be loaded via `shared_preload_libraries`.
 pub fn init() {
     pg_shmem_init!(OUTBOX_DOORBELL);
+    pg_shmem_init!(FLUSH_REQUEST);
     pg_shmem_init!(INLINE_RING);
 }

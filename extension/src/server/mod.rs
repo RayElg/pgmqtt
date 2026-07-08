@@ -9,7 +9,7 @@ use crate::inbound_map;
 use crate::mqtt;
 use crate::subscriptions;
 pub use cdc_worker::run_cdc;
-pub use db_action::{execute_session_db_actions, SessionDbAction};
+pub use db_action::{execute_session_db_actions, execute_session_db_actions_async, SessionDbAction};
 pub use session::{with_sessions, MqttMessage, MqttSession};
 pub use transport::Transport;
 
@@ -584,7 +584,7 @@ fn load_inbound_mappings() {
 ///
 /// Each write is executed in its own transaction so a single failure
 /// (constraint violation, bad data) doesn't roll back the entire batch.
-fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
+fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>, synchronous: bool) {
     if writes.is_empty() {
         return;
     }
@@ -595,6 +595,15 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     for write in &writes {
         let ok: bool = BackgroundWorker::transaction(|| {
             pgrx::spi::Spi::connect_mut(|client| {
+                if !synchronous {
+                    // QoS 0 direct writes: no ack gates on their durability,
+                    // so skip the commit's WAL flush (enterprise multiprocess).
+                    let _ = client.select(
+                        "SELECT set_config('synchronous_commit', 'off', true)",
+                        None,
+                        &[],
+                    );
+                }
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = write
                     .args
                     .iter()
@@ -616,12 +625,12 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     let ok_count = total - err_count;
     if ok_count > 0 {
         log!("pgmqtt inbound: committed {} writes", ok_count);
-        crate::metrics::add(&crate::metrics::get().inbound_writes_ok, ok_count as u64);
+        crate::metrics::add(&crate::metrics::shared_cdc().inbound_writes_ok, ok_count as u64);
     }
     if err_count > 0 {
         log!("pgmqtt inbound: {} writes failed", err_count);
         crate::metrics::add(
-            &crate::metrics::get().inbound_writes_failed,
+            &crate::metrics::shared_cdc().inbound_writes_failed,
             err_count as u64,
         );
     }
@@ -785,7 +794,7 @@ fn process_inbound_pending() {
                 message_id,
                 mapping_name,
             } => {
-                crate::metrics::inc(&crate::metrics::get().inbound_writes_ok);
+                crate::metrics::inc(&crate::metrics::shared_cdc().inbound_writes_ok);
                 log!(
                     "pgmqtt inbound: processed message {} for mapping '{}'",
                     message_id,
@@ -818,7 +827,7 @@ fn process_inbound_pending() {
                 payload,
                 error,
             } => {
-                crate::metrics::inc(&crate::metrics::get().inbound_writes_failed);
+                crate::metrics::inc(&crate::metrics::shared_cdc().inbound_writes_failed);
                 handle_inbound_failure(
                     message_id,
                     &mapping_name,
@@ -861,7 +870,7 @@ fn handle_inbound_failure(
             payload,
         );
     } else {
-        crate::metrics::inc(&crate::metrics::get().inbound_retries);
+        crate::metrics::inc(&crate::metrics::shared_cdc().inbound_retries);
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
             retry_count + 1,
@@ -902,7 +911,7 @@ fn dead_letter_inbound(
     topic: &str,
     payload: &[u8],
 ) {
-    crate::metrics::inc(&crate::metrics::get().inbound_dead_letters);
+    crate::metrics::inc(&crate::metrics::shared_cdc().inbound_dead_letters);
     log!(
         "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
         message_id,
@@ -1386,6 +1395,11 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     let mut outbox_pending = matches!(cdc_mode, CdcMode::Bridged);
     let mut outbox_doorbell_seen: u64 = 0;
     let mut last_outbox_safety_check = std::time::Instant::now();
+    // Bridged-mode async-commit state: batches persisted with
+    // synchronous_commit=off whose delivery/PUBACKs wait for the WAL flush
+    // pointer. Always empty in Standalone mode.
+    let mut deferred_publishes: std::collections::VecDeque<DeferredRelease> =
+        std::collections::VecDeque::new();
     while BackgroundWorker::wait_latch(Some(latch_interval())) {
         tick = tick.wrapping_add(1);
 
@@ -1488,8 +1502,14 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
             &mut pending_inbound_writes,
         );
 
-        // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
-        execute_inbound_writes(pending_inbound_writes);
+        // Execute inbound writes (MQTT → PostgreSQL) before CDC and message
+        // delivery. Bridged mode commits them asynchronously: these are
+        // QoS 0 direct writes with no ack to gate, so nothing waits on the
+        // flush — the fsync just moves off this loop.
+        execute_inbound_writes(
+            pending_inbound_writes,
+            matches!(cdc_mode, CdcMode::Standalone(_)),
+        );
 
         match cdc_mode {
             CdcMode::Standalone(slot_name) => {
@@ -1594,27 +1614,102 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
             }
         }
 
+        // Release deferred publishes whose WAL is now durably flushed:
+        // deliver to subscribers and send the owed PUBACKs. Watermarks are
+        // monotonic, so releasing from the front preserves publish order.
+        // If the flush pointer hasn't caught up, ask the CDC worker to
+        // force it with one small synchronous commit — the fsync happens
+        // in that process, never on this loop.
+        if !deferred_publishes.is_empty() {
+            let mut flush = read_lsn("pg_current_wal_flush_lsn()");
+            // Local fallback: if the oldest batch has outlived the normal
+            // beacon round trip, stop waiting on the off-loop flush path
+            // and pay one synchronous flush here — bounded, rare, and
+            // strictly better than a wal_writer_delay-sized PUBACK tail.
+            if deferred_publishes.front().is_some_and(|d| {
+                flush.map_or(true, |f| d.watermark > f)
+                    && d.queued_at.elapsed() >= deferred_flush_fallback_after()
+            }) {
+                BackgroundWorker::transaction(|| {
+                    let _ = pgrx::spi::Spi::run(
+                        "SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')",
+                    );
+                });
+                flush = read_lsn("pg_current_wal_flush_lsn()");
+            }
+            while deferred_publishes
+                .front()
+                .is_some_and(|d| flush.is_some_and(|f| d.watermark <= f))
+            {
+                let released = deferred_publishes.pop_front().expect("front checked");
+                deliver_messages(
+                    &released.messages,
+                    &mut clients,
+                    &mut publishes,
+                    &mut session_db_actions,
+                );
+                for (client_id, pid) in released.pubacks {
+                    if let Some(client) = clients.get_mut(&client_id) {
+                        let puback = mqtt::build_puback(pid);
+                        let _ = client.transport.write_all(&puback);
+                        crate::metrics::inc(&crate::metrics::get().pubacks_sent);
+                    }
+                }
+            }
+            if !deferred_publishes.is_empty() {
+                crate::shmem_bridge::request_wal_flush();
+            }
+        }
+
         // Periodically resend unacked QoS 1 messages (5s timeout; checking every 1s is sufficient)
         if last_redeliver_check.elapsed() >= Duration::from_secs(1) {
             redeliver_unacked_messages(&mut clients, &mut publishes, &mut session_db_actions);
             last_redeliver_check = std::time::Instant::now();
         }
 
-        publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
+        match cdc_mode {
+            CdcMode::Standalone(_) => {
+                publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
+            }
+            CdcMode::Bridged => {
+                // Async commit + deferred delivery/PUBACK — see
+                // publish_messages_batch_deferred for why this is only
+                // sound in the two-process topology.
+                publish_messages_batch_deferred(
+                    publishes,
+                    &mut clients,
+                    &mut session_db_actions,
+                    &mut deferred_publishes,
+                );
+            }
+        }
 
-        // Virtual subscriber: drain QoS 1 inbound-pending rows every tick so
-        // that callers receive durable delivery (row in target table) in the
-        // same tick as the PUBACK.  The SELECT is a no-op when the table is
-        // empty, so per-tick overhead is negligible.
-        process_inbound_pending();
+        // Virtual subscriber: drain QoS 1 inbound-pending rows so that
+        // callers receive durable delivery (row in target table) promptly
+        // after the PUBACK. In Bridged mode this pump runs in the
+        // pgmqtt_cdc worker instead: it is up to 50 single-row synchronous
+        // commits per tick under load, and its known target-table DDL race
+        // (a crash) then restarts that worker without touching sockets.
+        if matches!(cdc_mode, CdcMode::Standalone(_)) {
+            process_inbound_pending();
+        }
 
         if last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
             last_session_sweep = std::time::Instant::now();
         }
 
-        // Execute all collected session DB actions in one transaction
-        execute_session_db_actions(session_db_actions);
+        // Execute all collected session DB actions in one transaction. In
+        // Bridged mode the commit is asynchronous: every action here is
+        // reconstructible or at-least-once (lost DrainCdcOutbox deletes
+        // just re-deliver; session/subscription state is re-upserted), so
+        // losing the last few milliseconds on a postmaster crash is within
+        // the same recovery envelope as the crash itself — and it removes
+        // the last per-tick fsync from this loop.
+        match cdc_mode {
+            CdcMode::Standalone(_) => execute_session_db_actions(session_db_actions),
+            CdcMode::Bridged => execute_session_db_actions_async(session_db_actions),
+        }
 
         // ── Enterprise metrics flush ──────────────────────────────────────────
         if crate::license::has_feature(crate::license::Feature::Metrics) {
@@ -1639,6 +1734,35 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     log!("{}: SIGTERM received, shutting down gracefully", log_prefix);
     let mut shutdown_db_actions = Vec::new();
     let mut will_publishes = Vec::new();
+
+    // Anything still deferred gets flushed and released before teardown:
+    // clients are about to be disconnected, so the owed PUBACKs and
+    // deliveries go out now. One synchronous no-op commit guarantees every
+    // earlier async commit is durable (we're exiting — blocking is fine).
+    if !deferred_publishes.is_empty() {
+        BackgroundWorker::transaction(|| {
+            let _ = pgrx::spi::Spi::run("SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')");
+        });
+        let mut shutdown_cascade = Vec::new();
+        for released in deferred_publishes.drain(..) {
+            deliver_messages(
+                &released.messages,
+                &mut clients,
+                &mut shutdown_cascade,
+                &mut shutdown_db_actions,
+            );
+            for (client_id, pid) in released.pubacks {
+                if let Some(client) = clients.get_mut(&client_id) {
+                    let puback = mqtt::build_puback(pid);
+                    let _ = client.transport.write_all(&puback);
+                    crate::metrics::inc(&crate::metrics::get().pubacks_sent);
+                }
+            }
+        }
+        if !shutdown_cascade.is_empty() {
+            publish_messages_batch(shutdown_cascade, &mut clients, &mut shutdown_db_actions);
+        }
+    }
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
@@ -2912,6 +3036,184 @@ fn poll_mqtt_clients(
     }
 }
 
+/// Split a tick's publishes into DB-persistent (QoS >= 1 or retained) and
+/// transient (QoS 0, non-retained) sets.
+fn split_publishes(pending: Vec<PendingPublish>) -> (Vec<PendingPublish>, Vec<PendingPublish>) {
+    let mut persistent = Vec::new();
+    let mut transient = Vec::new();
+    for p in pending {
+        if p.qos > 0 || p.retain {
+            persistent.push(p);
+        } else {
+            transient.push(p);
+        }
+    }
+    (persistent, transient)
+}
+
+/// Persist one batch of QoS >= 1 / retained publishes in a single
+/// transaction; returns the persisted messages ready for delivery and
+/// whether the transaction committed.
+///
+/// With `synchronous = false` (enterprise multiprocess only), the commit
+/// skips its own WAL flush (`SET LOCAL synchronous_commit = off`): the rows
+/// are immediately visible and correctly ordered, but the caller MUST NOT
+/// emit client-visible effects (PUBACKs, QoS >= 1 delivery) until
+/// `pg_current_wal_flush_lsn()` passes the transaction — see
+/// [`DeferredRelease`].
+fn persist_publish_batch(
+    persistent: &[PendingPublish],
+    synchronous: bool,
+) -> (Vec<MqttMessage>, bool) {
+    BackgroundWorker::transaction(|| {
+        let mut to_publish = Vec::new();
+        pgrx::spi::Spi::connect_mut(|client| {
+            if !synchronous {
+                let _ = client.select(
+                    "SELECT set_config('synchronous_commit', 'off', true)",
+                    None,
+                    &[],
+                );
+            }
+            for p in persistent {
+                let mut msg_id_opt: Option<i64> = None;
+
+                // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
+                // non-retained row at QoS 1 so the forwarded clear has DB
+                // backing for reconnect redelivery.
+                if p.retain && p.payload.is_empty() {
+                    let topic_ref: &str = &p.topic;
+                    let args: Vec<pgrx::datum::DatumWithOid> =
+                        vec![topic_ref.into()];
+                    let table = client.update(
+                        "DELETE FROM pgmqtt_retained WHERE topic = $1 RETURNING message_id",
+                        None,
+                        &args,
+                    )?;
+                    for row in table {
+                        if let Ok(Some(old_id)) = row.get_by_name::<i64, _>("message_id") {
+                            db_action::cleanup_orphaned_message(client, old_id)?;
+                        }
+                    }
+                    if p.qos > 0 {
+                        let msg_id = db_action::persist_message(
+                            client,
+                            &p.topic,
+                            &p.payload,
+                            p.qos,
+                            false,
+                        )?;
+                        msg_id_opt = Some(msg_id);
+                    }
+                } else {
+                    // Normal publish: persist the message and update retained index.
+                    let msg_id = db_action::persist_message(
+                        client,
+                        &p.topic,
+                        &p.payload,
+                        p.qos,
+                        p.retain,
+                    )?;
+                    msg_id_opt = Some(msg_id);
+
+                    if p.retain {
+                        let topic_ref: &str = &p.topic;
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![topic_ref.into(), msg_id.into()];
+                        let table = client.update(
+                            "WITH old AS ( \
+                                 SELECT message_id AS old_id FROM pgmqtt_retained WHERE topic = $1 \
+                             ), upsert AS ( \
+                                 INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
+                                 ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id \
+                                 RETURNING 1 \
+                             ) \
+                             SELECT old_id FROM old, upsert",
+                            None,
+                            &args,
+                        )?;
+                        let mut old_msg_id: Option<i64> = None;
+                        for row in table {
+                            if let Ok(Some(id)) = row.get_by_name::<i64, _>("old_id") {
+                                old_msg_id = Some(id);
+                            }
+                        }
+                        if let Some(old_id) = old_msg_id {
+                            if old_id != msg_id {
+                                db_action::cleanup_orphaned_message(client, old_id)?;
+                            }
+                        }
+                    }
+                }
+
+                // Insert inbound-pending tracking rows (virtual subscriber).
+                // These are committed atomically with the message so the
+                // PUBACK reflects durable intent to process.
+                if let Some(msg_id) = msg_id_opt {
+                    for mapping_name in &p.inbound_mappings {
+                        let args: Vec<pgrx::datum::DatumWithOid> =
+                            vec![msg_id.into(), mapping_name.as_ref().into()];
+                        client.update(
+                            "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
+                             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            None,
+                            &args,
+                        )?;
+                    }
+                }
+
+                if crate::get_debug_log_guc() {
+                    log!(
+                        "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
+                        p.log_sender,
+                        p.topic,
+                        p.qos
+                    );
+                }
+                to_publish.push(MqttMessage {
+                    id: msg_id_opt,
+                    topic: p.topic.clone(),
+                    payload: p.payload.clone(),
+                    qos: p.qos,
+                });
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        })?;
+        Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
+    })
+    .unwrap_or((Vec::new(), false))
+}
+
+/// Deliver transient (QoS 0, non-retained) publishes immediately — they
+/// have no durability contract, so nothing gates them on a WAL flush in
+/// either topology. Returns any cascading will-publishes for the caller to
+/// route back through its own (sync or deferred) publish path.
+fn deliver_transient(
+    transient: Vec<PendingPublish>,
+    clients: &mut HashMap<String, MqttClient>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) -> Vec<PendingPublish> {
+    let transient_msgs: Vec<MqttMessage> = transient
+        .into_iter()
+        .map(|p| {
+            log!(
+                "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
+                p.log_sender,
+                p.topic
+            );
+            MqttMessage {
+                id: None,
+                topic: p.topic,
+                payload: p.payload,
+                qos: 0,
+            }
+        })
+        .collect();
+    let mut cascade = Vec::new();
+    deliver_messages(&transient_msgs, clients, &mut cascade, session_db_actions);
+    cascade
+}
+
 fn publish_messages_batch(
     pending: Vec<PendingPublish>,
     clients: &mut HashMap<String, MqttClient>,
@@ -2920,129 +3222,10 @@ fn publish_messages_batch(
     if pending.is_empty() {
         return;
     }
-
-    let mut persistent = Vec::new();
-    let mut transient = Vec::new();
-
-    for p in pending {
-        if p.qos > 0 || p.retain {
-            persistent.push(p);
-        } else {
-            transient.push(p);
-        }
-    }
+    let (persistent, transient) = split_publishes(pending);
 
     if !persistent.is_empty() {
-        let (to_publish, ok) = BackgroundWorker::transaction(|| {
-            let mut to_publish = Vec::new();
-            pgrx::spi::Spi::connect_mut(|client| {
-                for p in &persistent {
-                    let mut msg_id_opt: Option<i64> = None;
-
-                    // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
-                    // non-retained row at QoS 1 so the forwarded clear has DB
-                    // backing for reconnect redelivery.
-                    if p.retain && p.payload.is_empty() {
-                        let topic_ref: &str = &p.topic;
-                        let args: Vec<pgrx::datum::DatumWithOid> =
-                            vec![topic_ref.into()];
-                        let table = client.update(
-                            "DELETE FROM pgmqtt_retained WHERE topic = $1 RETURNING message_id",
-                            None,
-                            &args,
-                        )?;
-                        for row in table {
-                            if let Ok(Some(old_id)) = row.get_by_name::<i64, _>("message_id") {
-                                db_action::cleanup_orphaned_message(client, old_id)?;
-                            }
-                        }
-                        if p.qos > 0 {
-                            let msg_id = db_action::persist_message(
-                                client,
-                                &p.topic,
-                                &p.payload,
-                                p.qos,
-                                false,
-                            )?;
-                            msg_id_opt = Some(msg_id);
-                        }
-                    } else {
-                        // Normal publish: persist the message and update retained index.
-                        let msg_id = db_action::persist_message(
-                            client,
-                            &p.topic,
-                            &p.payload,
-                            p.qos,
-                            p.retain,
-                        )?;
-                        msg_id_opt = Some(msg_id);
-
-                        if p.retain {
-                            let topic_ref: &str = &p.topic;
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![topic_ref.into(), msg_id.into()];
-                            let table = client.update(
-                                "WITH old AS ( \
-                                     SELECT message_id AS old_id FROM pgmqtt_retained WHERE topic = $1 \
-                                 ), upsert AS ( \
-                                     INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
-                                     ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id \
-                                     RETURNING 1 \
-                                 ) \
-                                 SELECT old_id FROM old, upsert",
-                                None,
-                                &args,
-                            )?;
-                            let mut old_msg_id: Option<i64> = None;
-                            for row in table {
-                                if let Ok(Some(id)) = row.get_by_name::<i64, _>("old_id") {
-                                    old_msg_id = Some(id);
-                                }
-                            }
-                            if let Some(old_id) = old_msg_id {
-                                if old_id != msg_id {
-                                    db_action::cleanup_orphaned_message(client, old_id)?;
-                                }
-                            }
-                        }
-                    }
-
-                    // Insert inbound-pending tracking rows (virtual subscriber).
-                    // These are committed atomically with the message so the
-                    // PUBACK reflects durable intent to process.
-                    if let Some(msg_id) = msg_id_opt {
-                        for mapping_name in &p.inbound_mappings {
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![msg_id.into(), mapping_name.as_ref().into()];
-                            client.update(
-                                "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
-                                 VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                                None,
-                                &args,
-                            )?;
-                        }
-                    }
-
-                    if crate::get_debug_log_guc() {
-                        log!(
-                            "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                            p.log_sender,
-                            p.topic,
-                            p.qos
-                        );
-                    }
-                    to_publish.push(MqttMessage {
-                        id: msg_id_opt,
-                        topic: p.topic.clone(),
-                        payload: p.payload.clone(),
-                        qos: p.qos,
-                    });
-                }
-                Ok::<_, pgrx::spi::Error>(())
-            })?;
-            Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
-        })
-        .unwrap_or((Vec::new(), false));
+        let (to_publish, ok) = persist_publish_batch(&persistent, true);
 
         if ok {
             // Deliver directly to subscribers.
@@ -3071,26 +3254,126 @@ fn publish_messages_batch(
     }
 
     if !transient.is_empty() {
-        let transient_msgs: Vec<MqttMessage> = transient
-            .into_iter()
-            .map(|p| {
-                log!(
-                    "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
-                    p.log_sender,
-                    p.topic
-                );
-                MqttMessage {
-                    id: None,
-                    topic: p.topic,
-                    payload: p.payload,
-                    qos: 0,
-                }
-            })
-            .collect();
-        let mut cascade = Vec::new();
-        deliver_messages(&transient_msgs, clients, &mut cascade, session_db_actions);
+        let cascade = deliver_transient(transient, clients, session_db_actions);
         if !cascade.is_empty() {
             publish_messages_batch(cascade, clients, session_db_actions);
+        }
+    }
+}
+
+/// One batch of asynchronously-committed publishes whose client-visible
+/// effects (delivery to subscribers, PUBACKs to the publishers) are parked
+/// until `pg_current_wal_flush_lsn()` reaches `watermark` — the point at
+/// which the batch's commit record is durably on disk. Watermarks are
+/// captured in commit order, so FIFO release preserves publish order.
+struct DeferredRelease {
+    watermark: u64,
+    /// When the batch was parked — drives the local flush fallback in
+    /// `run_loop` if the off-loop flush path stalls.
+    queued_at: std::time::Instant,
+    messages: Vec<MqttMessage>,
+    /// `(client_id, packet_id)` PUBACKs owed once durable.
+    pubacks: Vec<(String, u16)>,
+}
+
+/// How long a [`DeferredRelease`] may wait before the socket loop stops
+/// trusting the off-loop flush path (CDC-worker beacon, WAL writer, other
+/// backends' commits) and pays one synchronous flush itself. The beacon
+/// round trip normally completes within ~3 ticks; past this threshold the
+/// CDC worker is stalled or restarting, or the WAL writer is on its default
+/// 200 ms cadence — and one bounded fsync here beats a 200 ms PUBACK tail.
+/// Worst case this degrades to the pre-split behavior (a sync commit on
+/// the loop), never below it.
+fn deferred_flush_fallback_after() -> Duration {
+    std::cmp::max(latch_interval() * 4, Duration::from_millis(20))
+}
+
+/// Enterprise (Bridged) variant of [`publish_messages_batch`]: persists
+/// with an asynchronous commit and parks delivery + PUBACKs as a
+/// [`DeferredRelease`] instead of blocking the socket loop on the WAL
+/// flush. The release check in `run_loop` emits the parked effects once
+/// the flush pointer catches up (typically 1–2 ticks; the CDC worker is
+/// asked to force a flush if it doesn't advance on its own). Only sound
+/// with the process split: in the single-worker topology the CDC tick's
+/// own synchronous commits would force catch-up flushes on this same loop,
+/// paying the fsync anyway.
+///
+/// Transient messages still deliver immediately, so a same-publisher QoS 0
+/// message can overtake an earlier QoS 1 message — MQTT ordering
+/// guarantees are per-QoS-flow, so this is permitted (and already happened
+/// across ticks).
+fn publish_messages_batch_deferred(
+    pending: Vec<PendingPublish>,
+    clients: &mut HashMap<String, MqttClient>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+    deferred: &mut std::collections::VecDeque<DeferredRelease>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let (persistent, transient) = split_publishes(pending);
+
+    if !persistent.is_empty() {
+        let (messages, ok) = persist_publish_batch(&persistent, false);
+        if ok {
+            let pubacks = persistent
+                .iter()
+                .filter(|p| p.qos == 1)
+                .filter_map(|p| p.packet_id.map(|pid| (p.log_sender.clone(), pid)))
+                .collect();
+            deferred.push_back(DeferredRelease {
+                watermark: capture_wal_insert_watermark(),
+                queued_at: std::time::Instant::now(),
+                messages,
+                pubacks,
+            });
+        }
+    }
+
+    if !transient.is_empty() {
+        let cascade = deliver_transient(transient, clients, session_db_actions);
+        if !cascade.is_empty() {
+            publish_messages_batch_deferred(cascade, clients, session_db_actions, deferred);
+        }
+    }
+}
+
+/// Parse PostgreSQL's textual LSN ("16/B374D848") into a comparable u64.
+fn parse_lsn(s: &str) -> Option<u64> {
+    let (hi, lo) = s.split_once('/')?;
+    Some((u64::from_str_radix(hi, 16).ok()? << 32) | u64::from_str_radix(lo, 16).ok()?)
+}
+
+/// Evaluate a WAL LSN expression in a read-only transaction (no WAL write,
+/// no flush wait) and return it as a comparable u64.
+fn read_lsn(expr: &str) -> Option<u64> {
+    let query = format!("SELECT {}::text", expr);
+    BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect(|client| {
+            client.select(&query, None, &[])?.first().get_one::<String>()
+        })
+        .ok()
+        .flatten()
+    })
+    .and_then(|s| parse_lsn(&s))
+}
+
+/// WAL position that covers everything committed so far — read *after* an
+/// asynchronous commit, it bounds that transaction's commit record. If the
+/// read fails (should not happen), force a synchronous flush on the spot
+/// and return 0 so the batch is releasable immediately with durability
+/// already guaranteed.
+fn capture_wal_insert_watermark() -> u64 {
+    match read_lsn("pg_current_wal_insert_lsn()") {
+        Some(lsn) => lsn,
+        None => {
+            log!("pgmqtt: failed to read WAL insert LSN — forcing a synchronous flush instead");
+            BackgroundWorker::transaction(|| {
+                let _ = pgrx::spi::Spi::run(
+                    "SELECT pg_logical_emit_message(true, 'pgmqtt_flush', '')",
+                );
+            });
+            0
         }
     }
 }
