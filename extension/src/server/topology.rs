@@ -127,6 +127,47 @@ fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
     }
 }
 
+/// Remove rows owned by worker slots that no longer exist. The worker count
+/// is fixed per postmaster boot, so after `pgmqtt.socket_workers` shrinks
+/// (or the license lapses back to community), any row with
+/// `worker_slot >= socket_workers()` is defunct: its outbox cursor would
+/// pin the slot-0 GC watermark forever (unbounded `pgmqtt_cdc_outbox`
+/// growth — nothing else ever advances a defunct cursor), and its
+/// connections-cache rows would linger as phantom connections (each worker
+/// prunes only its own slot's rows).
+///
+/// Runs once at startup on slot 0. Safe on a mere worker restart too: no
+/// live worker can hold a slot >= the boot-time count.
+pub(super) fn sweep_defunct_slots() {
+    BackgroundWorker::transaction(|| {
+        let _ = pgrx::spi::Spi::connect_mut(|client| {
+            // Startup write — serialized with the partner worker's slot
+            // creation, same as setup_replication_origin (see
+            // ensure_replication_slot in lib.rs for the wedge this avoids).
+            let _ = client.select(
+                &format!(
+                    "SELECT pg_advisory_xact_lock({})",
+                    crate::SCHEMA_MIGRATION_LOCK_KEY
+                ),
+                None,
+                &[],
+            );
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![socket_workers().into()];
+            client.update(
+                "DELETE FROM pgmqtt_outbox_cursors WHERE worker_slot >= $1",
+                None,
+                &args,
+            )?;
+            client.update(
+                "DELETE FROM pgmqtt_connections_cache WHERE worker_slot >= $1",
+                None,
+                &args,
+            )?;
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    });
+}
+
 /// Tag every transaction this worker session commits with a named
 /// replication origin, and register the origin's id in shared memory so the
 /// output plugin can skip the worker's own WAL *before* it enters the

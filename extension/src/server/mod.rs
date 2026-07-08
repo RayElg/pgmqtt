@@ -1274,6 +1274,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // clients reconnect (documented multi-worker caveat).
     if is_primary {
         db_mark_sessions_disconnected_on_startup();
+        topology::sweep_defunct_slots();
     }
     db_load_sessions_on_startup();
     load_inbound_mappings();

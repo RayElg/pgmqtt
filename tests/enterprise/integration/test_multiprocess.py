@@ -63,12 +63,14 @@ class Broker:
         mqtt_port: int,
         license_token: str | None,
         extra_conf: list | None = None,
+        auto_remove: bool = True,
     ):
         self.name = name
         self.pg_port = pg_port
         self.mqtt_port = mqtt_port
         self.license_token = license_token
         self.extra_conf = extra_conf or []
+        self.auto_remove = auto_remove
 
     def start(self):
         subprocess.call(
@@ -76,8 +78,11 @@ class Broker:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        cmd = [
-            "docker", "run", "-d", "--rm", "--name", self.name,
+        cmd = ["docker", "run", "-d"]
+        if self.auto_remove:
+            cmd.append("--rm")
+        cmd += [
+            "--name", self.name,
             "-e", "POSTGRES_PASSWORD=postgres",
             "-p", f"127.0.0.1:{self.pg_port}:5432",
             "-p", f"127.0.0.1:{self.mqtt_port}:1883",
@@ -101,6 +106,16 @@ class Broker:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def restart(self):
+        """Full postmaster restart, keeping the data directory.
+        Requires auto_remove=False (a --rm container may be reaped on stop)."""
+        subprocess.check_call(
+            ["docker", "restart", self.name],
+            stdout=subprocess.DEVNULL,
+        )
+        self._wait_pg()
+        self._wait_mqtt()
 
     def logs(self) -> str:
         try:
@@ -602,6 +617,75 @@ def test_multiworker_outbox_gc(multi_broker):
             break
         time.sleep(1)
     assert remaining == 0, f"outbox not garbage-collected: {remaining} rows left"
+
+
+def test_defunct_slot_rows_swept_on_startup():
+    """Rows left behind by a socket_workers decrease are swept at startup.
+
+    A defunct slot's outbox cursor would pin the slot-0 GC watermark forever
+    (nothing else ever advances it); its connections_cache rows would linger
+    as phantom connections. Simulate the leftovers of a larger previous
+    topology, then restart the postmaster: slot 0's startup sweep must
+    remove every row for slots >= the boot-time worker count while the live
+    slots' rows survive.
+    """
+    if not _image_available():
+        pytest.skip(f"docker image {IMAGE} not available")
+    token = generate_test_license(
+        customer="mw-sweep", days=1, features=["multiprocess", "metrics"]
+    )
+    broker = Broker(
+        "pgmqtt-test-defunct-sweep",
+        15494,
+        11894,
+        token,
+        extra_conf=["pgmqtt.socket_workers=2"],
+        auto_remove=False,
+    )
+    broker.start()
+    try:
+        broker.sql(
+            "INSERT INTO pgmqtt_outbox_cursors (worker_slot, last_id) VALUES (7, 0) "
+            "ON CONFLICT (worker_slot) DO UPDATE SET last_id = 0"
+        )
+        broker.sql(
+            "INSERT INTO pgmqtt_connections_cache (client_id, worker_slot) "
+            "VALUES ('ghost-from-slot-7', 7) "
+            "ON CONFLICT (client_id) DO UPDATE SET worker_slot = 7"
+        )
+
+        broker.restart()
+
+        deadline = time.time() + 30
+        cursors = cache = None
+        while time.time() < deadline:
+            cursors = broker.sql(
+                "SELECT count(*) FROM pgmqtt_outbox_cursors WHERE worker_slot >= 2"
+            )[0][0]
+            cache = broker.sql(
+                "SELECT count(*) FROM pgmqtt_connections_cache WHERE worker_slot >= 2"
+            )[0][0]
+            if cursors == 0 and cache == 0:
+                break
+            time.sleep(1)
+        assert cursors == 0, (
+            "defunct outbox cursor row not swept (would pin the GC watermark)"
+        )
+        assert cache == 0, "defunct connections_cache rows not swept"
+
+        # The live slots' cursor rows survive the sweep (intact or reseeded).
+        deadline = time.time() + 30
+        live = 0
+        while time.time() < deadline:
+            live = broker.sql(
+                "SELECT count(*) FROM pgmqtt_outbox_cursors WHERE worker_slot IN (0, 1)"
+            )[0][0]
+            if live == 2:
+                break
+            time.sleep(1)
+        assert live == 2, f"expected live cursor rows for slots 0 and 1, found {live}"
+    finally:
+        broker.stop()
 
 
 def test_community_boot_single_worker(community_broker):
