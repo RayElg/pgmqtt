@@ -3413,6 +3413,71 @@ fn split_publishes(pending: Vec<PendingPublish>) -> (Vec<PendingPublish>, Vec<Pe
     (persistent, transient)
 }
 
+/// Persist a run of plain (non-retain) publishes with one set-based INSERT.
+///
+/// `unnest ... WITH ORDINALITY ... ORDER BY ord` inserts rows in array order,
+/// so the sequence assigns ascending ids in that order and the sorted
+/// RETURNING ids map one-to-one onto the run.
+fn persist_plain_run(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    run: &[PendingPublish],
+    to_publish: &mut Vec<MqttMessage>,
+    inbound_rows: &mut Vec<(i64, Arc<str>)>,
+) -> Result<(), pgrx::spi::Error> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let topics: Vec<&str> = run.iter().map(|p| &*p.topic).collect();
+    let payloads: Vec<&[u8]> = run.iter().map(|p| &*p.payload).collect();
+    let qos: Vec<i32> = run.iter().map(|p| p.qos as i32).collect();
+    let args: Vec<pgrx::datum::DatumWithOid> =
+        vec![topics.into(), payloads.into(), qos.into()];
+    // NULLIF keeps the empty-payload representation identical to
+    // db_action::persist_message (empty -> NULL).
+    let table = client.update(
+        "INSERT INTO pgmqtt_messages (topic, payload, qos, retain) \
+         SELECT u.topic, NULLIF(u.payload, ''::bytea), u.qos, false \
+         FROM unnest($1::text[], $2::bytea[], $3::int[]) \
+              WITH ORDINALITY AS u(topic, payload, qos, ord) \
+         ORDER BY u.ord \
+         RETURNING id",
+        None,
+        &args,
+    )?;
+    let mut ids: Vec<i64> = Vec::with_capacity(run.len());
+    for row in table {
+        if let Ok(Some(id)) = row.get_by_name::<i64, _>("id") {
+            ids.push(id);
+        }
+    }
+    if ids.len() != run.len() {
+        return Err(pgrx::spi::Error::SpiError(
+            pgrx::spi::SpiErrorCodes::NoAttribute,
+        ));
+    }
+    ids.sort_unstable();
+    for (p, &id) in run.iter().zip(&ids) {
+        for mapping_name in &p.inbound_mappings {
+            inbound_rows.push((id, mapping_name.clone()));
+        }
+        if crate::get_debug_log_guc() {
+            log!(
+                "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
+                p.log_sender,
+                p.topic,
+                p.qos
+            );
+        }
+        to_publish.push(MqttMessage {
+            id: Some(id),
+            topic: p.topic.clone(),
+            payload: p.payload.clone(),
+            qos: p.qos,
+        });
+    }
+    Ok(())
+}
+
 /// Persist one batch of QoS >= 1 / retained publishes in a single
 /// transaction; returns the persisted messages ready for delivery and
 /// whether the transaction committed.
@@ -3438,7 +3503,29 @@ fn persist_publish_batch(
                     &[],
                 );
             }
-            for p in persistent {
+            let mut inbound_rows: Vec<(i64, Arc<str>)> = Vec::new();
+            let mut i = 0;
+            while i < persistent.len() {
+                if !persistent[i].retain {
+                    // Set-based fast path: a run of consecutive plain
+                    // publishes becomes a single INSERT. Chunking by runs
+                    // (rather than partitioning the whole batch) keeps
+                    // sequence-id order equal to batch order across a
+                    // retain/plain mix — id order is delivery order.
+                    let start = i;
+                    while i < persistent.len() && !persistent[i].retain {
+                        i += 1;
+                    }
+                    persist_plain_run(
+                        client,
+                        &persistent[start..i],
+                        &mut to_publish,
+                        &mut inbound_rows,
+                    )?;
+                    continue;
+                }
+                let p = &persistent[i];
+                i += 1;
                 let mut msg_id_opt: Option<i64> = None;
 
                 // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
@@ -3509,19 +3596,9 @@ fn persist_publish_batch(
                     }
                 }
 
-                // Insert inbound-pending tracking rows (virtual subscriber).
-                // These are committed atomically with the message so the
-                // PUBACK reflects durable intent to process.
                 if let Some(msg_id) = msg_id_opt {
                     for mapping_name in &p.inbound_mappings {
-                        let args: Vec<pgrx::datum::DatumWithOid> =
-                            vec![msg_id.into(), mapping_name.as_ref().into()];
-                        client.update(
-                            "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
-                             VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                            None,
-                            &args,
-                        )?;
+                        inbound_rows.push((msg_id, mapping_name.clone()));
                     }
                 }
 
@@ -3539,6 +3616,24 @@ fn persist_publish_batch(
                     payload: p.payload.clone(),
                     qos: p.qos,
                 });
+            }
+
+            // Inbound-pending tracking rows (virtual subscriber), committed
+            // atomically with the messages so the PUBACK reflects durable
+            // intent to process.
+            if !inbound_rows.is_empty() {
+                let msg_ids: Vec<i64> = inbound_rows.iter().map(|(id, _)| *id).collect();
+                let mappings: Vec<&str> = inbound_rows.iter().map(|(_, m)| &**m).collect();
+                let args: Vec<pgrx::datum::DatumWithOid> =
+                    vec![msg_ids.into(), mappings.into()];
+                client.update(
+                    "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
+                     SELECT u.message_id, u.mapping_name \
+                     FROM unnest($1::bigint[], $2::text[]) AS u(message_id, mapping_name) \
+                     ON CONFLICT DO NOTHING",
+                    None,
+                    &args,
+                )?;
             }
 
             // Multi-worker: every persisted publish also goes on the shared
@@ -4416,42 +4511,113 @@ fn fetch_cdc_outbox_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
     // `after`: multi-worker cursor mode — rows stay for the other workers
     // and are reclaimed by the slot-0 GC. `None`: single-worker mode — the
     // caller deletes delivered ids.
-    let query = format!(
-        "SELECT o.id, m.topic, m.payload, m.qos \
-         FROM pgmqtt_cdc_outbox o \
-         LEFT JOIN pgmqtt_messages m ON m.id = o.id \
-         {} \
-         ORDER BY o.id \
-         LIMIT {}",
-        after
-            .map(|c| format!("WHERE o.id > {}", c))
-            .unwrap_or_default(),
-        cdc_worker::CDC_BATCH_SIZE
-    );
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect(|client| {
             let mut ids = Vec::new();
             let mut out = Vec::new();
-            let table = client.select(&query, None, &[])?;
-            for row in table {
-                let id: i64 = match row.get_by_name("id")? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                ids.push(id);
-                let topic: Option<String> = row.get_by_name("topic")?;
-                let Some(topic) = topic else {
-                    // Dangling id — message row gone. Reap via the id list.
-                    continue;
-                };
-                let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
-                let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
-                out.push(MqttMessage {
-                    id: Some(id),
-                    topic: Arc::from(topic.as_str()),
-                    payload: Arc::from(payload),
-                    qos: qos as u8,
-                });
+            if let Some(cursor) = after {
+                // Multi-worker: every worker scans every outbox row, so
+                // payloads are the read amplification. Fetch ids + topics
+                // first and pull full rows only for topics this worker's
+                // own subscription tree matches. Safe where the 9a5783e
+                // fast path was not: the cursor still advances over
+                // non-matching ids, so only *local* delivery is skipped —
+                // other workers judge against their own trees, and
+                // reclamation stays with the slot-0 GC either way.
+                // has_subscribers() is side-effect-free (no $share
+                // round-robin advance), so deliver_messages' later
+                // match_topic is unaffected. False positives only cost a
+                // payload fetch; false negatives can't happen (same trie +
+                // shared-group walk).
+                let query = format!(
+                    "SELECT o.id, m.topic \
+                     FROM pgmqtt_cdc_outbox o \
+                     LEFT JOIN pgmqtt_messages m ON m.id = o.id \
+                     WHERE o.id > {} \
+                     ORDER BY o.id \
+                     LIMIT {}",
+                    cursor,
+                    cdc_worker::CDC_BATCH_SIZE
+                );
+                let mut wanted: Vec<i64> = Vec::new();
+                let table = client.select(&query, None, &[])?;
+                for row in table {
+                    let id: i64 = match row.get_by_name("id")? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    ids.push(id);
+                    let topic: Option<String> = row.get_by_name("topic")?;
+                    let Some(topic) = topic else {
+                        // Dangling id — message row gone. Cursor moves past.
+                        continue;
+                    };
+                    if subscriptions::has_subscribers(&topic) {
+                        wanted.push(id);
+                    }
+                }
+                if !wanted.is_empty() {
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![wanted.into()];
+                    let table = client.select(
+                        // ORDER BY id keeps delivery order = outbox order.
+                        "SELECT id, topic, payload, qos FROM pgmqtt_messages \
+                         WHERE id = ANY($1::bigint[]) ORDER BY id",
+                        None,
+                        &args,
+                    )?;
+                    for row in table {
+                        let id: i64 = match row.get_by_name("id")? {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let topic: Option<String> = row.get_by_name("topic")?;
+                        let Some(topic) = topic else {
+                            continue;
+                        };
+                        let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
+                        let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
+                        out.push(MqttMessage {
+                            id: Some(id),
+                            topic: Arc::from(topic.as_str()),
+                            payload: Arc::from(payload),
+                            qos: qos as u8,
+                        });
+                    }
+                }
+            } else {
+                // Single worker deletes on delivery, so each row is fetched
+                // exactly once — and it needs every message regardless of
+                // local matches: the no-subscriber orphan reclaim and the
+                // oversize-QoS-0 spill cleanup both key off this batch.
+                let query = format!(
+                    "SELECT o.id, m.topic, m.payload, m.qos \
+                     FROM pgmqtt_cdc_outbox o \
+                     LEFT JOIN pgmqtt_messages m ON m.id = o.id \
+                     ORDER BY o.id \
+                     LIMIT {}",
+                    cdc_worker::CDC_BATCH_SIZE
+                );
+                let table = client.select(&query, None, &[])?;
+                for row in table {
+                    let id: i64 = match row.get_by_name("id")? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    ids.push(id);
+                    let topic: Option<String> = row.get_by_name("topic")?;
+                    let Some(topic) = topic else {
+                        // Dangling id — message row gone. Reap via the id list.
+                        continue;
+                    };
+                    let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
+                    let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
+                    out.push(MqttMessage {
+                        id: Some(id),
+                        topic: Arc::from(topic.as_str()),
+                        payload: Arc::from(payload),
+                        qos: qos as u8,
+                    });
+                }
             }
             Ok::<_, pgrx::spi::Error>((ids, out))
         })
