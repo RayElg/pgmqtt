@@ -58,6 +58,123 @@ const MAX_QUEUE_SIZE: usize = 50_000;
 
 // Individual db_* functions were refactored into execute_session_db_actions.
 
+// ── Worker topology (set once by the run_* entry points) ────────────────────
+//
+// Process-local: each worker records its own slot and the boot-time worker
+// count so deep call paths (CONNECT takeover, deliver_messages, the CDC
+// worker's QoS 0 routing) can consult the topology without threading it
+// through every signature.
+static ACTIVE_WORKER_SLOT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static ACTIVE_SOCKET_WORKERS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+pub(crate) fn worker_slot() -> i32 {
+    ACTIVE_WORKER_SLOT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The socket-worker count this postmaster booted with. `> 1` switches the
+/// cross-worker paths on: outbox cursors instead of delete-on-delivery,
+/// client publishes routed through the outbox, GC-owned orphan cleanup,
+/// takeover/admin broadcast rings.
+pub(crate) fn multi_worker() -> bool {
+    ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed) > 1
+}
+
+fn admin_to_worker_command(cmd: &crate::admin_commands::Command) -> crate::shmem_bridge::WorkerCommand {
+    use crate::admin_commands::Command;
+    use crate::shmem_bridge::WorkerCommand;
+    match cmd {
+        Command::DisconnectClient { client_id, reason } => WorkerCommand::DisconnectClient {
+            client_id: client_id.clone(),
+            reason: *reason,
+        },
+        Command::DisconnectRole { role_name, reason } => WorkerCommand::DisconnectRole {
+            role_name: role_name.clone(),
+            reason: *reason,
+        },
+        Command::ReloadAcls { target } => WorkerCommand::ReloadAcls {
+            target: target.clone(),
+        },
+    }
+}
+
+fn worker_to_admin_command(wc: crate::shmem_bridge::WorkerCommand) -> crate::admin_commands::Command {
+    use crate::admin_commands::Command;
+    use crate::shmem_bridge::WorkerCommand;
+    match wc {
+        WorkerCommand::DisconnectClient { client_id, reason } => {
+            Command::DisconnectClient { client_id, reason }
+        }
+        WorkerCommand::DisconnectRole { role_name, reason } => {
+            Command::DisconnectRole { role_name, reason }
+        }
+        WorkerCommand::ReloadAcls { target } => Command::ReloadAcls { target },
+    }
+}
+
+/// Bind a listener, with `SO_REUSEPORT` when several socket workers share
+/// the same ports (the kernel then load-balances incoming connections
+/// across the workers' accept queues). Single-worker topologies use a
+/// plain bind, exactly as before.
+fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
+    if !multi_worker() {
+        return TcpListener::bind(addr);
+    }
+    let parsed: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+    let std::net::SocketAddr::V4(v4) = parsed else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only IPv4 listen addresses are supported",
+        ));
+    };
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let close_err = |fd: i32| -> std::io::Error {
+            let err = std::io::Error::last_os_error();
+            libc::close(fd);
+            err
+        };
+        let one: libc::c_int = 1;
+        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(close_err(fd));
+            }
+        }
+        let sin = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: v4.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_be_bytes(v4.ip().octets()).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        if libc::bind(
+            fd,
+            &sin as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(close_err(fd));
+        }
+        if libc::listen(fd, 128) != 0 {
+            return Err(close_err(fd));
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(TcpListener::from_raw_fd(fd))
+    }
+}
+
 /// Run `f` inside a PostgreSQL subtransaction (savepoint).  On `Ok`, the
 /// savepoint is released; on `Err` (whether a Rust error or a PG longjmp
 /// caught by `catch_others`), the savepoint is rolled back and the error is
@@ -1298,11 +1415,17 @@ method not allowed";
 ///   durable `pgmqtt_cdc_outbox` queue (woken by a shared-memory doorbell),
 ///   small QOS 0 messages from `crate::shmem_bridge`'s inline ring.
 pub fn run_standalone(ports: crate::PortConfig, slot_name: &str) {
+    ACTIVE_WORKER_SLOT.store(0, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE_SOCKET_WORKERS.store(1, std::sync::atomic::Ordering::Relaxed);
     run_loop(ports, CdcMode::Standalone(slot_name));
 }
 
 /// See [`run_standalone`] — enterprise counterpart, delivery-only.
-pub fn run_delivery(ports: crate::PortConfig) {
+/// `slot` 0 owns the singleton duties (HTTP healthcheck, metrics flush,
+/// sweeps, outbox GC); with `workers > 1` the cross-worker paths engage.
+pub fn run_delivery(ports: crate::PortConfig, slot: i32, workers: i32) {
+    ACTIVE_WORKER_SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE_SOCKET_WORKERS.store(workers.max(1), std::sync::atomic::Ordering::Relaxed);
     run_loop(ports, CdcMode::Bridged);
 }
 
@@ -1315,8 +1438,29 @@ enum CdcMode<'a> {
 }
 
 fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
-    setup_replication_origin("pgmqtt_mqtt");
-    db_mark_sessions_disconnected_on_startup();
+    let slot = worker_slot();
+    let multi = multi_worker();
+    // Slot 0 owns the cluster-singleton duties; other slots are pure
+    // socket/delivery workers.
+    let is_primary = slot == 0;
+
+    // Origin names are per-slot: a replication origin can only be attached
+    // to one session at a time.
+    let origin_name = if slot == 0 {
+        "pgmqtt_mqtt".to_string()
+    } else {
+        format!("pgmqtt_mqtt_{}", slot)
+    };
+    setup_replication_origin(&origin_name);
+
+    // Marking every "connected" session as disconnected is only valid at
+    // postmaster boot, when no client can be connected anywhere. A restart
+    // of a non-primary worker must not clobber the other workers' live
+    // sessions; its own clients' sessions stay "connected" until the
+    // clients reconnect (documented multi-worker caveat).
+    if is_primary {
+        db_mark_sessions_disconnected_on_startup();
+    }
     db_load_sessions_on_startup();
     load_inbound_mappings();
 
@@ -1327,7 +1471,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Bind MQTT TCP listener (optional)
     let mqtt_listener = if ports.mqtt_enabled {
         let addr = format!("0.0.0.0:{}", ports.mqtt_port);
-        match TcpListener::bind(&addr) {
+        match bind_listener(&addr) {
             Ok(l) => {
                 if let Err(e) = l.set_nonblocking(true) {
                     log!("pgmqtt mqtt: failed to set non-blocking: {}", e);
@@ -1349,7 +1493,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Bind WebSocket listener (optional)
     let ws_listener = if ports.ws_enabled {
         let addr = format!("0.0.0.0:{}", ports.ws_port);
-        match TcpListener::bind(&addr) {
+        match bind_listener(&addr) {
             Ok(l) => {
                 if let Err(e) = l.set_nonblocking(true) {
                     log!("pgmqtt ws: failed to set non-blocking: {}", e);
@@ -1371,7 +1515,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Bind MQTT TLS listener (optional)
     let mqtts_listener = if ports.mqtts_enabled {
         let addr = format!("0.0.0.0:{}", ports.mqtts_port);
-        match TcpListener::bind(&addr) {
+        match bind_listener(&addr) {
             Ok(l) => {
                 if let Err(e) = l.set_nonblocking(true) {
                     log!("pgmqtt mqtts: failed to set non-blocking: {}", e);
@@ -1393,7 +1537,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Bind WSS listener (optional)
     let wss_listener = if ports.wss_enabled {
         let addr = format!("0.0.0.0:{}", ports.wss_port);
-        match TcpListener::bind(&addr) {
+        match bind_listener(&addr) {
             Ok(l) => {
                 if let Err(e) = l.set_nonblocking(true) {
                     log!("pgmqtt wss: failed to set non-blocking: {}", e);
@@ -1415,7 +1559,7 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     // Bind HTTP healthcheck listener (optional)
     let http_listener = if ports.http_enabled {
         let addr = format!("0.0.0.0:{}", ports.http_port);
-        match TcpListener::bind(&addr) {
+        match bind_listener(&addr) {
             Ok(l) => {
                 if let Err(e) = l.set_nonblocking(true) {
                     log!("pgmqtt http: failed to set non-blocking: {}", e);
@@ -1485,6 +1629,14 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     let mut outbox_pending = matches!(cdc_mode, CdcMode::Bridged);
     let mut outbox_doorbell_seen: u64 = 0;
     let mut last_outbox_safety_check = std::time::Instant::now();
+    let mut last_outbox_gc = std::time::Instant::now();
+    // Multi-worker delivery cursor over pgmqtt_cdc_outbox (see the Bridged
+    // arm below). Seeded from the cursors table so a restarted worker
+    // resumes where its predecessor durably left off.
+    let mut outbox_cursor: i64 = 0;
+    if multi && matches!(cdc_mode, CdcMode::Bridged) {
+        outbox_cursor = seed_outbox_cursor(slot);
+    }
     // Bridged-mode async-commit state: batches persisted with
     // synchronous_commit=off whose delivery/PUBACKs wait for the WAL flush
     // pointer. Always empty in Standalone mode.
@@ -1514,15 +1666,50 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
         // snappy while cutting the idle query rate ~20x. Done before accept() so
         // a disconnect targeting a session-takeover race lands on the in-flight
         // in-memory state.
-        if last_admin_drain.elapsed() >= Duration::from_millis(100) {
+        if is_primary && last_admin_drain.elapsed() >= Duration::from_millis(100) {
             last_admin_drain = std::time::Instant::now();
             let admin_cmds = crate::admin_commands::drain(64);
             if !admin_cmds.is_empty() {
                 let mut admin_sess_actions = Vec::new();
                 let mut admin_pubs = Vec::new();
                 for cmd in admin_cmds {
+                    // The target client can live in any socket worker: fan
+                    // the command out before executing it locally (drain
+                    // deleted the DB row, so this is the only chance).
+                    if multi {
+                        crate::shmem_bridge::broadcast_command(
+                            slot,
+                            ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed),
+                            &admin_to_worker_command(&cmd),
+                        );
+                    }
                     dispatch_admin_command(
                         cmd,
+                        &mut clients,
+                        &mut admin_pubs,
+                        &mut admin_sess_actions,
+                    );
+                }
+                if !admin_pubs.is_empty() {
+                    publish_messages_batch(admin_pubs, &mut clients, &mut admin_sess_actions);
+                }
+                if !admin_sess_actions.is_empty() {
+                    execute_session_db_actions(admin_sess_actions);
+                }
+            }
+        }
+
+        // Commands the other workers broadcast to us (admin fan-out,
+        // session-takeover kicks). Cheap when empty: one lock, one length
+        // check.
+        if multi {
+            let ring_cmds = crate::shmem_bridge::drain_commands(slot);
+            if !ring_cmds.is_empty() {
+                let mut admin_sess_actions = Vec::new();
+                let mut admin_pubs = Vec::new();
+                for wc in ring_cmds {
+                    dispatch_admin_command(
+                        worker_to_admin_command(wc),
                         &mut clients,
                         &mut admin_pubs,
                         &mut admin_sess_actions,
@@ -1647,7 +1834,8 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                 }
                 if outbox_pending || doorbell != outbox_doorbell_seen {
                     outbox_doorbell_seen = doorbell;
-                    let (outbox_ids, outbox_messages) = fetch_cdc_outbox_batch();
+                    let (outbox_ids, outbox_messages) =
+                        fetch_cdc_outbox_batch(if multi { Some(outbox_cursor) } else { None });
                     // One batch per tick keeps this loop's CDC work bounded
                     // even against a huge backlog (the lesson of the old
                     // unbounded cdc_tick drain); a full fetch means more may
@@ -1664,25 +1852,53 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                         // Oversize-QOS-0 spill rows get no session_messages
                         // tracking (QOS 0 has no PUBACK), so nothing else
                         // would ever reclaim them: clean up right after the
-                        // one delivery attempt.
-                        for msg in &outbox_messages {
-                            if msg.qos == 0 {
-                                if let Some(message_id) = msg.id {
-                                    session_db_actions.push(
-                                        SessionDbAction::CleanupOrphanedMessage { message_id },
-                                    );
+                        // one delivery attempt. (Multi-worker: the slot-0
+                        // GC owns all reclamation instead — another worker
+                        // may not have delivered this row yet.)
+                        if !multi {
+                            for msg in &outbox_messages {
+                                if msg.qos == 0 {
+                                    if let Some(message_id) = msg.id {
+                                        session_db_actions.push(
+                                            SessionDbAction::CleanupOrphanedMessage { message_id },
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                    if !outbox_ids.is_empty() {
-                        // Committed atomically with this tick's delivery
-                        // state (execute_session_db_actions below): a crash
-                        // before that commit leaves the rows queued and they
-                        // are re-fetched and re-delivered — at-least-once.
-                        session_db_actions
-                            .push(SessionDbAction::DrainCdcOutbox { ids: outbox_ids });
+                    if let Some(&max_id) = outbox_ids.last() {
+                        if multi {
+                            // Advance this worker's cursor; rows are shared
+                            // with the other workers and reclaimed by the
+                            // slot-0 GC once every cursor has passed them.
+                            // Committed with this tick's delivery state — a
+                            // crash re-fetches from the old cursor
+                            // (at-least-once), so the local cursor can
+                            // advance immediately.
+                            outbox_cursor = outbox_cursor.max(max_id);
+                            session_db_actions.push(SessionDbAction::AdvanceOutboxCursor {
+                                worker_slot: slot,
+                                last_id: max_id,
+                            });
+                        } else {
+                            // Single worker: committed atomically with this
+                            // tick's delivery state (execute_session_db_actions
+                            // below): a crash before that commit leaves the
+                            // rows queued and they are re-fetched and
+                            // re-delivered — at-least-once.
+                            session_db_actions
+                                .push(SessionDbAction::DrainCdcOutbox { ids: outbox_ids });
+                        }
                     }
+                }
+
+                // Slot-0 housekeeping (multi-worker): reclaim outbox rows
+                // every worker has delivered, and orphaned message rows
+                // along with them.
+                if multi && is_primary && last_outbox_gc.elapsed() >= Duration::from_secs(1) {
+                    last_outbox_gc = std::time::Instant::now();
+                    gc_outbox_below_min_cursor();
                 }
                 // Small QOS 0 messages travel through shared memory only;
                 // draining is a lock + memcpy when the ring is empty, which
@@ -1788,7 +2004,9 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
             process_inbound_pending();
         }
 
-        if last_session_sweep.elapsed() >= Duration::from_millis(500) {
+        // Session expiry sweeps operate on cluster-global DB state — one
+        // owner (slot 0) so workers don't race each other.
+        if is_primary && last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
             last_session_sweep = std::time::Instant::now();
         }
@@ -1807,17 +2025,24 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
 
         // ── Enterprise metrics flush ──────────────────────────────────────────
         if crate::license::has_feature(crate::license::Feature::Metrics) {
+            // Counters are in shared memory, so slot 0 flushes the combined
+            // totals for the whole worker set.
             let snap_interval = crate::get_metrics_snapshot_interval_guc();
-            if snap_interval > 0 && last_metrics_flush.elapsed().as_secs() >= snap_interval as u64 {
+            if is_primary
+                && snap_interval > 0
+                && last_metrics_flush.elapsed().as_secs() >= snap_interval as u64
+            {
                 let snap = crate::metrics::MetricsSnapshot::capture();
                 flush_metrics_snapshot(&snap);
                 last_metrics_flush = std::time::Instant::now();
             }
+            // Every worker maintains its own clients' rows in the cache
+            // (scoped by worker_slot, so flushes don't clobber each other).
             let conn_interval = crate::get_metrics_connections_cache_interval_guc();
             if conn_interval > 0
                 && last_connections_flush.elapsed().as_secs() >= conn_interval as u64
             {
-                flush_connections_cache(&clients);
+                flush_connections_cache(&clients, slot);
                 last_connections_flush = std::time::Instant::now();
             }
         }
@@ -2490,13 +2715,37 @@ fn finish_connect(
                 s.insert(client_id.clone(), old_client.session);
             });
         }
+    } else if multi_worker() {
+        // The old connection (if any) may live in another socket worker:
+        // broadcast a takeover kick (0x8E, Session taken over). A no-op on
+        // workers that don't hold the client; its persisted session state
+        // is resumed from the DB below either way. The old worker's final
+        // session flush can race this resume — a documented multi-worker
+        // caveat, bounded by one tick of that worker.
+        crate::shmem_bridge::broadcast_command(
+            worker_slot(),
+            ACTIVE_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed),
+            &crate::shmem_bridge::WorkerCommand::DisconnectClient {
+                client_id: client_id.clone(),
+                reason: 0x8E,
+            },
+        );
     }
 
     // ── Connection limit enforcement ──────────────────────────────────────────
     // A genuinely new client is rejected when the limit is reached so operators
     // can control memory usage.  Session takeovers (handled above) always proceed.
+    // Multi-worker: the license cap is cluster-wide, so enforce against the
+    // shared connection gauge rather than this worker's local map.
     let limit = crate::license::max_connections();
-    if !clients.contains_key(&client_id) && clients.len() >= limit {
+    let active_connections = if multi_worker() {
+        crate::metrics::get()
+            .connections_current
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+    } else {
+        clients.len()
+    };
+    if !clients.contains_key(&client_id) && active_connections >= limit {
         log!(
             "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
             limit,
@@ -3178,6 +3427,7 @@ fn persist_publish_batch(
     persistent: &[PendingPublish],
     synchronous: bool,
 ) -> (Vec<MqttMessage>, bool) {
+    let multi = multi_worker();
     BackgroundWorker::transaction(|| {
         let mut to_publish = Vec::new();
         pgrx::spi::Spi::connect_mut(|client| {
@@ -3290,6 +3540,24 @@ fn persist_publish_batch(
                     qos: p.qos,
                 });
             }
+
+            // Multi-worker: every persisted publish also goes on the shared
+            // outbox, in this same transaction, so every socket worker's
+            // subscribers see it (this worker included — no direct local
+            // delivery in that topology). Mirrors the CDC worker's enqueue.
+            if multi {
+                let outbox_ids: Vec<i64> =
+                    to_publish.iter().filter_map(|m| m.id).collect();
+                if !outbox_ids.is_empty() {
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![outbox_ids.into()];
+                    client.update(
+                        "INSERT INTO pgmqtt_cdc_outbox (id) SELECT unnest($1::bigint[]) \
+                         ON CONFLICT DO NOTHING",
+                        None,
+                        &args,
+                    )?;
+                }
+            }
             Ok::<_, pgrx::spi::Error>(())
         })?;
         Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
@@ -3335,15 +3603,30 @@ fn publish_messages_batch(
     if pending.is_empty() {
         return;
     }
-    let (persistent, transient) = split_publishes(pending);
+    // Multi-worker: everything (QoS 0 included) is persisted and routed
+    // through the shared outbox so every worker's subscribers see it; no
+    // direct local delivery (this worker picks it up from the outbox like
+    // the rest). An explicit trade: QoS 0 loses its no-DB fast path when
+    // socket_workers > 1.
+    let multi = multi_worker();
+    let (persistent, transient) = if multi {
+        (pending, Vec::new())
+    } else {
+        split_publishes(pending)
+    };
 
     if !persistent.is_empty() {
         let (to_publish, ok) = persist_publish_batch(&persistent, true);
 
         if ok {
-            // Deliver directly to subscribers.
             let mut cascade = Vec::new();
-            deliver_messages(&to_publish, clients, &mut cascade, session_db_actions);
+            if multi {
+                // Delivery flows through the outbox; wake the fetchers.
+                crate::shmem_bridge::ring_outbox_doorbell();
+            } else {
+                // Deliver directly to subscribers.
+                deliver_messages(&to_publish, clients, &mut cascade, session_db_actions);
+            }
 
             // Send PUBACKs only after successful commit — MQTT at-least-once semantics.
             for p in persistent {
@@ -3424,11 +3707,24 @@ fn publish_messages_batch_deferred(
     if pending.is_empty() {
         return;
     }
-    let (persistent, transient) = split_publishes(pending);
+    // See publish_messages_batch: multi-worker routes everything through
+    // the shared outbox instead of delivering locally.
+    let multi = multi_worker();
+    let (persistent, transient) = if multi {
+        (pending, Vec::new())
+    } else {
+        split_publishes(pending)
+    };
 
     if !persistent.is_empty() {
         let (messages, ok) = persist_publish_batch(&persistent, false);
         if ok {
+            if multi {
+                // Rows are visible to all workers' cursor fetches already
+                // (async commit defers only durability, not visibility);
+                // PUBACKs still wait on the flush watermark below.
+                crate::shmem_bridge::ring_outbox_doorbell();
+            }
             let pubacks = persistent
                 .iter()
                 .filter(|p| p.qos == 1)
@@ -3437,7 +3733,7 @@ fn publish_messages_batch_deferred(
             deferred.push_back(DeferredRelease {
                 watermark: capture_wal_insert_watermark(),
                 queued_at: std::time::Instant::now(),
-                messages,
+                messages: if multi { Vec::new() } else { messages },
                 pubacks,
             });
         }
@@ -3935,8 +4231,15 @@ fn handle_mqtt_packet(
 
             // Optimization: skip all processing if no one is listening, not
             // retained, and no QoS 1 inbound mappings need durable tracking.
+            // Single-worker topologies only: the subscription tree is
+            // per-worker, so with socket_workers > 1 "no subscribers here"
+            // says nothing about the other workers — every publish must go
+            // through the shared outbox and the slot-0 GC reclaims the ones
+            // nobody anywhere wanted. (Skipping here with a subscriber on
+            // another worker silently dropped the message: PUBACK with no
+            // delivery, caught by the cross-worker perf runs.)
             let has_subs = subscriptions::has_subscribers(&pub_pkt.topic);
-            if !pub_pkt.retain && !has_subs && inbound_mapping_names.is_empty() {
+            if !multi_worker() && !pub_pkt.retain && !has_subs && inbound_mapping_names.is_empty() {
                 if pub_pkt.qos == 1 {
                     if let Some(pid) = pub_pkt.packet_id {
                         log!(
@@ -4033,13 +4336,96 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
 /// tables are deliberately not FK-linked) is still returned in the id list
 /// so the caller's `DrainCdcOutbox` reaps it instead of re-scanning it
 /// forever.
-fn fetch_cdc_outbox_batch() -> (Vec<i64>, Vec<MqttMessage>) {
+/// Ensure this worker has a cursor row and return its position. A brand-new
+/// slot starts at the minimum of the existing cursors (never behind the GC
+/// watermark, so it can't be handed already-reclaimed rows); the very first
+/// boot starts everyone at 0. Serialized under the startup advisory lock
+/// like every other worker-startup write.
+fn seed_outbox_cursor(slot: i32) -> i64 {
+    BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            let _ = client.select(
+                &format!(
+                    "SELECT pg_advisory_xact_lock({})",
+                    crate::SCHEMA_MIGRATION_LOCK_KEY
+                ),
+                None,
+                &[],
+            );
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![slot.into()];
+            client.update(
+                "INSERT INTO pgmqtt_outbox_cursors (worker_slot, last_id) \
+                 VALUES ($1, COALESCE((SELECT MIN(last_id) FROM pgmqtt_outbox_cursors), 0)) \
+                 ON CONFLICT (worker_slot) DO NOTHING",
+                None,
+                &args,
+            )?;
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![slot.into()];
+            client
+                .select(
+                    "SELECT last_id FROM pgmqtt_outbox_cursors WHERE worker_slot = $1",
+                    None,
+                    &args,
+                )?
+                .first()
+                .get_one::<i64>()
+        })
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+}
+
+/// Slot-0 GC (multi-worker): delete outbox rows every worker's cursor has
+/// passed, reclaiming orphaned message rows (no session_messages /
+/// retained / inbound references) along the way — this replaces the
+/// per-delivery cleanup that a single worker can do safely but N workers
+/// cannot. Bounded per pass; runs on a ~1s cadence.
+fn gc_outbox_below_min_cursor() {
+    BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            let swept = client.update(
+                &format!(
+                    "DELETE FROM pgmqtt_cdc_outbox \
+                     WHERE id IN (\
+                         SELECT id FROM pgmqtt_cdc_outbox \
+                         WHERE id <= (SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors) \
+                         ORDER BY id LIMIT {}) \
+                     RETURNING id",
+                    cdc_worker::CDC_BATCH_SIZE
+                ),
+                None,
+                &[],
+            )?;
+            let ids: Vec<i64> = swept
+                .into_iter()
+                .filter_map(|row| row.get_by_name::<i64, _>("id").ok().flatten())
+                .collect();
+            for id in ids {
+                let _ = db_action::cleanup_orphaned_message(client, id);
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        })
+    })
+    .unwrap_or_else(|e| {
+        log!("pgmqtt: outbox GC failed: {}", e);
+    });
+}
+
+fn fetch_cdc_outbox_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
+    // `after`: multi-worker cursor mode — rows stay for the other workers
+    // and are reclaimed by the slot-0 GC. `None`: single-worker mode — the
+    // caller deletes delivered ids.
     let query = format!(
         "SELECT o.id, m.topic, m.payload, m.qos \
          FROM pgmqtt_cdc_outbox o \
          LEFT JOIN pgmqtt_messages m ON m.id = o.id \
+         {} \
          ORDER BY o.id \
          LIMIT {}",
+        after
+            .map(|c| format!("WHERE o.id > {}", c))
+            .unwrap_or_default(),
         cdc_worker::CDC_BATCH_SIZE
     );
     BackgroundWorker::transaction(|| {
@@ -4110,9 +4496,14 @@ fn deliver_messages(
             // this (it has no subscriber visibility across the process
             // boundary), so this is the one place left to close the loop —
             // cleanup_orphaned_message() is a no-op if it's retained or
-            // referenced elsewhere.
-            if let Some(message_id) = msg.id {
-                session_db_actions.push(SessionDbAction::CleanupOrphanedMessage { message_id });
+            // referenced elsewhere. Multi-worker: "no subscribers HERE"
+            // doesn't mean orphaned — another worker may still deliver it;
+            // the slot-0 outbox GC reclaims instead.
+            if !multi_worker() {
+                if let Some(message_id) = msg.id {
+                    session_db_actions
+                        .push(SessionDbAction::CleanupOrphanedMessage { message_id });
+                }
             }
         }
 
@@ -4622,7 +5013,7 @@ fn flush_metrics_snapshot(snap: &crate::metrics::MetricsSnapshot) {
 /// Uses INSERT ... ON CONFLICT DO UPDATE to upsert live clients, then deletes
 /// stale rows whose `cached_at_unix` wasn't touched this cycle.  This avoids
 /// the dead-tuple churn of DELETE-all + re-INSERT on every flush interval.
-fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
+fn flush_connections_cache(clients: &HashMap<String, MqttClient>, slot: i32) {
     use pgrx::datum::DatumWithOid;
 
     let now_unix = crate::license::now_secs();
@@ -4719,17 +5110,19 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                 inflight_count.into(),
                 will_set.into(),
                 now_unix.into(),
+                slot.into(),
             ];
             // One round-trip regardless of client count: every column is a PG array
-            // unrolled by UNNEST.  $14 (cached_at_unix) is broadcast to every row.
+            // unrolled by UNNEST.  $14 (cached_at_unix) and $15 (worker_slot) are
+            // broadcast to every row.
             const UPSERT_SQL: &str = "\
                 INSERT INTO pgmqtt_connections_cache \
                  (client_id,transport,connected_at_unix,last_activity_at_unix,\
                   keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
-                  subscriptions,queue_depth,inflight_count,will_set,cached_at_unix) \
+                  subscriptions,queue_depth,inflight_count,will_set,cached_at_unix,worker_slot) \
                  SELECT client_id,transport,connected_at_unix,last_activity_at_unix,\
                   keep_alive_secs,msgs_received,msgs_sent,bytes_received,bytes_sent,\
-                  subscriptions,queue_depth,inflight_count,will_set,$14 \
+                  subscriptions,queue_depth,inflight_count,will_set,$14,$15 \
                  FROM UNNEST($1::text[],$2::text[],$3::bigint[],$4::bigint[],\
                   $5::int[],$6::bigint[],$7::bigint[],$8::bigint[],$9::bigint[],\
                   $10::int[],$11::int[],$12::int[],$13::bool[]) \
@@ -4749,14 +5142,16 @@ fn flush_connections_cache(clients: &HashMap<String, MqttClient>) {
                   queue_depth=EXCLUDED.queue_depth,\
                   inflight_count=EXCLUDED.inflight_count,\
                   will_set=EXCLUDED.will_set,\
-                  cached_at_unix=EXCLUDED.cached_at_unix";
+                  cached_at_unix=EXCLUDED.cached_at_unix,\
+                  worker_slot=EXCLUDED.worker_slot";
             if let Err(e) = spi.update(UPSERT_SQL, None, &upsert_args) {
                 pgrx::log!("pgmqtt metrics: failed to upsert connections cache: {}", e);
             }
-            // Remove rows for clients that disconnected since the last flush.
-            let stale_args: Vec<DatumWithOid> = vec![now_unix.into()];
+            // Remove rows for clients that disconnected since the last flush
+            // — but only this worker's rows; the other slots prune their own.
+            let stale_args: Vec<DatumWithOid> = vec![now_unix.into(), slot.into()];
             if let Err(e) = spi.update(
-                "DELETE FROM pgmqtt_connections_cache WHERE cached_at_unix < $1",
+                "DELETE FROM pgmqtt_connections_cache WHERE cached_at_unix < $1 AND worker_slot = $2",
                 None,
                 &stale_args,
             ) {

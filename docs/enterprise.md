@@ -370,6 +370,24 @@ The WAL flush itself is driven from off the socket loop: under CDC or inbound lo
 
 This is only sound because of the process split: in the single-worker topology the inline CDC batch commits are synchronous and would force catch-up flushes on the same loop anyway, so community mode keeps plain synchronous commits.
 
+### Scaling out: multiple socket workers
+
+`pgmqtt.socket_workers` (1–8, default 1; requires restart) runs several `pgmqtt_mqtt` processes. Listeners share the same ports via `SO_REUSEPORT`, so the kernel load-balances incoming connections across the workers; each worker owns its clients' sockets, sessions, and subscription matching. The readiness-based polling means each worker's per-tick cost scales with its *active* clients, so N workers raise both the connection ceiling and the aggregate socket throughput.
+
+How the workers stay coherent:
+
+- **All publishes route through the shared outbox** — client publishes (QoS 0 included) and CDC messages alike — and each worker delivers rows past its own cursor (`pgmqtt_outbox_cursors`) to its own subscribers. Slot 0 garbage-collects rows once every cursor has passed them, reclaiming orphaned messages at the same time. This is the explicit trade: QoS 0 gives up its no-database fast path when `socket_workers > 1`.
+- **Session takeover broadcasts a kick** through shared memory: a new CONNECT with an existing client_id disconnects the old connection whichever worker holds it (reason 0x8E), and the session resumes from its persisted state.
+- **Admin commands fan out**: slot 0 drains `pgmqtt_admin_commands` and broadcasts each command to every worker, so disconnects and ACL reloads reach clients wherever they live.
+- **Slot 0 owns the singleton duties**: metrics flush (counters are in shared memory, so the totals cover all workers), session-expiry sweeps, outbox GC. The connection cap from the license is enforced against the cluster-wide connection gauge. The HTTP healthcheck is answered by whichever worker the kernel picks — a 200 means "a worker's loop is ticking".
+
+v1 caveats, deliberate and documented:
+
+- **Shared subscriptions (`$share`)** balance within each worker, not globally.
+- **A crashed socket worker's sessions** stay "connected" in `pgmqtt_sessions` until their clients reconnect (only a full PostgreSQL restart resets all sessions).
+- **QoS 1 PUBACK and delivery latency** gain the outbox round trip (~1–2 ticks) relative to a single socket worker; QoS 0 end-to-end roughly doubles (measured ~12 ms vs ~5.5 ms at defaults).
+- A **retained-message replacement** can reclaim the previous message row before a lagging worker delivered it (window of one cursor lag, typically milliseconds).
+
 ### Restart required
 
 Process topology is decided **once, at PostgreSQL startup**: background workers can only be registered while the server is starting, so `_PG_init` reads `pgmqtt.license_key` at that moment to decide whether to register the second worker. `ALTER SYSTEM SET pgmqtt.license_key` + `pg_reload_conf()` updates the license for every runtime feature check, but adding or removing `multiprocess` only takes effect after a **full PostgreSQL restart**. Until then the broker keeps its current topology.

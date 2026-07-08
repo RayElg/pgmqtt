@@ -76,6 +76,15 @@ pub(crate) enum CdcQueueMode {
 ///   synchronous commit that group-flushes everything (see
 ///   `crate::shmem_bridge::request_wal_flush`).
 pub fn run_cdc(slot_name: &str) {
+    // Record the boot topology in this process too: the QoS 0 routing
+    // below consults it (multi-worker sends everything through the
+    // outbox). -1 marks "not a socket worker" — this process never drains
+    // a command ring or owns an outbox cursor.
+    super::ACTIVE_WORKER_SLOT.store(-1, std::sync::atomic::Ordering::Relaxed);
+    super::ACTIVE_SOCKET_WORKERS.store(
+        crate::socket_worker_count(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     super::setup_replication_origin("pgmqtt_cdc");
 
     let mut tick: u64 = 0;
@@ -454,13 +463,17 @@ pub(crate) fn cdc_tick_core(
                                 // A QOS 0 message too large for the shared-memory
                                 // ring takes the persisted outbox path instead of
                                 // being dropped; the delivery worker reclaims the
-                                // row after the one delivery attempt.
+                                // row after the one delivery attempt. With several
+                                // socket workers, ALL QoS 0 goes through the outbox
+                                // — the inline ring has a single consumer, and the
+                                // outbox is the one medium every worker reads.
                                 let spill_qos0 = matches!(mode, CdcQueueMode::OutboxQos1)
                                     && rendered.qos == 0
-                                    && !crate::shmem_bridge::fits_inline(
-                                        &rendered.topic,
-                                        &rendered.payload,
-                                    );
+                                    && (crate::server::multi_worker()
+                                        || !crate::shmem_bridge::fits_inline(
+                                            &rendered.topic,
+                                            &rendered.payload,
+                                        ));
 
                                 if rendered.qos > 0 || spill_qos0 {
                                     // Persist within this transaction — committed atomically

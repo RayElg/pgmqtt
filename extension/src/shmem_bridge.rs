@@ -111,6 +111,175 @@ pub fn take_wal_flush_request() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-worker command rings (socket_workers > 1)
+// ---------------------------------------------------------------------------
+//
+// With several socket workers, a client's connection can live in any of
+// them, so two things need a cross-worker control path: session takeover
+// (a new CONNECT with an existing client_id must disconnect the old
+// connection wherever it is) and admin commands (slot 0 drains the
+// pgmqtt_admin_commands table and fans the command out — disconnects and
+// ACL reloads must reach every worker's local clients). Commands are tiny
+// and rare, so a small fixed ring per worker suffices; on overflow the
+// oldest command is dropped with a log line — a lost takeover kick
+// self-heals via keepalive timeout, and admin commands can be re-issued.
+
+const CMD_RING_CAPACITY: usize = 256;
+const CMD_ARG_CAP: usize = 128;
+const MAX_RINGS: usize = crate::MAX_SOCKET_WORKERS as usize;
+
+/// Decoded cross-worker command (mirrors `admin_commands::Command`).
+pub enum WorkerCommand {
+    DisconnectClient { client_id: String, reason: u8 },
+    DisconnectRole { role_name: String, reason: u8 },
+    ReloadAcls { target: String },
+}
+
+#[derive(Copy, Clone)]
+struct CmdSlot {
+    op: u8,
+    reason: u8,
+    arg_len: u16,
+    arg: [u8; CMD_ARG_CAP],
+}
+
+impl Default for CmdSlot {
+    fn default() -> Self {
+        Self {
+            op: 0,
+            reason: 0,
+            arg_len: 0,
+            arg: [0u8; CMD_ARG_CAP],
+        }
+    }
+}
+
+unsafe impl pgrx::PGRXSharedMemory for CmdSlot {}
+
+#[derive(Copy, Clone)]
+struct CmdRing {
+    slots: [CmdSlot; CMD_RING_CAPACITY],
+    head: u32,
+    len: u32,
+}
+
+impl Default for CmdRing {
+    fn default() -> Self {
+        Self {
+            slots: [CmdSlot::default(); CMD_RING_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+unsafe impl pgrx::PGRXSharedMemory for CmdRing {}
+
+#[derive(Copy, Clone)]
+struct CmdRings {
+    rings: [CmdRing; MAX_RINGS],
+}
+
+impl Default for CmdRings {
+    fn default() -> Self {
+        Self {
+            rings: [CmdRing::default(); MAX_RINGS],
+        }
+    }
+}
+
+unsafe impl pgrx::PGRXSharedMemory for CmdRings {}
+
+static CMD_RINGS: PgLwLock<CmdRings> = unsafe { PgLwLock::new(c"pgmqtt_bridge_cmd_rings") };
+
+fn encode(cmd: &WorkerCommand) -> Option<CmdSlot> {
+    let (op, reason, arg): (u8, u8, &str) = match cmd {
+        WorkerCommand::DisconnectClient { client_id, reason } => (0, *reason, client_id),
+        WorkerCommand::DisconnectRole { role_name, reason } => (1, *reason, role_name),
+        WorkerCommand::ReloadAcls { target } => (2, 0, target),
+    };
+    if arg.len() > CMD_ARG_CAP {
+        pgrx::log!(
+            "pgmqtt: cross-worker command argument too long ({} bytes, cap {}) — not forwarded",
+            arg.len(),
+            CMD_ARG_CAP
+        );
+        return None;
+    }
+    let mut slot = CmdSlot {
+        op,
+        reason,
+        arg_len: arg.len() as u16,
+        ..Default::default()
+    };
+    slot.arg[..arg.len()].copy_from_slice(arg.as_bytes());
+    Some(slot)
+}
+
+fn decode(slot: &CmdSlot) -> Option<WorkerCommand> {
+    let arg = String::from_utf8_lossy(&slot.arg[..slot.arg_len as usize]).into_owned();
+    match slot.op {
+        0 => Some(WorkerCommand::DisconnectClient {
+            client_id: arg,
+            reason: slot.reason,
+        }),
+        1 => Some(WorkerCommand::DisconnectRole {
+            role_name: arg,
+            reason: slot.reason,
+        }),
+        2 => Some(WorkerCommand::ReloadAcls { target: arg }),
+        _ => None,
+    }
+}
+
+/// Queue `cmd` for every socket worker except `exclude_slot` (pass -1 to
+/// include all). Drops the oldest queued command per ring on overflow.
+pub fn broadcast_command(exclude_slot: i32, workers: i32, cmd: &WorkerCommand) {
+    let Some(encoded) = encode(cmd) else { return };
+    let workers = (workers.clamp(1, MAX_RINGS as i32)) as usize;
+    let mut rings = CMD_RINGS.exclusive();
+    for slot_idx in 0..workers {
+        if slot_idx as i32 == exclude_slot {
+            continue;
+        }
+        let ring = &mut rings.rings[slot_idx];
+        if ring.len as usize >= CMD_RING_CAPACITY {
+            ring.head = (ring.head + 1) % CMD_RING_CAPACITY as u32;
+            ring.len -= 1;
+            pgrx::log!(
+                "pgmqtt: cross-worker command ring for slot {} overflowed — oldest dropped",
+                slot_idx
+            );
+        }
+        let tail = (ring.head + ring.len) % CMD_RING_CAPACITY as u32;
+        ring.slots[tail as usize] = encoded;
+        ring.len += 1;
+    }
+}
+
+/// Drain every command queued for `slot`, in FIFO order.
+pub fn drain_commands(slot: i32) -> Vec<WorkerCommand> {
+    if slot < 0 || slot as usize >= MAX_RINGS {
+        return Vec::new();
+    }
+    let mut rings = CMD_RINGS.exclusive();
+    let ring = &mut rings.rings[slot as usize];
+    if ring.len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(ring.len as usize);
+    for i in 0..ring.len {
+        let idx = (ring.head + i) % CMD_RING_CAPACITY as u32;
+        if let Some(cmd) = decode(&ring.slots[idx as usize]) {
+            out.push(cmd);
+        }
+    }
+    ring.head = 0;
+    ring.len = 0;
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Inline ring (QoS 0, never persisted)
 // ---------------------------------------------------------------------------
 
@@ -218,4 +387,5 @@ pub fn init() {
     pg_shmem_init!(OUTBOX_DOORBELL);
     pg_shmem_init!(FLUSH_REQUEST);
     pg_shmem_init!(INLINE_RING);
+    pg_shmem_init!(CMD_RINGS);
 }

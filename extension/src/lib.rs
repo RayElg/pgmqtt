@@ -92,6 +92,23 @@ static MQTTS_PORT: GucSetting<i32> = GucSetting::<i32>::new(8883);
 static WSS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9002);
 static HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(8080);
 
+/// Number of `pgmqtt_mqtt` socket workers (enterprise `multiprocess`
+/// only; forced to 1 otherwise). Like the license-gated topology itself,
+/// this is read once in `_PG_init` — background workers can only be
+/// registered at postmaster start, so changing it requires a full
+/// PostgreSQL restart.
+static SOCKET_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub(crate) const MAX_SOCKET_WORKERS: i32 = 8;
+
+/// The effective socket-worker count for this postmaster boot.
+pub(crate) fn socket_worker_count() -> i32 {
+    if crate::license::has_feature(crate::license::Feature::MultiProcess) {
+        SOCKET_WORKERS.get().clamp(1, MAX_SOCKET_WORKERS)
+    } else {
+        1
+    }
+}
+
 static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
@@ -1286,6 +1303,16 @@ pub unsafe extern "C" fn _PG_init() {
         GucFlags::SUPERUSER_ONLY,
     );
     GucRegistry::define_int_guc(
+        c"pgmqtt.socket_workers",
+        c"Number of pgmqtt_mqtt socket worker processes (enterprise multiprocess; requires restart)",
+        c"",
+        &SOCKET_WORKERS,
+        1,
+        MAX_SOCKET_WORKERS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
         c"pgmqtt.ws_port",
         c"MQTT WebSocket port",
         c"",
@@ -1546,13 +1573,27 @@ pub unsafe extern "C" fn _PG_init() {
         crate::shmem_bridge::init();
     }
 
-    BackgroundWorkerBuilder::new("pgmqtt_mqtt")
-        .set_function("pgmqtt_mqtt_worker_main")
-        .set_library("pgmqtt")
-        .enable_spi_access()
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(5)))
-        .load();
+    // One or more socket workers. Slot 0 is named "pgmqtt_mqtt" and owns
+    // the singleton duties (HTTP healthcheck, metrics flush, sweeps,
+    // outbox GC); slots 1+ are pure socket/delivery workers sharing the
+    // same ports via SO_REUSEPORT. The slot index travels as the BGW main
+    // argument.
+    let socket_workers = socket_worker_count();
+    for slot in 0..socket_workers {
+        let name = if slot == 0 {
+            "pgmqtt_mqtt".to_string()
+        } else {
+            format!("pgmqtt_mqtt_{}", slot)
+        };
+        BackgroundWorkerBuilder::new(&name)
+            .set_function("pgmqtt_mqtt_worker_main")
+            .set_library("pgmqtt")
+            .enable_spi_access()
+            .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .set_argument(slot.into_datum())
+            .load();
+    }
 
     if multiprocess {
         BackgroundWorkerBuilder::new("pgmqtt_cdc")
@@ -1612,30 +1653,34 @@ fn ensure_replication_slot(slot_name: &str) {
 
 #[pg_guard]
 #[no_mangle]
-pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(_arg: pg_sys::Datum) {
+pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
     let db_name = get_database_guc();
+    let worker_slot = i32::from_datum(arg, false).unwrap_or(0);
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
 
-    // Re-derives the same topology decision _PG_init made when it decided
-    // whether to register a second "pgmqtt_cdc" worker — both reads see the
-    // same GUC snapshot from this postmaster boot, so they always agree.
+    // Re-derives the same topology decisions _PG_init made when it
+    // registered the workers — both reads see the same GUC snapshot from
+    // this postmaster boot, so they always agree.
     let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
+    let socket_workers = socket_worker_count();
     pgrx::log!(
-        "pgmqtt mqtt: starting ({}), connected to '{}'",
+        "pgmqtt mqtt: starting ({}, slot {}/{}), connected to '{}'",
         if multiprocess {
             "multi-process, delivery-only"
         } else {
             "standalone"
         },
+        worker_slot,
+        socket_workers,
         db_name
     );
 
     // Ensure tables exist. In multiprocess mode also called by
     // pgmqtt_cdc_worker_main at its own startup (both idempotent, CREATE ...
-    // IF NOT EXISTS, and serialized by an advisory lock) since the two
-    // workers can start in either order.
+    // IF NOT EXISTS, and serialized by an advisory lock) since the workers
+    // can start in any order.
     BackgroundWorker::transaction(|| {
         ensure_tables_exist();
     });
@@ -1643,12 +1688,12 @@ pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(_arg: pg_sys::Datum) {
     let ports = get_port_gucs();
     if multiprocess {
         // CDC slot consumption happens in the separate pgmqtt_cdc worker;
-        // this loop only delivers whatever it queues via crate::shmem_bridge.
-        server::run_delivery(ports);
+        // this loop delivers what it queues (outbox + shmem bridge).
+        server::run_delivery(ports, worker_slot, socket_workers);
     } else {
         // Community: no second worker — own the replication slot and tick
         // CDC inline, in this same process, exactly like the original
-        // combined-worker design.
+        // combined-worker design. socket_workers is always 1 here.
         let slot_name = "pgmqtt_slot";
         BackgroundWorker::transaction(|| {
             ensure_replication_slot(slot_name);

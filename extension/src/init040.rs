@@ -32,6 +32,22 @@ pub fn init_040() {
         "CREATE TABLE IF NOT EXISTS pgmqtt_cdc_outbox (id bigint PRIMARY KEY)",
         "create pgmqtt_cdc_outbox",
     );
+    // With socket_workers > 1, delivery switches from delete-on-delivery to
+    // per-worker cursors over the outbox: each worker delivers rows past its
+    // own cursor to its own subscribers, and slot 0 garbage-collects rows
+    // below min(last_id) (reclaiming orphaned messages at the same time).
+    run_ddl(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_outbox_cursors (\
+             worker_slot int PRIMARY KEY, \
+             last_id bigint NOT NULL DEFAULT 0)",
+        "create pgmqtt_outbox_cursors",
+    );
+    // Ownership column so each socket worker maintains only its own rows in
+    // the (UNLOGGED, rebuildable) connections cache.
+    run_ddl(
+        "ALTER TABLE pgmqtt_connections_cache ADD COLUMN IF NOT EXISTS worker_slot int NOT NULL DEFAULT 0",
+        "add worker_slot to connections_cache",
+    );
     run_ddl(
         "ALTER TABLE pgmqtt_metrics_current   ADD COLUMN IF NOT EXISTS cdc_bridge_dropped bigint NOT NULL DEFAULT 0",
         "add cdc_bridge_dropped to metrics_current",

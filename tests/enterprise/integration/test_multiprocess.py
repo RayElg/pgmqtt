@@ -56,11 +56,19 @@ def _image_available() -> bool:
 class Broker:
     """A dedicated pgmqtt container with known host ports."""
 
-    def __init__(self, name: str, pg_port: int, mqtt_port: int, license_token: str | None):
+    def __init__(
+        self,
+        name: str,
+        pg_port: int,
+        mqtt_port: int,
+        license_token: str | None,
+        extra_conf: list | None = None,
+    ):
         self.name = name
         self.pg_port = pg_port
         self.mqtt_port = mqtt_port
         self.license_token = license_token
+        self.extra_conf = extra_conf or []
 
     def start(self):
         subprocess.call(
@@ -81,6 +89,8 @@ class Broker:
             # any SQL session exists, so ALTER SYSTEM after boot is too late
             # to affect worker registration.
             cmd += ["-c", f"pgmqtt.license_key={self.license_token}"]
+        for conf in self.extra_conf:
+            cmd += ["-c", conf]
         subprocess.check_call(cmd)
         self._wait_pg()
         self._wait_mqtt()
@@ -435,6 +445,163 @@ def test_multiprocess_inbound_pump_runs_in_cdc_worker(enterprise_broker):
             break
         time.sleep(0.5)
     assert pending == 0, f"pgmqtt_inbound_pending not drained: {pending}"
+
+
+@pytest.fixture(scope="module")
+def multi_broker():
+    """Enterprise broker with two socket workers (SO_REUSEPORT sharding)."""
+    if not _image_available():
+        pytest.skip(f"docker image {IMAGE} not available")
+    token = generate_test_license(
+        customer="mw-test", days=1, features=["multiprocess", "metrics"]
+    )
+    broker = Broker(
+        "pgmqtt-test-multiworker",
+        15495,
+        11895,
+        token,
+        extra_conf=["pgmqtt.socket_workers=2"],
+    )
+    broker.start()
+    yield broker
+    broker.stop()
+
+
+def test_multiworker_topology(multi_broker):
+    workers = multi_broker.worker_types()
+    assert {"pgmqtt_mqtt", "pgmqtt_mqtt_1", "pgmqtt_cdc"} <= workers, workers
+
+    origins = {r[0] for r in multi_broker.sql("SELECT roname FROM pg_replication_origin")}
+    assert {"pgmqtt_mqtt", "pgmqtt_mqtt_1", "pgmqtt_cdc"} <= origins, origins
+
+    cursors = multi_broker.sql(
+        "SELECT worker_slot FROM pgmqtt_outbox_cursors ORDER BY worker_slot"
+    )
+    assert [r[0] for r in cursors] == [0, 1], cursors
+
+
+def test_multiworker_cross_worker_pubsub(multi_broker):
+    """Publishes must reach subscribers regardless of which worker the
+    kernel assigned each connection to: everything routes through the
+    shared outbox. Several connections make it overwhelmingly likely both
+    workers hold some of them."""
+    subs = []
+    pubs = []
+    try:
+        for i in range(3):
+            s = multi_broker.connect_mqtt(f"xw-sub-{i}")
+            _subscribe(s, 1, "xw/#", qos=1)
+            subs.append(s)
+        for i in range(4):
+            pubs.append(multi_broker.connect_mqtt(f"xw-pub-{i}"))
+
+        expected = set()
+        for i, pub in enumerate(pubs):
+            pub.sendall(
+                create_publish_packet(f"xw/q1/{i}", f"m{i}".encode(), qos=1, packet_id=10 + i)
+            )
+            expected.add((f"xw/q1/{i}", f"m{i}".encode(), 1))
+            pub.sendall(create_publish_packet(f"xw/q0/{i}", f"z{i}".encode(), qos=0))
+            expected.add((f"xw/q0/{i}", f"z{i}".encode(), 0))
+
+        for i, pub in enumerate(pubs):
+            puback = recv_packet(pub, timeout=15.0)
+            assert puback is not None, f"publisher {i}: no PUBACK"
+            validate_puback(puback, 10 + i)
+
+        for i, sub in enumerate(subs):
+            got = set(_collect_publishes(sub, expect=len(expected), timeout=30.0))
+            assert got == expected, f"subscriber {i} missing: {expected - got}"
+    finally:
+        for s in subs + pubs:
+            s.close()
+
+
+def test_multiworker_isolated_pair_delivery(multi_broker):
+    """One subscriber, one publisher, a topic nobody else subscribes to —
+    repeated so kernel placement splits the pair across workers in some
+    rounds. Regression for the 'no local subscribers' fast path silently
+    dropping cross-worker publishes (PUBACK with no delivery)."""
+    for i in range(6):
+        sub = multi_broker.connect_mqtt(f"iso-sub-{i}")
+        pub = multi_broker.connect_mqtt(f"iso-pub-{i}")
+        try:
+            _subscribe(sub, 1, f"iso/{i}", qos=1)
+            pub.sendall(
+                create_publish_packet(f"iso/{i}", f"p{i}".encode(), qos=1, packet_id=40 + i)
+            )
+            puback = recv_packet(pub, timeout=15.0)
+            assert puback is not None, f"pair {i}: no PUBACK"
+            validate_puback(puback, 40 + i)
+            got = _collect_publishes(sub, expect=1, timeout=15.0)
+            assert len(got) == 1 and got[0] == (f"iso/{i}", f"p{i}".encode(), 1), (
+                f"pair {i}: publish not delivered (cross-worker drop): {got}"
+            )
+        finally:
+            sub.close()
+            pub.close()
+
+
+def test_multiworker_cdc_delivery(multi_broker):
+    _setup_cdc_fixture_table(multi_broker)
+    sub = multi_broker.connect_mqtt("xw-cdc-sub")
+    try:
+        _subscribe(sub, 1, "mp/#", qos=1)
+        multi_broker.sql("INSERT INTO mp_events (name, val) VALUES ('xw', 'multi-worker')")
+        got = _collect_publishes(sub, expect=2)
+    finally:
+        sub.close()
+    topics = {t for (t, _p, _q) in got}
+    assert topics == {"mp/q1/xw", "mp/q0/xw"}, got
+
+
+def test_multiworker_session_takeover(multi_broker):
+    """A second CONNECT with the same client_id must disconnect the first
+    connection even when the two land on different workers (broadcast
+    kick). Placement is kernel-chosen, so this exercises the cross-worker
+    path probabilistically and the in-process path otherwise — both must
+    behave identically."""
+    first = multi_broker.connect_mqtt("xw-takeover")
+    second = multi_broker.connect_mqtt("xw-takeover")
+    try:
+        # The first connection should observe a DISCONNECT or EOF shortly.
+        deadline = time.time() + 10
+        closed = False
+        while time.time() < deadline and not closed:
+            p = recv_packet(first, timeout=2.0)
+            if p is None:
+                continue
+            ptype = (p[0] & 0xF0) >> 4
+            if ptype == MQTTControlPacket.DISCONNECT or len(p) == 0:
+                closed = True
+        if not closed:
+            # EOF manifests as recv_packet returning None forever; probe by
+            # checking the socket is actually closed.
+            first.settimeout(2.0)
+            try:
+                closed = first.recv(1) == b""
+            except (TimeoutError, OSError):
+                closed = False
+        assert closed, "old connection was not kicked on takeover"
+
+        # The new connection must be fully functional.
+        _subscribe(second, 1, "xwt/#", qos=1)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_multiworker_outbox_gc(multi_broker):
+    """After traffic quiesces, every worker's cursor passes the last row
+    and the slot-0 GC empties the outbox."""
+    deadline = time.time() + 30
+    remaining = None
+    while time.time() < deadline:
+        remaining = multi_broker.sql("SELECT count(*) FROM pgmqtt_cdc_outbox")[0][0]
+        if remaining == 0:
+            break
+        time.sleep(1)
+    assert remaining == 0, f"outbox not garbage-collected: {remaining} rows left"
 
 
 def test_community_boot_single_worker(community_broker):

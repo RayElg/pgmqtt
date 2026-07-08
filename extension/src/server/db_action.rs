@@ -119,12 +119,22 @@ pub enum SessionDbAction {
         message_id: i64,
     },
     /// Remove delivered ids from `pgmqtt_cdc_outbox` (enterprise
-    /// multiprocess). Queued in the same tick that delivered the messages,
-    /// so the dequeue commits atomically with the delivery state — if this
-    /// transaction never commits, the ids stay queued and the messages are
-    /// re-fetched and re-delivered (at-least-once).
+    /// multiprocess, single socket worker). Queued in the same tick that
+    /// delivered the messages, so the dequeue commits atomically with the
+    /// delivery state — if this transaction never commits, the ids stay
+    /// queued and the messages are re-fetched and re-delivered
+    /// (at-least-once).
     DrainCdcOutbox {
         ids: Vec<i64>,
+    },
+    /// Multi-worker counterpart of `DrainCdcOutbox`: rows are shared with
+    /// the other socket workers, so instead of deleting, advance this
+    /// worker's delivery cursor (slot-0 GC reclaims rows below the minimum
+    /// cursor). GREATEST() keeps a delayed/replayed action from moving the
+    /// cursor backwards.
+    AdvanceOutboxCursor {
+        worker_slot: i32,
+        last_id: i64,
     },
 }
 
@@ -363,6 +373,26 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
                             pgrx::log!(
                                 "pgmqtt: failed to dequeue {} delivered CDC outbox ids: {}",
                                 count, e
+                            );
+                        }
+                    }
+                    SessionDbAction::AdvanceOutboxCursor {
+                        worker_slot,
+                        last_id,
+                    } => {
+                        let args: Vec<DatumWithOid> =
+                            vec![worker_slot.into(), last_id.into()];
+                        if let Err(e) = client.update(
+                            "UPDATE pgmqtt_outbox_cursors \
+                             SET last_id = GREATEST(last_id, $2) \
+                             WHERE worker_slot = $1",
+                            None,
+                            &args,
+                        ) {
+                            crate::metrics::inc(&m.db_message_errors);
+                            pgrx::log!(
+                                "pgmqtt: failed to advance outbox cursor for slot {}: {}",
+                                worker_slot, e
                             );
                         }
                     }

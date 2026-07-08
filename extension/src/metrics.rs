@@ -7,7 +7,6 @@
 // so both must already be in scope at the call site — hence the prelude import.
 use pgrx::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 /// Broker-level metric counters (lock-free atomics, `Relaxed` ordering).
 pub struct BrokerMetrics {
@@ -94,10 +93,24 @@ impl BrokerMetrics {
     }
 }
 
-static METRICS: OnceLock<BrokerMetrics> = OnceLock::new();
+unsafe impl pgrx::PGRXSharedMemory for BrokerMetrics {}
+
+impl Default for BrokerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Broker counters live in PostgreSQL shared memory: with
+/// `pgmqtt.socket_workers > 1` several socket workers increment them
+/// concurrently and slot 0 flushes the combined totals; it also makes
+/// `connections_current` a cluster-wide gauge (used for license
+/// connection-cap enforcement) and lets SQL backends read live values.
+static METRICS: pgrx::PgAtomic<BrokerMetrics> =
+    unsafe { pgrx::PgAtomic::new(c"pgmqtt_broker_metrics") };
 
 pub fn get() -> &'static BrokerMetrics {
-    METRICS.get_or_init(BrokerMetrics::new)
+    METRICS.get()
 }
 
 /// CDC / outbound pipeline counters, in real PostgreSQL shared memory.
@@ -204,9 +217,10 @@ pub fn shared_cdc() -> &'static SharedCdcCounters {
     SHARED_CDC.get()
 }
 
-/// Register `SharedCdcCounters` with PostgreSQL shared memory. Must be
-/// called from `_PG_init`.
+/// Register the shared counter blocks with PostgreSQL shared memory. Must
+/// be called from `_PG_init`.
 pub fn init_shared() {
+    pgrx::pg_shmem_init!(METRICS);
     pgrx::pg_shmem_init!(SHARED_CDC);
 }
 
