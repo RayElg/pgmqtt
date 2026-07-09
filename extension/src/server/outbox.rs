@@ -74,6 +74,48 @@ fn seed_cursor(slot: i32) -> i64 {
     .unwrap_or(0)
 }
 
+/// Claim `(message_id, shared-group)` pairs for this worker. Every worker
+/// matches its local group members against every outbox row, so without
+/// arbitration a group with members on N workers receives each message N
+/// times; the claims table's primary key picks one winner cluster-wide.
+/// Returns the pairs this worker won, or `None` on error — the caller then
+/// delivers unclaimed (duplicates beat losing the message for the group).
+pub(super) fn claim_share_groups(
+    pairs: &[(i64, String)],
+) -> Option<std::collections::HashSet<(i64, String)>> {
+    let ids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
+    let groups: Vec<&str> = pairs.iter().map(|(_, g)| g.as_str()).collect();
+    BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            let _ = client.select(
+                "SELECT set_config('synchronous_commit', 'off', true)",
+                None,
+                &[],
+            );
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![ids.into(), groups.into()];
+            let table = client.update(
+                "INSERT INTO pgmqtt_share_claims (message_id, group_key) \
+                 SELECT u.message_id, u.group_key \
+                 FROM unnest($1::bigint[], $2::text[]) AS u(message_id, group_key) \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING message_id, group_key",
+                None,
+                &args,
+            )?;
+            let mut won = std::collections::HashSet::new();
+            for row in table {
+                let id: Option<i64> = row.get_by_name("message_id")?;
+                let group: Option<String> = row.get_by_name("group_key")?;
+                if let (Some(id), Some(group)) = (id, group) {
+                    won.insert((id, group));
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(won)
+        })
+    })
+    .ok()
+}
+
 /// Slot-0 GC (multi-worker): delete outbox rows every worker's cursor has
 /// passed, reclaiming orphaned message rows along the way — this replaces
 /// the per-delivery cleanup that a single worker can do safely but N
@@ -102,6 +144,12 @@ fn gc_below_min_cursor() {
             for id in ids {
                 let _ = db_action::cleanup_orphaned_message(client, id);
             }
+            client.update(
+                "DELETE FROM pgmqtt_share_claims \
+                 WHERE message_id <= (SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors)",
+                None,
+                &[],
+            )?;
             Ok::<_, pgrx::spi::Error>(())
         })
     })

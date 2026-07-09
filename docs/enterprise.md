@@ -383,8 +383,8 @@ How the workers stay coherent:
 
 v1 caveats, deliberate and documented:
 
-- **Shared subscriptions (`$share`)** balance within each worker, not globally.
-- **A crashed socket worker's sessions** stay "connected" in `pgmqtt_sessions` until their clients reconnect (only a full PostgreSQL restart resets all sessions).
+- **Shared subscriptions (`$share`)** deliver each message to exactly one member cluster-wide (workers claim each `(message, group)` pair through `pgmqtt_share_claims`), but the winning member is picked by each worker's local rotation — balancing is not globally round-robin.
+- **A crashed socket worker's sessions** stay "connected" in `pgmqtt_sessions` until their clients reconnect (only a full PostgreSQL restart resets all sessions). On reconnect, a session that last lived on another worker is resumed from its persisted state, including queued and unacknowledged messages.
 - **QoS 1 PUBACK and delivery latency** gain the outbox round trip (~1–2 ticks) relative to a single socket worker; QoS 0 end-to-end roughly doubles (measured ~12 ms vs ~5.5 ms at defaults).
 - A **retained-message replacement** can reclaim the previous message row before a lagging worker delivered it (window of one cursor lag, typically milliseconds).
 

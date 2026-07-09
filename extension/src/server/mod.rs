@@ -105,6 +105,108 @@ fn with_subtransaction<T>(
     result
 }
 
+/// Resume one client's session from the DB (multi-worker): the client was
+/// last connected to another socket worker, so this worker has no in-memory
+/// copy of its session, queue, or subscription-tree entries. Loads the
+/// session row, registers its subscriptions in this worker's tree, and
+/// rehydrates queued/inflight messages. Returns the session plus any queued
+/// message ids dropped for exceeding the queue byte cap (for the caller to
+/// delete).
+fn db_resume_session(client_id: &str) -> Option<(MqttSession, Vec<i64>)> {
+    BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into()];
+            let session_row = client
+                .select(
+                    "SELECT next_packet_id, expiry_interval FROM pgmqtt_sessions \
+                     WHERE client_id = $1",
+                    None,
+                    &args,
+                )?
+                .into_iter()
+                .next()
+                .map(|row| {
+                    (
+                        row.get_by_name::<i32, _>("next_packet_id")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(1),
+                        row.get_by_name::<i32, _>("expiry_interval")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                    )
+                });
+            let Some((next_pid, expiry)) = session_row else {
+                return Ok::<_, pgrx::spi::Error>(None);
+            };
+            let mut sess = MqttSession::new();
+            sess.next_packet_id = next_pid as u16;
+            sess.expiry_interval = expiry as u32;
+
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into()];
+            let table = client.select(
+                "SELECT topic_filter, qos FROM pgmqtt_subscriptions WHERE client_id = $1",
+                None,
+                &args,
+            )?;
+            for row in table {
+                let filter: Option<String> = row.get_by_name("topic_filter")?;
+                let qos: i32 = row.get_by_name("qos")?.unwrap_or(0);
+                if let Some(filter) = filter {
+                    subscriptions::subscribe(client_id, &filter, qos as u8);
+                }
+            }
+
+            let queue_cap = crate::get_max_queue_bytes_per_client_guc();
+            let mut overflow = Vec::new();
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into()];
+            let table = client.select(
+                "SELECT m.message_id, m.packet_id, pm.topic, pm.payload, pm.qos \
+                 FROM pgmqtt_session_messages m \
+                 JOIN pgmqtt_messages pm ON m.message_id = pm.id \
+                 WHERE m.client_id = $1 \
+                 ORDER BY m.created_at ASC",
+                None,
+                &args,
+            )?;
+            for row in table {
+                let message_id: i64 = row.get_by_name("message_id")?.unwrap_or(0);
+                let packet_id: Option<i32> = row.get_by_name("packet_id")?;
+                let topic: String = row.get_by_name("topic")?.unwrap_or_default();
+                let payload: Vec<u8> = row.get_by_name("payload")?.unwrap_or_default();
+                let qos: i32 = row.get_by_name("qos")?.unwrap_or(1);
+                if let Some(pid) = packet_id {
+                    sess.inflight.insert(
+                        pid as u16,
+                        (
+                            Arc::from(topic.as_str()),
+                            Arc::from(payload),
+                            Some(message_id),
+                            std::time::Instant::now(),
+                        ),
+                    );
+                } else if sess.queue_bytes.saturating_add(payload.len()) > queue_cap {
+                    overflow.push(message_id);
+                } else {
+                    sess.queue_push_back(MqttMessage {
+                        id: Some(message_id),
+                        topic: Arc::from(topic.as_str()),
+                        payload: Arc::from(payload),
+                        qos: qos as u8,
+                    });
+                }
+            }
+            if let Some(&max_pid) = sess.inflight.keys().max() {
+                sess.next_packet_id = if max_pid == 65535 { 1 } else { max_pid + 1 };
+            }
+            Ok(Some((sess, overflow)))
+        })
+    })
+    .ok()
+    .flatten()
+}
+
 /// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
 ///
 /// After a crash, sessions keep `disconnected_at = NULL` because the broker never
@@ -2327,13 +2429,28 @@ fn finish_connect(
     }
 
     // Check for an existing disconnected session to resume.
-    let (session_present, mut session) = with_sessions(|s| {
+    let (mut session_present, mut session) = with_sessions(|s| {
         if let Some(sess) = s.remove(&client_id) {
             (true, sess)
         } else {
             (false, MqttSession::new())
         }
     });
+    // The client may have been connected to another socket worker last —
+    // its state then exists only in the DB here. clean_start skips this:
+    // a fresh session was requested and the DB rows were deleted above.
+    if !session_present && !packet.clean_start && multi_worker() {
+        if let Some((resumed, overflow)) = db_resume_session(&client_id) {
+            session_present = true;
+            session = resumed;
+            for message_id in overflow {
+                session_db_actions.push(SessionDbAction::DeleteMessage {
+                    client_id: client_id.clone(),
+                    message_id,
+                });
+            }
+        }
+    }
     {
         let m = crate::metrics::get();
         if session_present {
@@ -2575,6 +2692,16 @@ fn dispatch_admin_command(
                     "pgmqtt admin: disconnect_client '{}': no such client",
                     client_id
                 );
+            }
+            // Takeover: the client now lives on another worker, which
+            // resumes its session from the DB. Any copy kept here would go
+            // stale — this worker would keep matching and queueing for a
+            // client it no longer owns.
+            if reason == 0x8E {
+                subscriptions::remove_client(&client_id);
+                with_sessions(|s| {
+                    s.remove(&client_id);
+                });
             }
         }
         Command::DisconnectRole { role_name, reason } => {
@@ -3497,8 +3624,43 @@ fn deliver_messages(
     let connected: std::collections::HashSet<String> = clients.keys().cloned().collect();
     let mut to_remove = Vec::new();
 
-    for msg in messages {
-        let subscriber_ids = subscriptions::match_topic(&msg.topic, &connected);
+    // Matching runs once per message up front (match_topic_split advances
+    // $share round-robin state, so it must not be re-run). With several
+    // workers each draining every outbox row, a shared group with members
+    // on N workers would get each message N times — every worker's shared
+    // picks are gated on a cluster-wide claim before delivery.
+    let multi = multi_worker();
+    let mut matches: Vec<(Vec<(String, u8)>, Vec<(String, String, u8)>)> = messages
+        .iter()
+        .map(|msg| subscriptions::match_topic_split(&msg.topic, &connected))
+        .collect();
+    if multi {
+        let pairs: Vec<(i64, String)> = messages
+            .iter()
+            .zip(&matches)
+            .filter_map(|(msg, (_, shared))| msg.id.map(|id| (id, shared)))
+            .flat_map(|(id, shared)| shared.iter().map(move |(g, _, _)| (id, g.clone())))
+            .collect();
+        if !pairs.is_empty() {
+            if let Some(won) = outbox::claim_share_groups(&pairs) {
+                for (msg, (_, shared)) in messages.iter().zip(matches.iter_mut()) {
+                    if let Some(id) = msg.id {
+                        shared.retain(|(g, _, _)| won.contains(&(id, g.clone())));
+                    }
+                }
+            }
+        }
+    }
+
+    for (msg, (regular, shared)) in messages.iter().zip(&matches) {
+        let mut subscriber_ids: HashMap<String, u8> = regular.iter().cloned().collect();
+        for (_group, cid, qos) in shared {
+            let entry = subscriber_ids.entry(cid.clone()).or_insert(*qos);
+            if *qos > *entry {
+                *entry = *qos;
+            }
+        }
+        let subscriber_ids: Vec<(String, u8)> = subscriber_ids.into_iter().collect();
         if subscriber_ids.is_empty() {
             log!(
                 "pgmqtt: no subscribers for topic='{}' (active_filters={:?})",

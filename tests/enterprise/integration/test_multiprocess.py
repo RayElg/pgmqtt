@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "integrat
 from proto_utils import (  # noqa: E402
     MQTTControlPacket,
     create_connect_packet,
+    create_disconnect_packet,
     create_puback_packet,
     create_publish_packet,
     create_subscribe_packet,
@@ -170,11 +171,15 @@ class Broker:
             f"{self.name}: MQTT listener never became ready\n{self.logs()}"
         )
 
-    def connect_mqtt(self, client_id: str) -> socket.socket:
+    def connect_mqtt(
+        self, client_id: str, clean_start: bool = True, properties: dict | None = None
+    ) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5.0)
         s.connect(("127.0.0.1", self.mqtt_port))
-        s.sendall(create_connect_packet(client_id, clean_start=True))
+        s.sendall(
+            create_connect_packet(client_id, clean_start=clean_start, properties=properties)
+        )
         connack = recv_packet(s)
         assert connack is not None, "no CONNACK"
         validate_connack(connack)
@@ -617,6 +622,168 @@ def test_multiworker_outbox_gc(multi_broker):
             break
         time.sleep(1)
     assert remaining == 0, f"outbox not garbage-collected: {remaining} rows left"
+
+
+def _publish_qos1_acked(pub: socket.socket, topic: str, payload: bytes, packet_id: int):
+    pub.sendall(create_publish_packet(topic, payload, qos=1, packet_id=packet_id))
+    puback = recv_packet(pub, timeout=10.0)
+    assert puback is not None, f"no PUBACK for packet {packet_id}"
+    validate_puback(puback, packet_id)
+
+
+def _drain_payload_set(s: socket.socket, want: set, timeout: float = 40.0) -> set:
+    got = set()
+    deadline = time.time() + timeout
+    while got != want and time.time() < deadline:
+        packet = recv_packet(s, timeout=2.0)
+        if packet is None:
+            continue
+        if (packet[0] & 0xF0) >> 4 != MQTTControlPacket.PUBLISH:
+            continue
+        _t, payload, qos, _d, _r, pid, _p = validate_publish(packet)
+        if qos == 1 and pid is not None:
+            s.sendall(create_puback_packet(pid))
+        got.add(bytes(payload))
+    return got
+
+
+def test_multiworker_offline_persistent_delivery(multi_broker):
+    """A QoS 1 publish while a persistent subscriber is offline is queued and
+    delivered when the subscriber reconnects, wherever either connection lands."""
+    sub = multi_broker.connect_mqtt("mp-off-sub", properties={0x11: 3600})
+    _subscribe(sub, 1, "mpoff/#", qos=1)
+    sub.sendall(create_disconnect_packet())
+    sub.close()
+    time.sleep(0.5)
+
+    want = {f"off-{i}".encode() for i in range(5)}
+    pub = multi_broker.connect_mqtt("mp-off-pub")
+    try:
+        for i in range(5):
+            _publish_qos1_acked(pub, "mpoff/data", f"off-{i}".encode(), i + 1)
+    finally:
+        pub.close()
+    time.sleep(1)
+
+    sub2 = multi_broker.connect_mqtt(
+        "mp-off-sub", clean_start=False, properties={0x11: 3600}
+    )
+    try:
+        got = _drain_payload_set(sub2, want)
+    finally:
+        sub2.close()
+    assert got == want, f"missing queued messages after reconnect: {want - got}"
+
+
+def test_multiworker_shared_subscription_exactly_once(multi_broker):
+    """Each message published to a shared subscription reaches exactly one
+    group member cluster-wide, even with members spread across workers."""
+    members = []
+    try:
+        for i in range(12):
+            m = multi_broker.connect_mqtt(f"mp-share-{i}")
+            _subscribe(m, 1, "$share/g1/mpshare/t", qos=1)
+            members.append(m)
+
+        deadline = time.time() + 30
+        slots = 0
+        while time.time() < deadline:
+            slots = multi_broker.sql(
+                "SELECT count(DISTINCT worker_slot) FROM pgmqtt_connections_cache "
+                "WHERE client_id LIKE 'mp-share-%'"
+            )[0][0]
+            if slots == 2:
+                break
+            time.sleep(1)
+        if slots < 2:
+            pytest.skip("kernel placed all group members on one worker")
+
+        n = 20
+        pub = multi_broker.connect_mqtt("mp-share-pub")
+        try:
+            for i in range(n):
+                _publish_qos1_acked(pub, "mpshare/t", f"s-{i}".encode(), i + 1)
+        finally:
+            pub.close()
+
+        # Map payload -> set of member indexes that received it. QoS 1
+        # redelivery to the same member (slow PUBACK) is legal; the same
+        # payload reaching two different members is the group violation.
+        recipients: dict = {}
+        quiet_passes = 0
+        deadline = time.time() + 30
+        while quiet_passes < 5 and time.time() < deadline:
+            saw_any = False
+            for idx, m in enumerate(members):
+                packet = recv_packet(m, timeout=0.05)
+                if packet is None:
+                    continue
+                if (packet[0] & 0xF0) >> 4 != MQTTControlPacket.PUBLISH:
+                    continue
+                saw_any = True
+                _t, payload, qos, _d, _r, pid, _p = validate_publish(packet)
+                if qos == 1 and pid is not None:
+                    m.sendall(create_puback_packet(pid))
+                recipients.setdefault(bytes(payload), set()).add(idx)
+            quiet_passes = 0 if saw_any else quiet_passes + 1
+    finally:
+        for m in members:
+            m.close()
+
+    expected = {f"s-{i}".encode() for i in range(n)}
+    split = {p: sorted(idxs) for p, idxs in recipients.items() if len(idxs) > 1}
+    assert set(recipients) == expected and not split, (
+        f"shared group delivery violated exactly-one-member: "
+        f"delivered_to_multiple={split}, "
+        f"missing={sorted(expected - set(recipients))}"
+    )
+
+
+def test_multiworker_puback_durable_across_restart():
+    """Every QoS 1 publish that was PUBACKed before a graceful restart is
+    delivered to a persistent subscriber afterwards."""
+    if not _image_available():
+        pytest.skip(f"docker image {IMAGE} not available")
+    token = generate_test_license(
+        customer="mw-durable", days=1, features=["multiprocess", "metrics"]
+    )
+    broker = Broker(
+        "pgmqtt-test-durable",
+        15493,
+        11893,
+        token,
+        extra_conf=["pgmqtt.socket_workers=2"],
+        auto_remove=False,
+    )
+    broker.start()
+    try:
+        sub = broker.connect_mqtt("mp-dur-sub", properties={0x11: 3600})
+        _subscribe(sub, 1, "mpdur/#", qos=1)
+        sub.sendall(create_disconnect_packet())
+        sub.close()
+        time.sleep(0.5)
+
+        want = {f"dur-{i}".encode() for i in range(50)}
+        pub = broker.connect_mqtt("mp-dur-pub")
+        for i in range(50):
+            _publish_qos1_acked(pub, "mpdur/data", f"dur-{i}".encode(), i + 1)
+
+        broker.restart()
+        pub.close()
+
+        sub2 = broker.connect_mqtt(
+            "mp-dur-sub", clean_start=False, properties={0x11: 3600}
+        )
+        try:
+            got = _drain_payload_set(sub2, want)
+        finally:
+            sub2.close()
+        assert got == want, (
+            f"{len(want - got)} PUBACKed messages lost across graceful restart: "
+            f"{sorted(want - got)[:5]}..."
+        )
+    finally:
+        broker.stop()
 
 
 def test_defunct_slot_rows_swept_on_startup():

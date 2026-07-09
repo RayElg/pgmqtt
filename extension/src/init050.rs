@@ -42,6 +42,17 @@ pub fn init_050() {
              last_id bigint NOT NULL DEFAULT 0)",
         "create pgmqtt_outbox_cursors",
     );
+    // Cluster-wide arbitration for shared-subscription delivery: every
+    // socket worker matches its local group members against every outbox
+    // row, so the first worker to claim (message_id, group) delivers and
+    // the rest skip. Reclaimed by the slot-0 outbox GC.
+    run_ddl(
+        "CREATE TABLE IF NOT EXISTS pgmqtt_share_claims (\
+             message_id bigint NOT NULL, \
+             group_key text NOT NULL, \
+             PRIMARY KEY (message_id, group_key))",
+        "create pgmqtt_share_claims",
+    );
     // Ownership column so each socket worker maintains only its own rows in
     // the (UNLOGGED, rebuildable) connections cache.
     run_ddl(
