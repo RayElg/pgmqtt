@@ -60,7 +60,9 @@ pub fn cleanup_orphaned_message(
                AND NOT EXISTS \
                  (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1) \
                AND NOT EXISTS \
-                 (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
+                 (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1) \
+               AND NOT EXISTS \
+                 (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1)",
             None,
             &args,
         ),

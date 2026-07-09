@@ -163,6 +163,11 @@ pub(super) fn sweep_defunct_slots() {
                 None,
                 &args,
             )?;
+            if socket_workers() == 1 {
+                // Claims are only written and GC'd with several workers; a
+                // downsize to one strands whatever the last epoch left.
+                client.update("DELETE FROM pgmqtt_share_claims", None, &[])?;
+            }
             Ok::<_, pgrx::spi::Error>(())
         });
     });

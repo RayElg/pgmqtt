@@ -339,24 +339,11 @@ impl Drain {
             // waiting, so keep fetching on subsequent ticks without needing
             // another doorbell.
             self.pending = outbox_ids.len() >= cdc_worker::CDC_BATCH_SIZE;
-            if !outbox_messages.is_empty() {
-                super::deliver_messages(&outbox_messages, clients, publishes, session_db_actions);
-                // Oversize-QoS-0 spill rows get no session_messages
-                // tracking (QoS 0 has no PUBACK), so nothing else would
-                // ever reclaim them: clean up right after the one delivery
-                // attempt. (Multi-worker: the slot-0 GC owns all
-                // reclamation instead.)
-                if !multi {
-                    for msg in &outbox_messages {
-                        if msg.qos == 0 {
-                            if let Some(message_id) = msg.id {
-                                session_db_actions
-                                    .push(SessionDbAction::CleanupOrphanedMessage { message_id });
-                            }
-                        }
-                    }
-                }
-            }
+            // Queued before the delivery-time cleanup actions: everything
+            // commits in one end-of-tick transaction, and the orphan-reclaim
+            // predicate refuses to delete a message whose outbox row still
+            // exists — the dequeue must execute first within that
+            // transaction for single-worker reclaim to see it gone.
             if let Some(&max_id) = outbox_ids.last() {
                 if multi {
                     // Rows are shared with the other workers and reclaimed
@@ -374,6 +361,24 @@ impl Drain {
                     // a crash before that commit leaves the rows queued and
                     // they are re-fetched and re-delivered — at-least-once.
                     session_db_actions.push(SessionDbAction::DrainCdcOutbox { ids: outbox_ids });
+                }
+            }
+            if !outbox_messages.is_empty() {
+                super::deliver_messages(&outbox_messages, clients, publishes, session_db_actions);
+                // Oversize-QoS-0 spill rows get no session_messages
+                // tracking (QoS 0 has no PUBACK), so nothing else would
+                // ever reclaim them: clean up right after the one delivery
+                // attempt. (Multi-worker: the slot-0 GC owns all
+                // reclamation instead.)
+                if !multi {
+                    for msg in &outbox_messages {
+                        if msg.qos == 0 {
+                            if let Some(message_id) = msg.id {
+                                session_db_actions
+                                    .push(SessionDbAction::CleanupOrphanedMessage { message_id });
+                            }
+                        }
+                    }
                 }
             }
         }

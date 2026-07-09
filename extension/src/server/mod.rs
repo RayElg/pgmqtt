@@ -1356,6 +1356,7 @@ enum CdcMode<'a> {
 fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     let slot = worker_slot();
     let multi = multi_worker();
+    crate::metrics::slot_connections_reset(slot);
     // Slot 0 owns the cluster-singleton duties; other slots are pure
     // socket/delivery workers.
     let is_primary = slot == 0;
@@ -2324,9 +2325,8 @@ fn finish_connect(
         );
         // Bypasses disconnect_client(), so do its metric bookkeeping inline.
         {
-            let m = crate::metrics::get();
-            crate::metrics::dec(&m.connections_current);
-            crate::metrics::inc(&m.disconnections_unclean);
+            crate::metrics::slot_connections_dec(worker_slot());
+            crate::metrics::inc(&crate::metrics::get().disconnections_unclean);
         }
         let _ = old_client.transport.write_all(&mqtt::build_disconnect(
             mqtt::reason::SESSION_TAKEN_OVER,
@@ -2396,9 +2396,7 @@ fn finish_connect(
     // shared connection gauge rather than this worker's local map.
     let limit = crate::license::max_connections();
     let active_connections = if multi_worker() {
-        crate::metrics::get()
-            .connections_current
-            .load(std::sync::atomic::Ordering::Relaxed) as usize
+        crate::metrics::connections_total() as usize
     } else {
         clients.len()
     };
@@ -2495,9 +2493,8 @@ fn finish_connect(
     }
 
     {
-        let m = crate::metrics::get();
-        crate::metrics::inc(&m.connections_accepted);
-        crate::metrics::inc(&m.connections_current);
+        crate::metrics::inc(&crate::metrics::get().connections_accepted);
+        crate::metrics::slot_connections_inc(worker_slot());
     }
 
     // Set non-blocking for ongoing reads
@@ -2865,7 +2862,7 @@ fn disconnect_client(
 ) {
     if let Some(mut client) = clients.remove(id) {
         let m = crate::metrics::get();
-        crate::metrics::dec(&m.connections_current);
+        crate::metrics::slot_connections_dec(worker_slot());
         if client.clean_disconnect {
             crate::metrics::inc(&m.disconnections_clean);
         } else {

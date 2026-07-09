@@ -13,7 +13,12 @@ pub struct BrokerMetrics {
     // Connections
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
-    pub connections_current: AtomicU64,
+    /// Live connections per socket-worker slot. Split per slot (rather than
+    /// one shared gauge) so a restarting worker can zero its own count: the
+    /// license connection cap is enforced against the sum, and a crashed
+    /// worker's un-decremented connections would otherwise shrink the
+    /// effective cap until a full PostgreSQL restart.
+    pub connections_per_slot: [AtomicU64; crate::MAX_SOCKET_WORKERS as usize],
     pub disconnections_clean: AtomicU64,
     pub disconnections_unclean: AtomicU64,
     pub wills_fired: AtomicU64,
@@ -65,7 +70,8 @@ impl BrokerMetrics {
         Self {
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
-            connections_current: AtomicU64::new(0),
+            connections_per_slot: [(); crate::MAX_SOCKET_WORKERS as usize]
+                .map(|_| AtomicU64::new(0)),
             disconnections_clean: AtomicU64::new(0),
             disconnections_unclean: AtomicU64::new(0),
             wills_fired: AtomicU64::new(0),
@@ -111,6 +117,39 @@ static METRICS: pgrx::PgAtomic<BrokerMetrics> =
 
 pub fn get() -> &'static BrokerMetrics {
     METRICS.get()
+}
+
+/// Cluster-wide live connection count (sum over all worker slots).
+pub fn connections_total() -> u64 {
+    get()
+        .connections_per_slot
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
+}
+
+fn slot_connections(slot: i32) -> Option<&'static AtomicU64> {
+    get().connections_per_slot.get(usize::try_from(slot).ok()?)
+}
+
+pub fn slot_connections_inc(slot: i32) {
+    if let Some(c) = slot_connections(slot) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn slot_connections_dec(slot: i32) {
+    if let Some(c) = slot_connections(slot) {
+        c.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Called at socket-worker startup: whatever this slot's previous
+/// incarnation left in the gauge is gone with its connections.
+pub fn slot_connections_reset(slot: i32) {
+    if let Some(c) = slot_connections(slot) {
+        c.store(0, Ordering::Relaxed);
+    }
 }
 
 /// CDC / outbound pipeline counters, in real PostgreSQL shared memory.
@@ -297,7 +336,7 @@ impl MetricsSnapshot {
             last_reset_at_unix: m.last_reset_at_unix.load(Ordering::Relaxed) as i64,
             connections_accepted: m.connections_accepted.load(Ordering::Relaxed) as i64,
             connections_rejected: m.connections_rejected.load(Ordering::Relaxed) as i64,
-            connections_current: m.connections_current.load(Ordering::Relaxed) as i64,
+            connections_current: connections_total() as i64,
             disconnections_clean: m.disconnections_clean.load(Ordering::Relaxed) as i64,
             disconnections_unclean: m.disconnections_unclean.load(Ordering::Relaxed) as i64,
             wills_fired: m.wills_fired.load(Ordering::Relaxed) as i64,
