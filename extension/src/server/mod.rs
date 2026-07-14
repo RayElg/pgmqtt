@@ -105,20 +105,62 @@ fn with_subtransaction<T>(
     result
 }
 
+/// `BackgroundWorker::transaction` variant whose closure chooses the
+/// outcome: `(result, false)` rolls the whole transaction back instead of
+/// committing. Needed because returning normally from
+/// `BackgroundWorker::transaction` *always* commits — a CDC batch that
+/// caught a persist/enqueue failure in a subtransaction would otherwise
+/// still commit the messages persisted before the failure, and the caller
+/// (seeing "failed") would replay the batch on top of them. The abort makes
+/// "failed" mean what it says: nothing committed, nothing to advance past.
+fn transaction_or_abort<R>(
+    body: impl FnOnce() -> (R, bool) + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+) -> (R, bool) {
+    unsafe {
+        pgrx::pg_sys::SetCurrentStatementStartTimestamp();
+        pgrx::pg_sys::StartTransactionCommand();
+        pgrx::pg_sys::PushActiveSnapshot(pgrx::pg_sys::GetTransactionSnapshot());
+    }
+    let (result, commit) = pgrx::pg_sys::pg_try::PgTryBuilder::new(body).execute();
+    unsafe {
+        pgrx::pg_sys::PopActiveSnapshot();
+        if commit {
+            pgrx::pg_sys::CommitTransactionCommand();
+        } else {
+            pgrx::pg_sys::AbortCurrentTransaction();
+        }
+    }
+    (result, commit)
+}
+
+/// Outcome of a durable-session lookup at CONNECT time.
+enum ResumeOutcome {
+    /// No persisted session under this client_id.
+    NoSession,
+    /// A session exists but belongs to a different authenticated principal:
+    /// the caller must discard it (fresh session, delete the old rows)
+    /// rather than hand one identity's queued payloads to another.
+    PrincipalMismatch,
+    /// Session resumed; the ids are queued messages dropped for exceeding
+    /// the queue byte cap (for the caller to delete).
+    Resumed(MqttSession, Vec<i64>),
+}
+
 /// Resume one client's session from the DB (multi-worker): the client was
 /// last connected to another socket worker, so this worker has no in-memory
 /// copy of its session, queue, or subscription-tree entries. Loads the
 /// session row, registers its subscriptions in this worker's tree, and
-/// rehydrates queued/inflight messages. Returns the session plus any queued
-/// message ids dropped for exceeding the queue byte cap (for the caller to
-/// delete).
-fn db_resume_session(client_id: &str) -> Option<(MqttSession, Vec<i64>)> {
+/// rehydrates queued/inflight messages — but only when the session's
+/// `auth_principal` matches the connecting identity ("" = pre-upgrade row,
+/// resumable once).
+fn db_resume_session(client_id: &str, principal: &str) -> ResumeOutcome {
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into()];
             let session_row = client
                 .select(
-                    "SELECT next_packet_id, expiry_interval FROM pgmqtt_sessions \
+                    "SELECT next_packet_id, expiry_interval, auth_principal \
+                     FROM pgmqtt_sessions \
                      WHERE client_id = $1",
                     None,
                     &args,
@@ -135,14 +177,22 @@ fn db_resume_session(client_id: &str) -> Option<(MqttSession, Vec<i64>)> {
                             .ok()
                             .flatten()
                             .unwrap_or(0),
+                        row.get_by_name::<String, _>("auth_principal")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
                     )
                 });
-            let Some((next_pid, expiry)) = session_row else {
-                return Ok::<_, pgrx::spi::Error>(None);
+            let Some((next_pid, expiry, owner)) = session_row else {
+                return Ok::<_, pgrx::spi::Error>(ResumeOutcome::NoSession);
             };
+            if !owner.is_empty() && owner != principal {
+                return Ok(ResumeOutcome::PrincipalMismatch);
+            }
             let mut sess = MqttSession::new();
             sess.next_packet_id = next_pid as u16;
             sess.expiry_interval = expiry as u32;
+            sess.auth_principal = owner;
 
             let args: Vec<pgrx::datum::DatumWithOid> = vec![client_id.into()];
             let table = client.select(
@@ -200,25 +250,30 @@ fn db_resume_session(client_id: &str) -> Option<(MqttSession, Vec<i64>)> {
             if let Some(&max_pid) = sess.inflight.keys().max() {
                 sess.next_packet_id = if max_pid == 65535 { 1 } else { max_pid + 1 };
             }
-            Ok(Some((sess, overflow)))
+            Ok(ResumeOutcome::Resumed(sess, overflow))
         })
     })
-    .ok()
-    .flatten()
+    .unwrap_or(ResumeOutcome::NoSession)
 }
 
-/// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
+/// On startup, mark this worker's orphaned sessions as disconnected now.
 ///
 /// After a crash, sessions keep `disconnected_at = NULL` because the broker never
 /// reached the normal disconnect path. This causes two problems:
 ///   1. `pgmqtt_status()` reports them as active connections indefinitely.
 ///   2. Session expiry timers never start, so stale sessions accumulate forever.
 ///
-/// Setting `disconnected_at = now()` for all NULL-disconnected sessions fixes both:
-/// the status view is accurate, and expiry timers begin from broker restart.
+/// Setting `disconnected_at = now()` fixes both: the status view is
+/// accurate, and expiry timers begin from broker restart.
 /// `db_load_sessions_on_startup` then reads the updated timestamps and
 /// correctly restores in-memory expiry state.
-fn db_mark_sessions_disconnected_on_startup() {
+///
+/// Multi-worker, the sweep is scoped to `owner_slot = this slot`: an
+/// independent restart of one worker (slot 0 included) must not mark — and
+/// thereby eventually expire and delete — sessions that are live on healthy
+/// sibling workers. Single-worker sweeps everything, since every connection
+/// lived in this process.
+fn db_mark_sessions_disconnected_on_startup(slot: i32, multi: bool) {
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
             // Startup write — serialized with the partner worker's slot
@@ -232,11 +287,22 @@ fn db_mark_sessions_disconnected_on_startup() {
                 None,
                 &[],
             );
-            let _ = client.update(
-                "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE disconnected_at IS NULL",
-                None,
-                &[],
-            );
+            if multi {
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![slot.into()];
+                let _ = client.update(
+                    "UPDATE pgmqtt_sessions SET disconnected_at = now() \
+                     WHERE disconnected_at IS NULL AND owner_slot = $1",
+                    None,
+                    &args,
+                );
+            } else {
+                let _ = client.update(
+                    "UPDATE pgmqtt_sessions SET disconnected_at = now() \
+                     WHERE disconnected_at IS NULL",
+                    None,
+                    &[],
+                );
+            }
             Ok::<_, pgrx::spi::Error>(())
         });
     });
@@ -271,7 +337,8 @@ fn db_load_sessions_on_startup() {
 
             // Load sessions
             if let Ok(table) = client.select(
-                "SELECT client_id, next_packet_id, expiry_interval, disconnected_at::text \
+                "SELECT client_id, next_packet_id, expiry_interval, auth_principal, \
+                        disconnected_at::text \
                  FROM pgmqtt_sessions",
                 None,
                 &[],
@@ -293,6 +360,11 @@ fn db_load_sessions_on_startup() {
                             .ok()
                             .flatten()
                             .unwrap_or(0);
+                        let principal: String = row
+                            .get_by_name("auth_principal")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         let disconnected_str: Option<String> =
                             row.get_by_name("disconnected_at").ok().flatten();
 
@@ -306,6 +378,7 @@ fn db_load_sessions_on_startup() {
                         sess.next_packet_id = next_pid as u16;
                         sess.expiry_interval = expiry as u32;
                         sess.disconnected_at = disconnected_at;
+                        sess.auth_principal = principal;
 
                         s.insert(client_id, sess);
                         loaded_count += 1;
@@ -1370,13 +1443,17 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
     };
     topology::setup_replication_origin(&origin_name);
 
-    // Marking every "connected" session as disconnected is only valid at
-    // postmaster boot, when no client can be connected anywhere. A restart
-    // of a non-primary worker must not clobber the other workers' live
-    // sessions; its own clients' sessions stay "connected" until the
-    // clients reconnect (documented multi-worker caveat).
+    // Every worker (re)start marks its *own* orphaned sessions as
+    // disconnected — scoped by owner_slot in the multi-worker topology, so
+    // a single restarting worker (slot 0 included) never clobbers sessions
+    // live on healthy siblings.
+    db_mark_sessions_disconnected_on_startup(slot, multi);
+    if multi {
+        // A floor orphaned by a crash of this worker would freeze every
+        // delivery cursor; the transaction it covered is long over.
+        crate::shmem_bridge::clear_enqueue_floor(slot.max(0) as usize);
+    }
     if is_primary {
-        db_mark_sessions_disconnected_on_startup();
         topology::sweep_defunct_slots();
     }
     db_load_sessions_on_startup();
@@ -1503,13 +1580,23 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
                 for cmd in admin_cmds {
                     // The target client can live in any socket worker: fan
                     // the command out before executing it locally (drain
-                    // deleted the DB row, so this is the only chance).
+                    // deleted the DB row, so this is the only chance). The
+                    // admin ring is separate from the takeover ring so
+                    // CONNECT churn cannot evict a one-shot security
+                    // command.
                     if multi {
-                        crate::shmem_bridge::broadcast_command(
+                        let sent = crate::shmem_bridge::broadcast_command(
                             slot,
                             topology::socket_workers(),
+                            crate::shmem_bridge::RingClass::Admin,
                             &(&cmd).into(),
                         );
+                        if !sent {
+                            log!(
+                                "pgmqtt admin: command argument exceeds the cross-worker cap — \
+                                 executed on this worker only; re-issue against a shorter target"
+                            );
+                        }
                     }
                     dispatch_admin_command(
                         cmd,
@@ -1686,10 +1773,17 @@ fn run_loop(ports: crate::PortConfig, cdc_mode: CdcMode) {
             process_inbound_pending();
         }
 
-        // Session expiry sweeps operate on cluster-global DB state — one
-        // owner (slot 0) so workers don't race each other.
-        if is_primary && last_session_sweep.elapsed() >= Duration::from_millis(500) {
+        // Session expiry. Every worker sweeps its own in-memory map (that
+        // is where its disconnected sessions live — a slot-0-only sweep
+        // would never see sessions disconnected on other workers). In the
+        // multi-worker topology slot 0 additionally runs a DB-authoritative
+        // sweep, catching sessions whose owning worker lost its in-memory
+        // copy (restart) or no longer exists.
+        if last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
+            if multi && is_primary {
+                db_sweep_expired_sessions();
+            }
             last_session_sweep = std::time::Instant::now();
         }
 
@@ -2057,9 +2151,40 @@ fn finish_connect(
         return;
     }
 
-    let client_id = if packet.client_id.is_empty() {
-        let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-        format!("pgmqtt-auto-{}", id)
+    // Admission bound: every accepted client must be addressable by the
+    // cross-worker command channel (takeover kicks, admin disconnects, ACL
+    // reloads), whose fixed shared-memory slots cap arguments at
+    // CMD_ARG_CAP bytes. A longer id would be admitted here but silently
+    // unreachable there — reject it up front instead (MQTT lets a server
+    // impose its own client-id limits).
+    if packet.client_id.len() > crate::shmem_bridge::CMD_ARG_CAP {
+        log!(
+            "pgmqtt mqtt: client ID too long ({} bytes, cap {}) — rejecting",
+            packet.client_id.len(),
+            crate::shmem_bridge::CMD_ARG_CAP
+        );
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::CLIENT_IDENTIFIER_NOT_VALID,
+            v5,
+        ));
+        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+        return;
+    }
+
+    let assigned_id = packet.client_id.is_empty();
+    let client_id = if assigned_id {
+        // Unique across workers and restarts: a bare per-process counter
+        // would hand out "pgmqtt-auto-0" on every worker's first empty-id
+        // CONNECT, silently cross-connecting unrelated clients through
+        // session takeover.
+        let n = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "pgmqtt-auto-{}-{}-{}",
+            worker_slot().max(0),
+            std::process::id(),
+            n
+        )
     } else {
         packet.client_id.clone()
     };
@@ -2088,6 +2213,9 @@ fn finish_connect(
     let mut sub_acl: Vec<String> = Vec::new();
     let mut pub_acl: Vec<String> = Vec::new();
     let mut authenticated_role: Option<String> = None;
+    // Identity string durable sessions are bound to (see
+    // MqttSession::auth_principal). Set by whichever auth path accepts.
+    let mut jwt_principal: Option<String> = None;
 
     let password_bytes = packet.password.as_deref();
     let password_looks_like_jwt = password_bytes
@@ -2135,6 +2263,14 @@ fn finish_connect(
                     sub_acl = claims.sub_claims;
                     pub_acl = claims.pub_claims;
                     routed_password_to_jwt = password_looks_like_jwt;
+                    // Best identity the token offers: subject, else the
+                    // client_id binding, else just "holder of a valid
+                    // token" — the deployment defined nothing finer.
+                    jwt_principal = Some(match (&claims.sub, &claims.client_id) {
+                        (Some(sub), _) => format!("jwt:sub:{}", sub),
+                        (None, Some(cid)) => format!("jwt:cid:{}", cid),
+                        (None, None) => "jwt".to_string(),
+                    });
                     log!("pgmqtt mqtt: JWT validated for '{}'", client_id);
                 }
                 Err(e) => {
@@ -2268,6 +2404,18 @@ fn finish_connect(
         return;
     }
 
+    // The identity durable session state is bound to. Password auth wins
+    // when both validated (matching the ACL precedence above); "anon" is as
+    // fine-grained as an unauthenticated deployment gets — MQTT's session
+    // key is the client_id itself there.
+    let auth_principal = if let Some(role) = &authenticated_role {
+        format!("role:{}", role)
+    } else if let Some(p) = jwt_principal {
+        p
+    } else {
+        "anon".to_string()
+    };
+
     // ── Will validation ───────────────────────────────────────────────────────
     // The Will is a deferred PUBLISH; it must satisfy the same authorization
     // (JWT pub_claims / pgmqtt_acls pub rules) and topic-name rules (MQTT-3.3.2-2:
@@ -2312,6 +2460,34 @@ fn finish_connect(
             crate::metrics::inc(&crate::metrics::get().connections_rejected);
             return;
         }
+    }
+
+    // ── Connection limit enforcement ──────────────────────────────────────────
+    // Before the takeover below: rejecting a replacement *after* the kick
+    // already went out would disconnect the existing client and admit
+    // nobody. A local takeover frees its own slot, so it always proceeds; a
+    // cross-worker takeover is indistinguishable from a new client here and
+    // is enforced conservatively against the shared gauge (which still
+    // counts the old connection for at most one tick).
+    let limit = crate::license::max_connections();
+    let active_connections = if multi_worker() {
+        crate::metrics::connections_total() as usize
+    } else {
+        clients.len()
+    };
+    if !clients.contains_key(&client_id) && active_connections >= limit {
+        log!(
+            "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
+            limit,
+            client_id
+        );
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::QUOTA_EXCEEDED,
+            v5,
+        ));
+        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+        return;
     }
 
     // ── Session takeover (MQTT 5.0 §4.9) ──────────────────────────────────────
@@ -2359,8 +2535,12 @@ fn finish_connect(
         // Session takeover acts as a disconnect for the old connection.
         // If the old session had expiry_interval == 0 (end at disconnect),
         // clean it up now so that the session_present check below is correct
-        // (MQTT 5.0 §3.2.2.1.1).
-        if old_client.session.expiry_interval == 0 {
+        // (MQTT 5.0 §3.2.2.1.1). A replacement under a *different*
+        // principal likewise never inherits the old identity's session.
+        let old_principal = &old_client.session.auth_principal;
+        if old_client.session.expiry_interval == 0
+            || (!old_principal.is_empty() && *old_principal != auth_principal)
+        {
             subscriptions::remove_client(&client_id);
             session_db_actions.push(SessionDbAction::DeleteSession {
                 client_id: client_id.clone(),
@@ -2378,41 +2558,17 @@ fn finish_connect(
         // workers that don't hold the client; its persisted session state
         // is resumed from the DB below either way. The old worker's final
         // session flush can race this resume — a documented multi-worker
-        // caveat, bounded by one tick of that worker.
-        crate::shmem_bridge::broadcast_command(
+        // caveat, bounded by one tick of that worker. Encoding cannot fail
+        // (client_id length is enforced at admission above).
+        let _ = crate::shmem_bridge::broadcast_command(
             worker_slot(),
             topology::socket_workers(),
+            crate::shmem_bridge::RingClass::Takeover,
             &crate::shmem_bridge::WorkerCommand::DisconnectClient {
                 client_id: client_id.clone(),
                 reason: 0x8E,
             },
         );
-    }
-
-    // ── Connection limit enforcement ──────────────────────────────────────────
-    // A genuinely new client is rejected when the limit is reached so operators
-    // can control memory usage.  Session takeovers (handled above) always proceed.
-    // Multi-worker: the license cap is cluster-wide, so enforce against the
-    // shared connection gauge rather than this worker's local map.
-    let limit = crate::license::max_connections();
-    let active_connections = if multi_worker() {
-        crate::metrics::connections_total() as usize
-    } else {
-        clients.len()
-    };
-    if !clients.contains_key(&client_id) && active_connections >= limit {
-        log!(
-            "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
-            limit,
-            client_id
-        );
-        let _ = transport.write_all(&mqtt::build_connack(
-            false,
-            mqtt::reason::QUOTA_EXCEEDED,
-            v5,
-        ));
-        crate::metrics::inc(&crate::metrics::get().connections_rejected);
-        return;
     }
 
     // If clean_start, remove any previous session
@@ -2434,19 +2590,53 @@ fn finish_connect(
             (false, MqttSession::new())
         }
     });
+    // Sessions are bound to the identity that created them: the same
+    // client_id under a different accepted principal gets a fresh session,
+    // and the old one (queued payloads included) is deleted — never handed
+    // over. "" = pre-upgrade session, resumable once, stamped below.
+    if session_present
+        && !session.auth_principal.is_empty()
+        && session.auth_principal != auth_principal
+    {
+        log!(
+            "pgmqtt mqtt: '{}' reconnected under a different identity — discarding the previous session",
+            client_id
+        );
+        subscriptions::remove_client(&client_id);
+        session_db_actions.push(SessionDbAction::DeleteSession {
+            client_id: client_id.clone(),
+        });
+        session_present = false;
+        session = MqttSession::new();
+    }
     // The client may have been connected to another socket worker last —
     // its state then exists only in the DB here. clean_start skips this:
     // a fresh session was requested and the DB rows were deleted above.
     if !session_present && !packet.clean_start && multi_worker() {
-        if let Some((resumed, overflow)) = db_resume_session(&client_id) {
-            session_present = true;
-            session = resumed;
-            for message_id in overflow {
-                session_db_actions.push(SessionDbAction::DeleteMessage {
+        match db_resume_session(&client_id, &auth_principal) {
+            ResumeOutcome::Resumed(resumed, overflow) => {
+                session_present = true;
+                session = resumed;
+                for message_id in overflow {
+                    session_db_actions.push(SessionDbAction::DeleteMessage {
+                        client_id: client_id.clone(),
+                        message_id,
+                    });
+                }
+            }
+            ResumeOutcome::PrincipalMismatch => {
+                log!(
+                    "pgmqtt mqtt: '{}' reconnected under a different identity — discarding the previous session",
+                    client_id
+                );
+                // Startup loaded every DB subscription into this worker's
+                // tree; drop the stale entries along with the DB rows.
+                subscriptions::remove_client(&client_id);
+                session_db_actions.push(SessionDbAction::DeleteSession {
                     client_id: client_id.clone(),
-                    message_id,
                 });
             }
+            ResumeOutcome::NoSession => {}
         }
     }
     {
@@ -2462,6 +2652,7 @@ fn finish_connect(
     session.expiry_interval = packet.session_expiry_interval;
     session.receive_maximum = packet.receive_maximum;
     session.disconnected_at = None;
+    session.auth_principal = auth_principal;
 
     let next_pid = session.next_packet_id;
     let expiry = session.expiry_interval;
@@ -2469,14 +2660,23 @@ fn finish_connect(
         client_id: client_id.clone(),
         next_packet_id: next_pid,
         expiry_interval: expiry,
+        auth_principal: session.auth_principal.clone(),
     });
 
-    let connack = mqtt::build_connack_with_max_packet(
+    let connack = mqtt::build_connack_with_props(
         session_present,
         mqtt::reason::SUCCESS,
         v5,
         if v5 {
             Some(broker_max_packet_size())
+        } else {
+            None
+        },
+        // MQTT-3.1.3-7: a v5 client that sent an empty client ID must be
+        // told the identifier the server assigned, or it can never address
+        // its own session again.
+        if v5 && assigned_id {
+            Some(client_id.as_str())
         } else {
             None
         },
@@ -2770,6 +2970,7 @@ fn dispatch_admin_command(
                     }
                     log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
                 }
+                prune_offline_role_sessions(clients, None, session_db_actions);
             } else if let Some(client) = clients.get_mut(&target) {
                 if let Some(role) = client.authenticated_role.clone() {
                     let rules = crate::password_auth::load_acls_for_role(&role);
@@ -2797,8 +2998,52 @@ fn dispatch_admin_command(
                     );
                 }
             } else {
-                log!("pgmqtt admin: reload_acls '{}': no such client", target);
+                // Not connected here — but this worker may still hold the
+                // client's durable session and tree subscriptions (loaded
+                // at startup or left by a disconnect) and keep queueing
+                // QoS 1 messages against them.
+                prune_offline_role_sessions(clients, Some(&target), session_db_actions);
             }
+        }
+    }
+}
+
+/// Apply an ACL reload to durable sessions whose client is *not* connected
+/// to this worker. Every worker restores every DB subscription into its
+/// tree at startup, so a revoked subscription must be pruned on non-owner
+/// workers too — otherwise a stale replica keeps matching and queueing
+/// later QoS 1 messages under the revoked filter. Only sessions bound to a
+/// `role:` principal participate: JWT sessions carry their claims in the
+/// token and are re-checked on reconnect, and pruning here mirrors exactly
+/// the SUBSCRIBE-time rule set (`prune_unauthorized_subscriptions`).
+fn prune_offline_role_sessions(
+    clients: &HashMap<String, MqttClient>,
+    target: Option<&str>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    let offline: Vec<(String, String)> = with_sessions(|s| {
+        s.iter()
+            .filter(|(id, _)| {
+                !clients.contains_key(*id) && target.is_none_or(|t| t == id.as_str())
+            })
+            .filter_map(|(id, sess)| {
+                sess.auth_principal
+                    .strip_prefix("role:")
+                    .map(|r| (id.clone(), r.to_string()))
+            })
+            .collect()
+    });
+    if offline.is_empty() {
+        if let Some(t) = target {
+            log!("pgmqtt admin: reload_acls '{}': no such client or session", t);
+        }
+        return;
+    }
+    let roles: Vec<String> = offline.iter().map(|(_, r)| r.clone()).collect();
+    let by_role = crate::password_auth::load_acls_for_roles(&roles);
+    for (id, role) in offline {
+        if let Some(rules) = by_role.get(&role) {
+            prune_unauthorized_subscriptions(&id, &rules.sub, session_db_actions);
         }
     }
 }
@@ -3422,6 +3667,7 @@ fn handle_mqtt_packet(
                         client_id: client_id.clone(),
                         next_packet_id: current_pid,
                         expiry_interval: new_expiry,
+                        auth_principal: client.session.auth_principal.clone(),
                     });
                 }
             }
@@ -3562,8 +3808,66 @@ fn handle_mqtt_packet(
     }
 }
 
-/// Sweep all sessions whose Session Expiry Interval has elapsed.
-/// Must only be called for sessions whose client is not actively connected.
+/// DB-authoritative expiry sweep (multi-worker, slot 0): delete sessions
+/// whose expiry elapsed by their persisted `disconnected_at`, regardless of
+/// which worker owned them — a worker's in-memory sweep can only see its
+/// own map, and a session disconnected on a worker that later restarted is
+/// in nobody's map at all. Cascades clean session_messages and
+/// subscriptions. `expiry_interval` is stored as i32, so 0xFFFFFFFF
+/// ("never expire") arrives as a negative value and is excluded.
+///
+/// A concurrent resume on another worker flips `disconnected_at` to NULL
+/// via UpsertSession; the sub-second window where the sweep can still see
+/// the old committed row loses only DB tracking rows for messages already
+/// rehydrated in that worker's memory — deliveries proceed, DeleteMessage
+/// no-ops, at-least-once holds.
+fn db_sweep_expired_sessions() {
+    BackgroundWorker::transaction(|| {
+        let expired: Vec<String> = pgrx::spi::Spi::connect_mut(|client| {
+            let table = client.update(
+                "DELETE FROM pgmqtt_sessions \
+                 WHERE disconnected_at IS NOT NULL \
+                   AND expiry_interval >= 0 \
+                   AND disconnected_at + make_interval(secs => expiry_interval) <= now() \
+                 RETURNING client_id",
+                None,
+                &[],
+            )?;
+            Ok::<_, pgrx::spi::Error>(
+                table
+                    .into_iter()
+                    .filter_map(|row| row.get_by_name::<String, _>("client_id").ok().flatten())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+        for id in &expired {
+            log!("pgmqtt mqtt: session for client '{}' expired (DB sweep)", id);
+            // This worker may hold startup-loaded copies; other workers'
+            // copies expire through their own in-memory sweeps.
+            subscriptions::remove_client(id);
+            with_sessions(|s| {
+                s.remove(id);
+            });
+        }
+        if !expired.is_empty() {
+            crate::metrics::add(
+                &crate::metrics::get().sessions_expired,
+                expired.len() as u64,
+            );
+        }
+    });
+}
+
+/// Sweep this worker's in-memory sessions whose Session Expiry Interval has
+/// elapsed, evicting them from the local map and subscription tree.
+///
+/// Single-worker, this also deletes the DB rows. Multi-worker it must not:
+/// this map holds startup-loaded copies of *every* session, including ones
+/// whose client is connected to (or has reconnected to) a sibling worker —
+/// a DeleteSession issued from such a stale copy would destroy a live
+/// session. DB deletion is owned by [`db_sweep_expired_sessions`] (slot 0),
+/// which checks the authoritative persisted `disconnected_at`.
 fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
     let now = std::time::Instant::now();
     let mut expired_ids: Vec<String> = Vec::new();
@@ -3583,17 +3887,20 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
             sessions.remove(id);
         }
     });
+    let multi = multi_worker();
     for id in &expired_ids {
         log!(
             "pgmqtt mqtt: session for client '{}' expired, cleaning up",
             id
         );
         subscriptions::remove_client(id);
-        session_db_actions.push(SessionDbAction::DeleteSession {
-            client_id: id.clone(),
-        });
+        if !multi {
+            session_db_actions.push(SessionDbAction::DeleteSession {
+                client_id: id.clone(),
+            });
+        }
     }
-    if !expired_ids.is_empty() {
+    if !expired_ids.is_empty() && !multi {
         crate::metrics::add(
             &crate::metrics::get().sessions_expired,
             expired_ids.len() as u64,
@@ -3632,20 +3939,56 @@ fn deliver_messages(
         .map(|msg| subscriptions::match_topic_split(&msg.topic, &connected))
         .collect();
     if multi {
-        let pairs: Vec<(i64, String)> = messages
-            .iter()
-            .zip(&matches)
-            .filter_map(|(msg, (_, shared))| msg.id.map(|id| (id, shared)))
-            .flat_map(|(id, shared)| shared.iter().map(move |(g, _, _)| (id, g.clone())))
-            .collect();
-        if !pairs.is_empty() {
-            if let Some(won) = outbox::claim_share_groups(&pairs) {
-                for (msg, (_, shared)) in messages.iter().zip(matches.iter_mut()) {
-                    if let Some(id) = msg.id {
-                        shared.retain(|(g, _, _)| won.contains(&(id, g.clone())));
+        // Claims go out in bounded chunks of whole messages: a batch of B
+        // messages matching G shared groups is B×G pairs, and materializing
+        // (or feeding one unnest) millions of them at once is an
+        // allocation/statement bomb. The per-(message, group) work itself
+        // is inherent fan-out; only the peak footprint is capped here.
+        const CLAIM_CHUNK_PAIRS: usize = 4096;
+        let mut start = 0;
+        while start < messages.len() {
+            let mut end = start;
+            let mut pair_count = 0usize;
+            while end < messages.len() {
+                let n = if messages[end].id.is_some() {
+                    matches[end].1.len()
+                } else {
+                    0
+                };
+                // Always take at least one message per chunk, even if a
+                // single message matches more groups than the cap.
+                if end > start && pair_count + n > CLAIM_CHUNK_PAIRS {
+                    break;
+                }
+                pair_count += n;
+                end += 1;
+            }
+            if pair_count > 0 {
+                let won = {
+                    let pairs: Vec<(i64, &str)> = messages[start..end]
+                        .iter()
+                        .zip(&matches[start..end])
+                        .filter_map(|(msg, (_, shared))| msg.id.map(|id| (id, shared)))
+                        .flat_map(|(id, shared)| {
+                            shared.iter().map(move |(g, _, _)| (id, g.as_str()))
+                        })
+                        .collect();
+                    outbox::claim_share_groups(&pairs)
+                };
+                // None = claim error: deliver unclaimed (duplicates beat
+                // losing the message for the group).
+                if let Some(won) = won {
+                    for (msg, (_, shared)) in messages[start..end]
+                        .iter()
+                        .zip(matches[start..end].iter_mut())
+                    {
+                        if let Some(id) = msg.id {
+                            shared.retain(|(g, _, _)| won.contains(&(id, g.clone())));
+                        }
                     }
                 }
             }
+            start = end;
         }
     }
 
@@ -3985,6 +4328,8 @@ fn parse_jwt_public_key(key_str: &str) -> Option<[u8; 32]> {
 struct JwtClaims {
     /// If present, the CONNECT client_id must match this value.
     client_id: Option<String>,
+    /// Standard subject claim, used to bind durable sessions to an identity.
+    sub: Option<String>,
     sub_claims: Vec<String>,
     pub_claims: Vec<String>,
 }
@@ -4067,8 +4412,14 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
         })
         .unwrap_or_default();
 
+    let sub = payload
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Ok(JwtClaims {
         client_id,
+        sub,
         sub_claims,
         pub_claims,
     })

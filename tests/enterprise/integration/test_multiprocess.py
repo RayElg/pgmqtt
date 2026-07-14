@@ -876,3 +876,123 @@ def test_community_boot_single_worker(community_broker):
     topics = {t for (t, _p, _q) in got}
     assert topics == {"mp/q1/beta", "mp/q0/beta"}, got
     assert community_broker.sql("SELECT count(*) FROM pgmqtt_cdc_outbox")[0][0] == 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-07 security-review regressions (multi-worker)
+# ---------------------------------------------------------------------------
+
+
+def test_multiworker_retained_clear_reaches_live_subscribers(multi_broker):
+    """MQTT-3.3.1-6/7/10: an empty retained publish clears the retained
+    value AND is forwarded to current subscribers like any publish. In the
+    multi-worker topology delivery only travels through the outbox, so a
+    QoS 0 clear (no message id) used to reach no live subscriber on any
+    worker — they kept believing the retained value existed."""
+    topic = "mpclear/t"
+    pub = multi_broker.connect_mqtt("mp-clear-pub")
+    sub = multi_broker.connect_mqtt("mp-clear-sub")
+    try:
+        pub.sendall(create_publish_packet(topic, b"v1", qos=0, retain=True))
+        time.sleep(1)
+        _subscribe(sub, 1, topic, qos=0)
+        got = _collect_publishes(sub, expect=1, timeout=15.0)
+        assert [(t, p) for (t, p, _q) in got] == [(topic, b"v1")], got
+
+        pub.sendall(create_publish_packet(topic, b"", qos=0, retain=True))
+        got = _collect_publishes(sub, expect=1, timeout=15.0)
+        assert [(t, p) for (t, p, _q) in got] == [(topic, b"")], (
+            f"live subscriber never saw the retained clear: {got}"
+        )
+
+        sub2 = multi_broker.connect_mqtt("mp-clear-sub2")
+        try:
+            _subscribe(sub2, 1, topic, qos=0)
+            got2 = _collect_publishes(sub2, expect=1, timeout=3.0)
+            assert got2 == [], f"retained message survived the clear: {got2}"
+        finally:
+            sub2.close()
+    finally:
+        pub.close()
+        sub.close()
+
+
+def test_multiworker_disconnected_sessions_expire_on_any_worker(multi_broker):
+    """Session expiry must be database-authoritative: a session disconnected
+    on a non-primary worker used to live only in that worker's process-local
+    map, which the slot-0 sweeper never scanned — it never expired. Several
+    clients make it overwhelmingly likely both workers own some of them."""
+    ids = [f"mpexp-{i}" for i in range(6)]
+    for cid in ids:
+        s = multi_broker.connect_mqtt(cid, properties={0x11: 3})
+        s.sendall(create_disconnect_packet())
+        s.close()
+
+    # Session rows commit with the end-of-tick action batch; wait for all 6.
+    deadline = time.time() + 15
+    rows = 0
+    while time.time() < deadline:
+        rows = multi_broker.sql(
+            "SELECT count(*) FROM pgmqtt_sessions WHERE client_id LIKE 'mpexp-%'"
+        )[0][0]
+        if rows == len(ids):
+            break
+        time.sleep(0.5)
+    assert rows == len(ids), f"expected {len(ids)} session rows, found {rows}"
+
+    # 3 s expiry + 500 ms sweep cadence + commit slack.
+    deadline = time.time() + 25
+    remaining = None
+    while time.time() < deadline:
+        remaining = multi_broker.sql(
+            "SELECT count(*) FROM pgmqtt_sessions WHERE client_id LIKE 'mpexp-%'"
+        )[0][0]
+        if remaining == 0:
+            break
+        time.sleep(1)
+    assert remaining == 0, (
+        f"{remaining} expired sessions never reaped — sessions disconnected on "
+        f"non-primary workers are invisible to a process-local sweep"
+    )
+
+
+def test_multiworker_concurrent_qos1_publishers_no_loss(multi_broker):
+    """Concurrent publishers commit their outbox batches in arbitrary order
+    while ids are assigned in allocation order; without the enqueue-floor
+    barrier a delivery cursor can pass an id whose transaction commits a
+    moment later, and that message is never delivered despite its PUBACK.
+    Every payload must reach the subscriber (duplicates allowed — QoS 1)."""
+    import threading
+
+    n_pubs, n_msgs = 4, 50
+    sub = multi_broker.connect_mqtt("mpfloor-sub")
+    errors = []
+
+    def publisher(t):
+        try:
+            pub = multi_broker.connect_mqtt(f"mpfloor-pub-{t}")
+            try:
+                for i in range(n_msgs):
+                    _publish_qos1_acked(pub, "mpfloor/t", f"fl-{t}-{i}".encode(), i + 1)
+            finally:
+                pub.close()
+        except Exception as e:  # noqa: BLE001 — surface in the main thread
+            errors.append(f"publisher {t}: {e}")
+
+    want = {f"fl-{t}-{i}".encode() for t in range(n_pubs) for i in range(n_msgs)}
+    try:
+        _subscribe(sub, 1, "mpfloor/#", qos=1)
+        threads = [threading.Thread(target=publisher, args=(t,)) for t in range(n_pubs)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=120)
+        assert not errors, errors
+        got = _drain_payload_set(sub, want, timeout=60.0)
+    finally:
+        sub.close()
+    missing = want - got
+    assert not missing, (
+        f"lost {len(missing)} PUBACKed QoS 1 messages "
+        f"(cursor passed an uncommitted id?): {sorted(missing)[:10]}"
+    )

@@ -27,6 +27,8 @@ pub mod property {
     pub const AUTH_METHOD: u8 = 0x15;
     /// Reason String (UTF-8 string) — DISCONNECT/others
     pub const REASON_STRING: u8 = 0x1F;
+    /// Assigned Client Identifier (UTF-8 string) — CONNACK
+    pub const ASSIGNED_CLIENT_IDENTIFIER: u8 = 0x12;
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +802,16 @@ pub fn build_connack_with_max_packet(
     v5: bool,
     server_max_packet_size: Option<u32>,
 ) -> Vec<u8> {
+    build_connack_with_props(session_present, reason_code, v5, server_max_packet_size, None)
+}
+
+pub fn build_connack_with_props(
+    session_present: bool,
+    reason_code: u8,
+    v5: bool,
+    server_max_packet_size: Option<u32>,
+    assigned_client_id: Option<&str>,
+) -> Vec<u8> {
     let mut vh = Vec::with_capacity(3);
     vh.push(if session_present { 0x01 } else { 0x00 }); // connect ack flags
     vh.push(if v5 {
@@ -808,15 +820,21 @@ pub fn build_connack_with_max_packet(
         v5_to_v3_connack(reason_code)
     });
     if v5 {
-        match server_max_packet_size {
-            Some(n) => {
-                let mut props = Vec::with_capacity(6);
-                props.push(property::MAX_PACKET_SIZE);
-                props.extend_from_slice(&n.to_be_bytes());
-                vh.extend_from_slice(&encode_variable_byte_int(props.len()));
-                vh.extend_from_slice(&props);
-            }
-            None => vh.extend_from_slice(&EMPTY_PROPERTIES),
+        let mut props = Vec::new();
+        if let Some(n) = server_max_packet_size {
+            props.push(property::MAX_PACKET_SIZE);
+            props.extend_from_slice(&n.to_be_bytes());
+        }
+        if let Some(cid) = assigned_client_id {
+            props.push(property::ASSIGNED_CLIENT_IDENTIFIER);
+            props.extend_from_slice(&(cid.len() as u16).to_be_bytes());
+            props.extend_from_slice(cid.as_bytes());
+        }
+        if props.is_empty() {
+            vh.extend_from_slice(&EMPTY_PROPERTIES);
+        } else {
+            vh.extend_from_slice(&encode_variable_byte_int(props.len()));
+            vh.extend_from_slice(&props);
         }
     }
     build_packet(PacketType::Connack, 0x00, &vh)

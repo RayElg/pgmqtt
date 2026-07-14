@@ -418,7 +418,7 @@ def decode_properties(buffer, offset):
         if prop_id == 0x0B: # Subscription Identifier (VarInt)
             val, offset = decode_variable_byte_integer(buffer, offset)
             props[prop_id] = val
-        elif prop_id in [0x1F, 0x03, 0x08]: # Reason String, Content Type, Response Topic (UTF-8)
+        elif prop_id in [0x1F, 0x03, 0x08, 0x12]: # Reason String, Content Type, Response Topic, Assigned Client Identifier (UTF-8)
             val, offset = decode_utf8_string(buffer, offset)
             props[prop_id] = val
         elif prop_id == 0x26: # User Property (String Pair)

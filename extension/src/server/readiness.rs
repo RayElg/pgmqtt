@@ -39,6 +39,9 @@ pub(crate) struct ReadinessPoller {
     always: HashSet<String>,
     /// Clients to force into the next ready set (see carry-over rule).
     pub(crate) carry: HashSet<String>,
+    /// Reusable `epoll_wait` output buffer, grown to the interest-set size.
+    #[cfg(target_os = "linux")]
+    events: Vec<libc::epoll_event>,
 }
 
 impl ReadinessPoller {
@@ -65,6 +68,8 @@ impl ReadinessPoller {
             by_id: HashMap::new(),
             always: HashSet::new(),
             carry: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            events: Vec::new(),
         }
     }
 
@@ -161,31 +166,43 @@ impl ReadinessPoller {
             let mut ready = std::mem::take(&mut self.carry);
             ready.extend(self.always.iter().cloned());
 
-            const MAX_EVENTS: usize = 256;
-            loop {
-                let mut events: [libc::epoll_event; MAX_EVENTS] =
-                    unsafe { std::mem::zeroed() };
+            // One wait, with the buffer sized to the interest set, reports
+            // every currently-ready fd exactly once. Level-triggered epoll
+            // re-reports the same fds on every call until their data is
+            // consumed, so draining "until a short batch" with a small fixed
+            // buffer never terminates once >= bufsize fds stay ready — a
+            // remote-triggerable livelock. Anything the kernel would not fit
+            // here (interest set raced larger between sync and wait) is
+            // simply re-reported next tick.
+            let want = self.by_fd.len().max(1);
+            if self.events.len() < want {
+                self.events.resize(want, unsafe { std::mem::zeroed() });
+            }
+            let n = loop {
                 let n = unsafe {
-                    libc::epoll_wait(epfd, events.as_mut_ptr(), MAX_EVENTS as i32, 0)
+                    libc::epoll_wait(
+                        epfd,
+                        self.events.as_mut_ptr(),
+                        self.events.len().min(i32::MAX as usize) as i32,
+                        0,
+                    )
                 };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    pgrx::log!(
-                        "pgmqtt mqtt: epoll_wait failed ({}) — polling all clients this tick",
-                        err
-                    );
-                    return None;
+                if n >= 0 {
+                    break n;
                 }
-                for ev in events.iter().take(n as usize) {
-                    if let Some(id) = self.by_fd.get(&(ev.u64 as i32)) {
-                        ready.insert(id.clone());
-                    }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                if (n as usize) < MAX_EVENTS {
-                    break;
+                pgrx::log!(
+                    "pgmqtt mqtt: epoll_wait failed ({}) — polling all clients this tick",
+                    err
+                );
+                return None;
+            };
+            for ev in self.events.iter().take(n as usize) {
+                if let Some(id) = self.by_fd.get(&(ev.u64 as i32)) {
+                    ready.insert(id.clone());
                 }
             }
             Some(ready)

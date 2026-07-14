@@ -130,7 +130,8 @@ fn persist_publish_batch(
     synchronous: bool,
 ) -> (Vec<MqttMessage>, bool) {
     let multi = multi_worker();
-    BackgroundWorker::transaction(|| {
+    let floor_slot = super::worker_slot().max(0) as usize;
+    let result = BackgroundWorker::transaction(|| {
         let mut to_publish = Vec::new();
         pgrx::spi::Spi::connect_mut(|client| {
             if !synchronous {
@@ -139,6 +140,13 @@ fn persist_publish_batch(
                     None,
                     &[],
                 );
+            }
+            if multi {
+                // Everything below lands in the shared outbox: hold an
+                // enqueue floor before the first message insert so delivery
+                // cursors can't advance past ids this transaction commits
+                // later (see shmem_bridge). Cleared after the transaction.
+                outbox::arm_enqueue_floor(client, floor_slot)?;
             }
             let mut inbound_rows: Vec<(i64, Arc<str>)> = Vec::new();
             let mut i = 0;
@@ -167,7 +175,11 @@ fn persist_publish_batch(
 
                 // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
                 // non-retained row at QoS 1 so the forwarded clear has DB
-                // backing for reconnect redelivery.
+                // backing for reconnect redelivery. Multi-worker persists
+                // the QoS 0 clear too: cross-worker delivery only travels
+                // through the outbox (which carries message ids), so an
+                // unpersisted clear would reach no live subscriber on any
+                // worker — they'd keep believing the retained value exists.
                 if p.retain && p.payload.is_empty() {
                     let topic_ref: &str = &p.topic;
                     let args: Vec<pgrx::datum::DatumWithOid> = vec![topic_ref.into()];
@@ -181,7 +193,7 @@ fn persist_publish_batch(
                             db_action::cleanup_orphaned_message(client, old_id)?;
                         }
                     }
-                    if p.qos > 0 {
+                    if p.qos > 0 || multi {
                         let msg_id = db_action::persist_message(
                             client,
                             &p.topic,
@@ -284,7 +296,11 @@ fn persist_publish_batch(
         })?;
         Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
     })
-    .unwrap_or((Vec::new(), false))
+    .unwrap_or((Vec::new(), false));
+    if multi {
+        crate::shmem_bridge::clear_enqueue_floor(floor_slot);
+    }
+    result
 }
 
 /// Deliver transient (QoS 0, non-retained) publishes immediately — they
@@ -383,6 +399,10 @@ struct DeferredRelease {
     messages: Vec<MqttMessage>,
     /// `(client_id, packet_id)` PUBACKs owed once durable.
     pubacks: Vec<(String, u16)>,
+    /// Multi-worker: ring the outbox doorbell when this batch releases —
+    /// not at commit time, or the other workers would deliver QoS 1+
+    /// effects before the durability point the PUBACK gate promises.
+    ring_doorbell: bool,
 }
 
 /// How long a [`DeferredRelease`] may wait before the socket loop stops
@@ -431,19 +451,37 @@ impl DeferredQueue {
             flush.map_or(true, |f| d.watermark > f)
                 && d.queued_at.elapsed() >= flush_fallback_after()
         }) {
-            wal::force_flush();
+            if wal::force_flush() {
+                // A successful flush covers every earlier commit, including
+                // batches whose watermark capture failed outright.
+                for d in self.queue.iter_mut() {
+                    if d.watermark == wal::WATERMARK_UNCONFIRMED {
+                        d.watermark = 0;
+                    }
+                }
+            }
             flush = wal::read_lsn("pg_current_wal_flush_lsn()");
         }
+        let mut ring = false;
         while self
             .queue
             .front()
             .is_some_and(|d| flush.is_some_and(|f| d.watermark <= f))
         {
             let released = self.queue.pop_front().expect("front checked");
+            ring |= released.ring_doorbell;
             deliver_messages(&released.messages, clients, publishes, session_db_actions);
             for (client_id, pid) in released.pubacks {
                 send_puback(clients, &client_id, pid);
             }
+        }
+        if ring {
+            // Durability confirmed for everything just released — now the
+            // other workers may fetch and deliver it. (Their fetches woken
+            // by unrelated doorbells can still see the rows earlier — async
+            // commits are visible before they are flushed — but the common
+            // path respects the gate.)
+            crate::shmem_bridge::ring_outbox_doorbell();
         }
         if !self.queue.is_empty() {
             crate::shmem_bridge::request_wal_flush();
@@ -452,7 +490,10 @@ impl DeferredQueue {
 
     /// Shutdown: one synchronous flush makes every earlier asynchronous
     /// commit durable (we're exiting — blocking is fine), then everything
-    /// parked is delivered and acked before clients are disconnected.
+    /// parked is delivered and acked before clients are disconnected. If
+    /// even that flush fails, the PUBACKs are withheld — the publishers
+    /// retransmit on reconnect (at-least-once) instead of being told a
+    /// possibly-unflushed message is safe.
     pub(super) fn release_all(
         &mut self,
         clients: &mut HashMap<String, MqttClient>,
@@ -461,13 +502,26 @@ impl DeferredQueue {
         if self.queue.is_empty() {
             return;
         }
-        wal::force_flush();
+        let flushed = wal::force_flush();
+        if !flushed {
+            log!(
+                "pgmqtt: shutdown WAL flush failed — withholding deferred PUBACKs; \
+                 publishers will retransmit"
+            );
+        }
         let mut cascade = Vec::new();
+        let mut ring = false;
         for released in self.queue.drain(..) {
+            ring |= released.ring_doorbell && flushed;
             deliver_messages(&released.messages, clients, &mut cascade, session_db_actions);
-            for (client_id, pid) in released.pubacks {
-                send_puback(clients, &client_id, pid);
+            if flushed {
+                for (client_id, pid) in released.pubacks {
+                    send_puback(clients, &client_id, pid);
+                }
             }
+        }
+        if ring {
+            crate::shmem_bridge::ring_outbox_doorbell();
         }
         if !cascade.is_empty() {
             publish_messages_batch(cascade, clients, session_db_actions);
@@ -505,12 +559,6 @@ pub(super) fn publish_messages_batch_deferred(
     if !persistent.is_empty() {
         let (messages, ok) = persist_publish_batch(&persistent, false);
         if ok {
-            if multi {
-                // Rows are visible to all workers' cursor fetches already
-                // (async commit defers only durability, not visibility);
-                // PUBACKs still wait on the flush watermark.
-                crate::shmem_bridge::ring_outbox_doorbell();
-            }
             let pubacks = persistent
                 .iter()
                 .filter(|p| p.qos == 1)
@@ -521,6 +569,10 @@ pub(super) fn publish_messages_batch_deferred(
                 queued_at: std::time::Instant::now(),
                 messages: if multi { Vec::new() } else { messages },
                 pubacks,
+                // The doorbell rings at release, not here: waking the other
+                // workers now would let them deliver QoS 1+ effects before
+                // the durability point the deferred PUBACKs promise.
+                ring_doorbell: multi,
             });
         }
     }

@@ -34,6 +34,35 @@ pub(crate) fn enqueue(
         .map(|_| ())
 }
 
+/// Publish this process's enqueue floor from the current pgmqtt_messages
+/// sequence position. Must run inside the enqueuing write transaction,
+/// *before* its first message insert: every id the transaction goes on to
+/// allocate is then strictly greater than the floor, so delivery cursors
+/// (which stop at the minimum active floor) cannot pass an id this
+/// transaction might still commit. The caller clears the floor after the
+/// transaction ends.
+pub(super) fn arm_enqueue_floor(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    floor_slot: usize,
+) -> Result<(), pgrx::spi::Error> {
+    let floor: i64 = client
+        .select(
+            // Sequence state is non-transactional: last_value covers every
+            // allocation so far, ours all come later. is_called = false only
+            // on a virgin sequence, whose first nextval returns last_value
+            // itself.
+            "SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END \
+             FROM pgmqtt_messages_id_seq",
+            None,
+            &[],
+        )?
+        .first()
+        .get_one::<i64>()?
+        .unwrap_or(0);
+    crate::shmem_bridge::publish_enqueue_floor(floor_slot, floor);
+    Ok(())
+}
+
 /// Ensure this worker has a cursor row and return its position. A brand-new
 /// slot starts at the minimum of the existing cursors (never behind the GC
 /// watermark, so it can't be handed already-reclaimed rows); the very first
@@ -78,13 +107,22 @@ fn seed_cursor(slot: i32) -> i64 {
 /// matches its local group members against every outbox row, so without
 /// arbitration a group with members on N workers receives each message N
 /// times; the claims table's primary key picks one winner cluster-wide.
+///
+/// A claim this worker already holds counts as won: claims commit before
+/// delivery, so a worker that crashed between claiming and durably
+/// recording delivery re-fetches the message (its cursor didn't advance)
+/// and must be able to re-win its own claim — losing that race against
+/// itself would strand the message for the group. Redelivery after such a
+/// crash is at-least-once, as everywhere else.
+///
 /// Returns the pairs this worker won, or `None` on error — the caller then
 /// delivers unclaimed (duplicates beat losing the message for the group).
 pub(super) fn claim_share_groups(
-    pairs: &[(i64, String)],
+    pairs: &[(i64, &str)],
 ) -> Option<std::collections::HashSet<(i64, String)>> {
     let ids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
-    let groups: Vec<&str> = pairs.iter().map(|(_, g)| g.as_str()).collect();
+    let groups: Vec<&str> = pairs.iter().map(|(_, g)| *g).collect();
+    let slot = super::worker_slot();
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect_mut(|client| {
             let _ = client.select(
@@ -92,13 +130,22 @@ pub(super) fn claim_share_groups(
                 None,
                 &[],
             );
-            let args: Vec<pgrx::datum::DatumWithOid> = vec![ids.into(), groups.into()];
+            let args: Vec<pgrx::datum::DatumWithOid> =
+                vec![ids.into(), groups.into(), slot.into()];
             let table = client.update(
-                "INSERT INTO pgmqtt_share_claims (message_id, group_key) \
-                 SELECT u.message_id, u.group_key \
-                 FROM unnest($1::bigint[], $2::text[]) AS u(message_id, group_key) \
-                 ON CONFLICT DO NOTHING \
-                 RETURNING message_id, group_key",
+                "WITH ins AS (\
+                     INSERT INTO pgmqtt_share_claims (message_id, group_key, worker_slot) \
+                     SELECT u.message_id, u.group_key, $3 \
+                     FROM unnest($1::bigint[], $2::text[]) AS u(message_id, group_key) \
+                     ON CONFLICT DO NOTHING \
+                     RETURNING message_id, group_key) \
+                 SELECT message_id, group_key FROM ins \
+                 UNION \
+                 SELECT c.message_id, c.group_key \
+                 FROM pgmqtt_share_claims c \
+                 JOIN unnest($1::bigint[], $2::text[]) AS u(message_id, group_key) \
+                   ON c.message_id = u.message_id AND c.group_key = u.group_key \
+                 WHERE c.worker_slot = $3",
                 None,
                 &args,
             )?;
@@ -120,8 +167,9 @@ pub(super) fn claim_share_groups(
 /// passed, reclaiming orphaned message rows along the way — this replaces
 /// the per-delivery cleanup that a single worker can do safely but N
 /// workers cannot (another worker may not have delivered the row yet).
-/// Bounded per pass.
-fn gc_below_min_cursor() {
+/// Bounded per pass; returns the number of rows swept so the caller can
+/// tell a drained pass (short batch) from one that left backlog behind.
+fn gc_below_min_cursor() -> usize {
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect_mut(|client| {
             let swept = client.update(
@@ -141,8 +189,8 @@ fn gc_below_min_cursor() {
                 .into_iter()
                 .filter_map(|row| row.get_by_name::<i64, _>("id").ok().flatten())
                 .collect();
-            for id in ids {
-                let _ = db_action::cleanup_orphaned_message(client, id);
+            for id in &ids {
+                let _ = db_action::cleanup_orphaned_message(client, *id);
             }
             client.update(
                 "DELETE FROM pgmqtt_share_claims \
@@ -150,27 +198,32 @@ fn gc_below_min_cursor() {
                 None,
                 &[],
             )?;
-            Ok::<_, pgrx::spi::Error>(())
+            Ok::<_, pgrx::spi::Error>(ids.len())
         })
     })
     .unwrap_or_else(|e| {
         log!("pgmqtt: outbox GC failed: {}", e);
-    });
+        0
+    })
 }
 
 /// Fetch one bounded batch. `after`: multi-worker cursor mode — rows stay
 /// for the other workers and are reclaimed by the slot-0 GC. `None`:
 /// single-worker mode — the caller deletes delivered ids.
 ///
-/// Returns `(fetched_outbox_ids, messages)`. The two can differ: a dangling
-/// outbox id whose message row no longer exists is still returned in the id
-/// list so the caller dequeues it (or advances past it) instead of
-/// re-scanning it forever.
-fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
+/// Returns `(fetched_outbox_ids, messages, view_capped)`. Ids and messages
+/// can differ: a dangling outbox id whose message row no longer exists is
+/// still returned in the id list so the caller dequeues it (or advances
+/// past it) instead of re-scanning it forever. `view_capped` reports that
+/// an enqueue barrier truncated this fetch — rows may exist above it whose
+/// doorbell already rang (or never will, if the in-flight enqueuer aborts),
+/// so the caller must keep re-querying rather than wait for a new doorbell.
+fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>, bool) {
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect(|client| {
             let mut ids = Vec::new();
             let mut out = Vec::new();
+            let mut view_capped = false;
             if let Some(cursor) = after {
                 // Multi-worker: every worker scans every outbox row, so
                 // payloads are the read amplification. Fetch ids + topics
@@ -185,14 +238,24 @@ fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
                 // match_topic is unaffected. False positives only cost a
                 // payload fetch; false negatives can't happen (same trie +
                 // shared-group walk).
+                //
+                // The enqueue barrier caps the fetch: ids above it may still
+                // gain a smaller committed sibling from an in-flight enqueue
+                // transaction, and advancing the cursor past that hole would
+                // skip the message forever (see shmem_bridge's floor docs).
+                // Read *after* this transaction's snapshot was taken, so any
+                // enqueuer invisible to the snapshot still holds its floor.
+                let barrier = crate::shmem_bridge::enqueue_barrier();
+                view_capped = barrier != i64::MAX;
                 let query = format!(
                     "SELECT o.id, m.topic \
                      FROM pgmqtt_cdc_outbox o \
                      LEFT JOIN pgmqtt_messages m ON m.id = o.id \
-                     WHERE o.id > {} \
+                     WHERE o.id > {} AND o.id <= {} \
                      ORDER BY o.id \
                      LIMIT {}",
                     cursor,
+                    barrier,
                     cdc_worker::CDC_BATCH_SIZE
                 );
                 let mut wanted: Vec<i64> = Vec::new();
@@ -273,12 +336,12 @@ fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>) {
                     });
                 }
             }
-            Ok::<_, pgrx::spi::Error>((ids, out))
+            Ok::<_, pgrx::spi::Error>((ids, out, view_capped))
         })
     })
     .unwrap_or_else(|e| {
         log!("pgmqtt: failed to fetch pending CDC outbox batch: {}", e);
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), false)
     })
 }
 
@@ -295,6 +358,10 @@ pub(super) struct Drain {
     cursor: i64,
     last_safety_check: Instant,
     last_gc: Instant,
+    /// Set when the last GC pass swept a full batch: enqueue may outpace a
+    /// once-per-second bounded sweep, so a full pass keeps GC running every
+    /// tick until it catches up (otherwise the table grows without bound).
+    gc_backlog: bool,
 }
 
 impl Drain {
@@ -309,6 +376,7 @@ impl Drain {
             },
             last_safety_check: Instant::now(),
             last_gc: Instant::now(),
+            gc_backlog: false,
         }
     }
 
@@ -332,13 +400,14 @@ impl Drain {
         }
         if self.pending || doorbell != self.doorbell_seen {
             self.doorbell_seen = doorbell;
-            let (outbox_ids, outbox_messages) =
+            let (outbox_ids, outbox_messages, view_capped) =
                 fetch_batch(if multi { Some(self.cursor) } else { None });
             // One batch per tick keeps this loop's CDC work bounded even
             // against a huge backlog; a full fetch means more may be
             // waiting, so keep fetching on subsequent ticks without needing
-            // another doorbell.
-            self.pending = outbox_ids.len() >= cdc_worker::CDC_BATCH_SIZE;
+            // another doorbell. A barrier-capped view also keeps fetching:
+            // the rows above the barrier may never get another doorbell.
+            self.pending = outbox_ids.len() >= cdc_worker::CDC_BATCH_SIZE || view_capped;
             // Queued before the delivery-time cleanup actions: everything
             // commits in one end-of-tick transaction, and the orphan-reclaim
             // predicate refuses to delete a message whose outbox row still
@@ -383,9 +452,16 @@ impl Drain {
             }
         }
 
-        if multi && slot == 0 && self.last_gc.elapsed() >= Duration::from_secs(1) {
+        // GC normally runs once per second, but a full sweep means enqueue
+        // is outpacing one bounded batch per second — keep sweeping every
+        // tick (still one bounded batch per tick, so the loop stays
+        // responsive) until a short pass shows it caught up.
+        if multi
+            && slot == 0
+            && (self.gc_backlog || self.last_gc.elapsed() >= Duration::from_secs(1))
+        {
             self.last_gc = Instant::now();
-            gc_below_min_cursor();
+            self.gc_backlog = gc_below_min_cursor() >= cdc_worker::CDC_BATCH_SIZE;
         }
 
         // Small QoS 0 messages travel through shared memory only; draining

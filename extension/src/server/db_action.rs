@@ -74,11 +74,13 @@ pub fn cleanup_orphaned_message(
 /// Batched database operation: insert/update/delete session, message, or subscription.
 #[derive(Debug)]
 pub enum SessionDbAction {
-    /// Upsert a session row (next_packet_id, expiry_interval).
+    /// Upsert a session row (next_packet_id, expiry_interval, identity).
     UpsertSession {
         client_id: String,
         next_packet_id: u16,
         expiry_interval: u32,
+        /// Principal the session is bound to (see MqttSession::auth_principal).
+        auth_principal: String,
     },
     /// Mark a session as disconnected (set disconnected_at = now).
     MarkDisconnected {
@@ -140,11 +142,16 @@ pub enum SessionDbAction {
     },
 }
 
-/// Execute all queued DB actions in a single atomic transaction.
+/// Execute all queued DB actions in one transaction.
 ///
-/// Each action is applied in order. If any operation fails, the entire
-/// transaction rolls back (and the same actions will be retried on the
-/// next poll loop). This guarantees at-least-once semantics.
+/// The batch is applied inside a subtransaction: on success everything
+/// commits atomically. If any statement fails, the subtransaction rolls the
+/// whole batch back and each action is retried individually in its own
+/// subtransaction, so one poisoned action cannot poison the rest. Actions
+/// that still fail are dropped (logged + counted in `db_*_errors`); there
+/// is no cross-tick retry queue — recovery relies on the surrounding
+/// at-least-once design (outbox re-delivery, session/subscription state
+/// re-upserted on the next event).
 ///
 /// Hot-path queries use session-level prepared statements created by
 /// `crate::statements::prepare_hot_path_statements()` at BGW startup.
@@ -170,238 +177,247 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
     }
 
     BackgroundWorker::transaction(move || {
-        let _ = pgrx::spi::Spi::connect_mut(|client| {
-            let m = crate::metrics::get();
+        let m = crate::metrics::get();
 
-            if !synchronous {
-                let _ = client.select(
-                    "SELECT set_config('synchronous_commit', 'off', true)",
-                    None,
-                    &[],
-                );
-            }
+        if !synchronous {
+            // Outside the subtransactions below: set_config(..., true) is
+            // transaction-local, and a batch rollback must not undo it.
+            let _ = pgrx::spi::Spi::connect_mut(|client| {
+                client
+                    .select(
+                        "SELECT set_config('synchronous_commit', 'off', true)",
+                        None,
+                        &[],
+                    )
+                    .map(|_| ())
+            });
+        }
 
-            for action in actions {
-                match action {
-                    SessionDbAction::UpsertSession {
-                        client_id,
-                        next_packet_id,
-                        expiry_interval,
-                    } => {
-                        let args: Vec<DatumWithOid> = vec![
-                            client_id.as_str().into(),
-                            (next_packet_id as i32).into(),
-                            (expiry_interval as i32).into(),
-                        ];
-                        if let Err(e) = client.update(
-                            "INSERT INTO pgmqtt_sessions (client_id, next_packet_id, expiry_interval, disconnected_at) \
-                             VALUES ($1, $2, $3, NULL) \
-                             ON CONFLICT (client_id) DO UPDATE \
-                             SET next_packet_id = EXCLUDED.next_packet_id, \
-                                 expiry_interval = EXCLUDED.expiry_interval, \
-                                 disconnected_at = NULL",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_session_errors);
-                            pgrx::log!("pgmqtt: failed to upsert session '{}': {}", client_id, e);
-                        }
-                    }
-                    SessionDbAction::MarkDisconnected { client_id } => {
-                        let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE client_id = $1",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_session_errors);
-                            pgrx::log!("pgmqtt: failed to mark session '{}' disconnected: {}", client_id, e);
-                        }
-                    }
-                    SessionDbAction::DeleteSession { client_id } => {
-                        let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_session_errors);
-                            pgrx::log!("pgmqtt: failed to delete session '{}': {}", client_id, e);
-                        }
-                        // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
-                        // rows. Messages that now have no remaining session_messages are cleaned up
-                        // by the DeleteMessage action when each subscriber ACKs. A global sweep
-                        // here would race with InsertMessageBatch in the same transaction.
-                    }
-                    SessionDbAction::InsertMessageBatch {
-                        message_id,
-                        entries,
-                    } => {
-                        for (cid, packet_id) in &entries {
-                            let pid_arg = packet_id.map(|p| p as i32);
-                            let args: Vec<DatumWithOid> = vec![
-                                message_id.into(),
-                                cid.as_str().into(),
-                                pid_arg.into(),
-                            ];
-                            let result = match crate::statements::with_plans(|p| {
-                                client.update(&p.ins_sess_msg, None, &args)
-                            }) {
-                                Some(r) => r,
-                                None => client.update(
-                                    "INSERT INTO pgmqtt_session_messages \
-                                     (message_id, client_id, packet_id, sent_at) \
-                                     VALUES ($1, $2, $3, \
-                                       CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
-                                     ON CONFLICT (client_id, message_id) DO NOTHING",
-                                    None,
-                                    &args,
-                                ),
-                            };
-                            if let Err(e) = result {
-                                crate::metrics::inc(&m.db_message_errors);
-                                pgrx::log!("pgmqtt: failed to insert session_message for message {}, client '{}': {}", message_id, cid, e);
-                            }
-                        }
-                    }
-                    SessionDbAction::UpdateMessageInflight {
-                        client_id,
-                        message_id,
-                        packet_id,
-                    } => {
-                        let args: Vec<DatumWithOid> = vec![
-                            (packet_id as i32).into(),
-                            client_id.as_str().into(),
-                            message_id.into(),
-                        ];
-                        let result = match crate::statements::with_plans(|p| {
-                            client.update(&p.upd_inflight, None, &args)
-                        }) {
-                            Some(r) => r,
-                            None => client.update(
-                                "UPDATE pgmqtt_session_messages \
-                                 SET packet_id = $1, sent_at = now() \
-                                 WHERE client_id = $2 AND message_id = $3",
-                                None,
-                                &args,
-                            ),
-                        };
-                        if let Err(e) = result {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!("pgmqtt: failed to update message {} as inflight for session '{}': {}", message_id, client_id, e);
-                        }
-                    }
-                    SessionDbAction::DeleteMessage {
-                        client_id,
-                        message_id,
-                    } => {
-                        let del_args: Vec<DatumWithOid> =
-                            vec![client_id.as_str().into(), message_id.into()];
-                        let result = match crate::statements::with_plans(|p| {
-                            client.update(&p.del_sess_msg, None, &del_args)
-                        }) {
-                            Some(r) => r,
-                            None => client.update(
-                                "DELETE FROM pgmqtt_session_messages \
-                                 WHERE client_id = $1 AND message_id = $2",
-                                None,
-                                &del_args,
-                            ),
-                        };
-                        if let Err(e) = result {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!("pgmqtt: failed to delete message {} from session '{}': {}", message_id, client_id, e);
-                        }
-                        if let Err(e) = cleanup_orphaned_message(client, message_id) {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!("pgmqtt: failed to delete orphaned message {}: {}", message_id, e);
-                        }
-                    }
-                    SessionDbAction::InsertSubscription {
-                        client_id,
-                        topic_filter,
-                        qos,
-                    } => {
-                        let args: Vec<DatumWithOid> = vec![
-                            client_id.as_str().into(),
-                            topic_filter.as_str().into(),
-                            (qos as i32).into(),
-                        ];
-                        if let Err(e) = client.update(
-                            "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) \
-                             VALUES ($1, $2, $3) \
-                             ON CONFLICT (client_id, topic_filter) DO UPDATE \
-                             SET qos = EXCLUDED.qos",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_subscription_errors);
-                            pgrx::log!("pgmqtt: failed to insert subscription for '{}' to '{}': {}", client_id, topic_filter, e);
-                        }
-                    }
-                    SessionDbAction::DeleteSubscription {
-                        client_id,
-                        topic_filter,
-                    } => {
-                        let args: Vec<DatumWithOid> =
-                            vec![client_id.as_str().into(), topic_filter.as_str().into()];
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_subscriptions WHERE client_id = $1 AND topic_filter = $2",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_subscription_errors);
-                            pgrx::log!("pgmqtt: failed to delete subscription for '{}' from '{}': {}", client_id, topic_filter, e);
-                        }
-                    }
-                    SessionDbAction::CleanupOrphanedMessage { message_id } => {
-                        if let Err(e) = cleanup_orphaned_message(client, message_id) {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!(
-                                "pgmqtt: failed to clean up orphaned message {} (no subscribers at delivery time): {}",
-                                message_id, e
-                            );
-                        }
-                    }
-                    SessionDbAction::DrainCdcOutbox { ids } => {
-                        let count = ids.len();
-                        let args: Vec<DatumWithOid> = vec![ids.into()];
-                        if let Err(e) = client.update(
-                            "DELETE FROM pgmqtt_cdc_outbox WHERE id = ANY($1::bigint[])",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!(
-                                "pgmqtt: failed to dequeue {} delivered CDC outbox ids: {}",
-                                count, e
-                            );
-                        }
-                    }
-                    SessionDbAction::AdvanceOutboxCursor {
-                        worker_slot,
-                        last_id,
-                    } => {
-                        let args: Vec<DatumWithOid> =
-                            vec![worker_slot.into(), last_id.into()];
-                        if let Err(e) = client.update(
-                            "UPDATE pgmqtt_outbox_cursors \
-                             SET last_id = GREATEST(last_id, $2) \
-                             WHERE worker_slot = $1",
-                            None,
-                            &args,
-                        ) {
-                            crate::metrics::inc(&m.db_message_errors);
-                            pgrx::log!(
-                                "pgmqtt: failed to advance outbox cursor for slot {}: {}",
-                                worker_slot, e
-                            );
-                        }
-                    }
+        // Fast path: the whole batch in one subtransaction — atomic, and a
+        // PostgreSQL-level error is caught instead of aborting the outer
+        // transaction (which would silently discard every action while
+        // per-statement logs claimed partial progress).
+        let batch = super::with_subtransaction(|| {
+            pgrx::spi::Spi::connect_mut(|client| {
+                for action in &actions {
+                    apply_action(client, action)?;
                 }
-            }
-            crate::metrics::inc(&m.db_batches_committed);
-            Ok::<_, pgrx::spi::Error>(())
+                Ok(())
+            })
         });
+        if batch.is_ok() {
+            crate::metrics::inc(&m.db_batches_committed);
+            return;
+        }
+
+        // Isolation path: one action poisoned the batch — retry each in its
+        // own subtransaction so the rest still commit, and drop (log +
+        // count) the failures. No cross-tick retry: recovery relies on the
+        // surrounding at-least-once design.
+        let mut dropped = 0usize;
+        for action in &actions {
+            let one = super::with_subtransaction(|| {
+                pgrx::spi::Spi::connect_mut(|client| apply_action(client, action))
+            });
+            if one.is_err() {
+                dropped += 1;
+                crate::metrics::inc(action_error_metric(&m, action));
+                pgrx::log!("pgmqtt: dropped DB action after batch failure: {:?}", action);
+            }
+        }
+        pgrx::log!(
+            "pgmqtt: DB action batch failed; {} of {} actions retried individually and dropped",
+            dropped,
+            actions.len()
+        );
+        crate::metrics::inc(&m.db_batches_committed);
     });
+}
+
+/// Which error counter a failed action reports to.
+fn action_error_metric<'a>(
+    m: &'a crate::metrics::BrokerMetrics,
+    action: &SessionDbAction,
+) -> &'a std::sync::atomic::AtomicU64 {
+    match action {
+        SessionDbAction::UpsertSession { .. }
+        | SessionDbAction::MarkDisconnected { .. }
+        | SessionDbAction::DeleteSession { .. } => &m.db_session_errors,
+        SessionDbAction::InsertSubscription { .. }
+        | SessionDbAction::DeleteSubscription { .. } => &m.db_subscription_errors,
+        _ => &m.db_message_errors,
+    }
+}
+
+/// Apply one action; any error propagates so the caller's subtransaction
+/// rolls back.
+fn apply_action(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    action: &SessionDbAction,
+) -> Result<(), spi::Error> {
+    match action {
+        SessionDbAction::UpsertSession {
+            client_id,
+            next_packet_id,
+            expiry_interval,
+            auth_principal,
+        } => {
+            let args: Vec<DatumWithOid> = vec![
+                client_id.as_str().into(),
+                (*next_packet_id as i32).into(),
+                (*expiry_interval as i32).into(),
+                auth_principal.as_str().into(),
+                crate::server::worker_slot().max(0).into(),
+            ];
+            client.update(
+                "INSERT INTO pgmqtt_sessions \
+                 (client_id, next_packet_id, expiry_interval, disconnected_at, \
+                  auth_principal, owner_slot) \
+                 VALUES ($1, $2, $3, NULL, $4, $5) \
+                 ON CONFLICT (client_id) DO UPDATE \
+                 SET next_packet_id = EXCLUDED.next_packet_id, \
+                     expiry_interval = EXCLUDED.expiry_interval, \
+                     disconnected_at = NULL, \
+                     auth_principal = EXCLUDED.auth_principal, \
+                     owner_slot = EXCLUDED.owner_slot",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::MarkDisconnected { client_id } => {
+            let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
+            client.update(
+                "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE client_id = $1",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::DeleteSession { client_id } => {
+            let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
+            client.update("DELETE FROM pgmqtt_sessions WHERE client_id = $1", None, &args)?;
+            // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
+            // rows. Messages that now have no remaining session_messages are cleaned up
+            // by the DeleteMessage action when each subscriber ACKs. A global sweep
+            // here would race with InsertMessageBatch in the same transaction.
+        }
+        SessionDbAction::InsertMessageBatch {
+            message_id,
+            entries,
+        } => {
+            for (cid, packet_id) in entries {
+                let pid_arg = packet_id.map(|p| p as i32);
+                let args: Vec<DatumWithOid> =
+                    vec![(*message_id).into(), cid.as_str().into(), pid_arg.into()];
+                match crate::statements::with_plans(|p| {
+                    client.update(&p.ins_sess_msg, None, &args)
+                }) {
+                    Some(r) => r,
+                    None => client.update(
+                        "INSERT INTO pgmqtt_session_messages \
+                         (message_id, client_id, packet_id, sent_at) \
+                         VALUES ($1, $2, $3, \
+                           CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
+                         ON CONFLICT (client_id, message_id) DO NOTHING",
+                        None,
+                        &args,
+                    ),
+                }?;
+            }
+        }
+        SessionDbAction::UpdateMessageInflight {
+            client_id,
+            message_id,
+            packet_id,
+        } => {
+            let args: Vec<DatumWithOid> = vec![
+                (*packet_id as i32).into(),
+                client_id.as_str().into(),
+                (*message_id).into(),
+            ];
+            match crate::statements::with_plans(|p| client.update(&p.upd_inflight, None, &args)) {
+                Some(r) => r,
+                None => client.update(
+                    "UPDATE pgmqtt_session_messages \
+                     SET packet_id = $1, sent_at = now() \
+                     WHERE client_id = $2 AND message_id = $3",
+                    None,
+                    &args,
+                ),
+            }?;
+        }
+        SessionDbAction::DeleteMessage {
+            client_id,
+            message_id,
+        } => {
+            let del_args: Vec<DatumWithOid> =
+                vec![client_id.as_str().into(), (*message_id).into()];
+            match crate::statements::with_plans(|p| client.update(&p.del_sess_msg, None, &del_args))
+            {
+                Some(r) => r,
+                None => client.update(
+                    "DELETE FROM pgmqtt_session_messages \
+                     WHERE client_id = $1 AND message_id = $2",
+                    None,
+                    &del_args,
+                ),
+            }?;
+            cleanup_orphaned_message(client, *message_id)?;
+        }
+        SessionDbAction::InsertSubscription {
+            client_id,
+            topic_filter,
+            qos,
+        } => {
+            let args: Vec<DatumWithOid> = vec![
+                client_id.as_str().into(),
+                topic_filter.as_str().into(),
+                (*qos as i32).into(),
+            ];
+            client.update(
+                "INSERT INTO pgmqtt_subscriptions (client_id, topic_filter, qos) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (client_id, topic_filter) DO UPDATE \
+                 SET qos = EXCLUDED.qos",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::DeleteSubscription {
+            client_id,
+            topic_filter,
+        } => {
+            let args: Vec<DatumWithOid> =
+                vec![client_id.as_str().into(), topic_filter.as_str().into()];
+            client.update(
+                "DELETE FROM pgmqtt_subscriptions WHERE client_id = $1 AND topic_filter = $2",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::CleanupOrphanedMessage { message_id } => {
+            cleanup_orphaned_message(client, *message_id)?;
+        }
+        SessionDbAction::DrainCdcOutbox { ids } => {
+            let args: Vec<DatumWithOid> = vec![ids.clone().into()];
+            client.update(
+                "DELETE FROM pgmqtt_cdc_outbox WHERE id = ANY($1::bigint[])",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::AdvanceOutboxCursor {
+            worker_slot,
+            last_id,
+        } => {
+            let args: Vec<DatumWithOid> = vec![(*worker_slot).into(), (*last_id).into()];
+            client.update(
+                "UPDATE pgmqtt_outbox_cursors \
+                 SET last_id = GREATEST(last_id, $2) \
+                 WHERE worker_slot = $1",
+                None,
+                &args,
+            )?;
+        }
+    }
+    Ok(())
 }

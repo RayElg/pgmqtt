@@ -5,10 +5,11 @@
 //! ([`CdcQueueMode::DeliverAll`]: every message goes to the sink for direct
 //! delivery). Enterprise runs it in the dedicated `pgmqtt_cdc` worker
 //! ([`CdcQueueMode::OutboxQos1`]: persisted messages are queued to
-//! `pgmqtt_cdc_outbox` inside the same transaction that advances the slot —
-//! the handoff is exactly as durable as the messages, with id order = WAL
-//! order; only small fire-and-forget QOS 0 messages reach the sink, bound
-//! for `crate::shmem_bridge`'s inline ring).
+//! `pgmqtt_cdc_outbox` inside the same transaction that persists them, and
+//! the slot is advanced only after that transaction commits — the handoff
+//! is exactly as durable as the messages, with id order = WAL order; only
+//! small fire-and-forget QOS 0 messages reach the sink, bound for
+//! `crate::shmem_bridge`'s inline ring).
 //!
 //! In `OutboxQos1` mode this worker has no subscriber visibility (that
 //! state lives in the other process), so it persists unconditionally;
@@ -21,13 +22,72 @@ use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 use pgrx::spi::{self, Spi};
 
-/// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
+/// Maximum number of WAL events to process per `cdc_tick` batch transaction.
 ///
-/// Each batch is one atomic PostgreSQL transaction: the replication slot LSN
-/// only advances when **all** QOS ≥ 1 messages from that batch have been
-/// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
-/// cost if a batch fails; larger values reduce per-batch transaction overhead.
+/// The replication slot only advances past a batch after **all** its QOS ≥ 1
+/// messages are committed to `pgmqtt_messages` (see the at-least-once notes
+/// on [`cdc_tick_core`]). Smaller values reduce the retry cost if a batch
+/// fails; larger values reduce per-batch transaction overhead.
 pub(crate) const CDC_BATCH_SIZE: usize = 4096;
+
+/// Throttle for the idle slot advance: WAL that decodes to zero emitted
+/// rows (chiefly pgmqtt's own origin-filtered bookkeeping) never yields an
+/// LSN to advance past, so without this the slot would pin restart_lsn —
+/// and WAL retention — indefinitely on a broker whose only writer is
+/// itself. Each advance persists slot state to disk, so it runs at most
+/// once per interval, not per tick.
+const IDLE_ADVANCE_INTERVAL_SECS: i64 = 10;
+static LAST_IDLE_ADVANCE_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Format a parsed LSN back into PostgreSQL's textual form.
+fn lsn_text(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
+/// Confirm the slot up to `flush_lsn` (captured *before* the empty peek, so
+/// everything at or below it has been decoded and produced nothing).
+/// Conditional on actually moving forward — advancing backward is an error.
+fn advance_slot_idle(slot_name: &str, flush_lsn: u64) {
+    let now = crate::license::now_secs();
+    let last = LAST_IDLE_ADVANCE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < IDLE_ADVANCE_INTERVAL_SECS {
+        return;
+    }
+    LAST_IDLE_ADVANCE_SECS.store(now, std::sync::atomic::Ordering::Relaxed);
+    let lsn = lsn_text(flush_lsn);
+    BackgroundWorker::transaction(|| {
+        let _ = Spi::connect_mut(|client| {
+            suppress_decoding_logs(client);
+            client
+                .update(
+                    &format!(
+                        "SELECT pg_replication_slot_advance('{slot}', '{lsn}') \
+                         WHERE '{lsn}'::pg_lsn > (SELECT confirmed_flush_lsn \
+                                                  FROM pg_replication_slots \
+                                                  WHERE slot_name = '{slot}')",
+                        slot = slot_name,
+                        lsn = lsn,
+                    ),
+                    None,
+                    &[],
+                )
+                .map(|_| ())
+        });
+    });
+}
+
+/// `pg_replication_slot_advance` and the peek both start a decoding context,
+/// which logs "starting logical decoding for slot ..." at LOG level on every
+/// call — several lines per batch in production. Transaction-local, so the
+/// suppression never leaks past the statement that needed it.
+fn suppress_decoding_logs(client: &mut pgrx::spi::SpiClient<'_>) {
+    let _ = client.select(
+        "SELECT set_config('log_min_messages', 'fatal', true)",
+        None,
+        &[],
+    );
+}
 
 /// Where `cdc_tick_core` routes a finished message. See the module docs.
 #[derive(Copy, Clone)]
@@ -51,8 +111,13 @@ pub fn run_cdc(slot_name: &str) {
     // Record the boot topology in this process too: the QoS 0 routing
     // below consults it (multi-worker sends everything through the
     // outbox).
-    super::topology::set(-1, crate::socket_worker_count());
+    super::topology::set(-1, crate::boot_socket_workers());
     super::topology::setup_replication_origin("pgmqtt_cdc");
+    if super::multi_worker() {
+        // A floor orphaned by a crash of this worker would freeze every
+        // delivery cursor; the transaction it covered is long over.
+        crate::shmem_bridge::clear_enqueue_floor(crate::shmem_bridge::CDC_FLOOR_SLOT);
+    }
 
     let mut tick: u64 = 0;
     let mut last_inbound_reload = std::time::Instant::now();
@@ -77,7 +142,7 @@ pub fn run_cdc(slot_name: &str) {
         // flush of all earlier WAL, including the socket worker's async
         // commits.
         if crate::shmem_bridge::take_wal_flush_request() {
-            super::wal::force_flush();
+            let _ = super::wal::force_flush();
         }
 
         if last_inbound_reload.elapsed() >= std::time::Duration::from_millis(500) {
@@ -102,18 +167,28 @@ pub fn run_cdc(slot_name: &str) {
     log!("pgmqtt cdc: SIGTERM received, shutting down");
 }
 
-/// Drain the WAL slot in atomic batches, persisting QOS ≥ 1 messages within
-/// the same transaction.
+/// Drain the WAL slot in bounded batches, persisting QOS ≥ 1 messages and
+/// confirming the slot only after they are committed.
 ///
-/// # Atomicity guarantee
+/// # At-least-once guarantee
 ///
-/// Each batch is one transaction: the slot advance
-/// (`pg_logical_slot_get_changes`), the `pgmqtt_messages` inserts, and (in
-/// `OutboxQos1` mode) the outbox enqueue commit or roll back together. A
-/// failed batch leaves the slot unmoved and the events are re-read next
-/// tick — at-least-once, with no window where a persisted message exists
-/// without its outbox row (or vice versa), so a crash of either worker or
-/// the postmaster never strands a message.
+/// Each batch *peeks* the slot (`pg_logical_slot_peek_changes` — decoding
+/// runs, nothing is consumed), persists the rendered messages and (in
+/// `OutboxQos1` mode) their outbox rows in one transaction, and only after
+/// that transaction commits advances the slot past the batch
+/// (`pg_replication_slot_advance`). Slot state is not transactional — the
+/// consuming `pg_logical_slot_get_changes` confirms its position inside the
+/// function call, so rolling back (or crashing out of) the surrounding
+/// transaction does NOT un-consume events; verified empirically. Peek +
+/// advance-after-commit is therefore the only ordering that can never lose
+/// a message:
+///
+/// - a failed batch aborts and never advances — the same events replay next
+///   tick;
+/// - a crash after the commit but before the advance replays the whole
+///   batch, re-persisting it (duplicate delivery, which QoS 1 permits);
+/// - the message rows and their outbox rows still commit or roll back
+///   together, so no window exists where one is visible without the other.
 ///
 /// `sink` fires per batch right after that batch's commit, not once for the
 /// whole backlog: a single bulk INSERT can span many batches, and
@@ -228,22 +303,34 @@ pub(crate) fn cdc_tick_core(
         });
     }
 
-    // BackgroundWorker::transaction requires UnwindSafe, which &mut T does
-    // not satisfy — so all mutable state lives inside the closure and comes
-    // back out through the returned tuple.
+    // The closure requires UnwindSafe, which &mut T does not satisfy — so
+    // all mutable state lives inside the closure and comes back out through
+    // the returned tuple. `transaction_or_abort` (not
+    // `BackgroundWorker::transaction`, which always commits) because a
+    // failed batch must roll back the slot advance too, or the failed
+    // events are consumed without their messages ever being persisted.
     loop {
-        let (to_publish, outbox_queued, batch_count, batch_ok) = BackgroundWorker::transaction(
-            move || -> (Vec<MqttMessage>, usize, usize, bool) {
+        // Captured before the peek: everything flushed at this point is
+        // covered by the peek's decode pass, so if that pass emits nothing
+        // the slot can safely be confirmed up to here (throttled — see
+        // advance_slot_idle).
+        let pre_peek_flush = super::wal::read_lsn("pg_current_wal_flush_lsn()");
+
+        let ((to_publish, outbox_queued, batch_count, batch_end_lsn), batch_ok) =
+            super::transaction_or_abort(
+            move || -> ((Vec<MqttMessage>, usize, usize, Option<String>), bool) {
                 let mut to_publish: Vec<MqttMessage> = Vec::new();
                 let mut outbox_ids: Vec<i64> = Vec::new();
                 let mut batch_count: usize = 0;
+                let mut batch_end_lsn: Option<String> = None;
 
-                // Step 1: advance the slot by at most CDC_BATCH_SIZE events.
-                // The output plugin pushes each event into ring_buffer; the
-                // slot's confirmed_flush_lsn only moves forward when this
-                // transaction (inserts included) commits.
-                let advance_query = format!(
-                    "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
+                // Step 1: peek at most CDC_BATCH_SIZE events. The output
+                // plugin pushes each event into ring_buffer; nothing is
+                // consumed — the caller advances the slot past the batch's
+                // last LSN only after this transaction commits (see the
+                // at-least-once notes on cdc_tick_core).
+                let peek_query = format!(
+                    "SELECT lsn::text FROM pg_logical_slot_peek_changes('{}', NULL, {})",
                     slot_name, CDC_BATCH_SIZE
                 );
                 match Spi::connect(|client| {
@@ -258,14 +345,19 @@ pub(crate) fn cdc_tick_core(
                         &[],
                     );
                     let mut n = 0usize;
-                    let table = client.select(&advance_query, None, &[])?;
-                    for _ in table {
+                    let mut last: Option<String> = None;
+                    let table = client.select(&peek_query, None, &[])?;
+                    for row in table {
                         n += 1;
+                        if let Ok(Some(lsn)) = row.get_by_name::<String, _>("lsn") {
+                            last = Some(lsn);
+                        }
                     }
-                    Ok::<usize, spi::Error>(n)
+                    Ok::<(usize, Option<String>), spi::Error>((n, last))
                 }) {
-                    Ok(n) => {
+                    Ok((n, last)) => {
                         batch_count = n;
+                        batch_end_lsn = last;
                         if n > 0 {
                             log!("pgmqtt: slot batch fetched {} raw logical messages", n);
                             crate::metrics::add(
@@ -275,9 +367,37 @@ pub(crate) fn cdc_tick_core(
                         }
                     }
                     Err(e) => {
-                        log!("pgmqtt: error advancing slot: {:?} — skipping batch", e);
+                        log!("pgmqtt: error peeking slot: {:?} — skipping batch", e);
                         crate::metrics::inc(&crate::metrics::shared_cdc().slot_errors);
-                        return (to_publish, 0, batch_count, false);
+                        // Nothing was consumed, so anything the failed peek
+                        // already pushed into the ring will be decoded again
+                        // — drop it or the retry sees duplicates.
+                        let _ = ring_buffer::drain();
+                        return ((to_publish, 0, batch_count, None), false);
+                    }
+                }
+
+                // Multi-worker: everything queued below lands in the shared
+                // outbox, so this batch must hold an enqueue floor before
+                // its first message insert — the delivery cursors otherwise
+                // could advance past ids this transaction commits later
+                // (see shmem_bridge). Cleared by the caller after the
+                // transaction ends.
+                if matches!(mode, CdcQueueMode::OutboxQos1) && crate::server::multi_worker() {
+                    if let Err(e) = Spi::connect_mut(|client| {
+                        super::outbox::arm_enqueue_floor(
+                            client,
+                            crate::shmem_bridge::CDC_FLOOR_SLOT,
+                        )
+                    }) {
+                        log!(
+                            "pgmqtt cdc: failed to arm enqueue floor: {:?} — batch aborted and retried",
+                            e
+                        );
+                        // Same as the peek-error path: the aborted peek's
+                        // events will be re-decoded on retry.
+                        let _ = ring_buffer::drain();
+                        return ((Vec::new(), 0, batch_count, None), false);
                     }
                 }
 
@@ -448,7 +568,7 @@ pub(crate) fn cdc_tick_core(
                                             crate::metrics::inc(
                                                 &crate::metrics::shared_cdc().persist_errors,
                                             );
-                                            return (Vec::new(), 0, batch_count, false);
+                                            return ((Vec::new(), 0, batch_count, None), false);
                                         }
                                     }
                                 } else {
@@ -476,8 +596,8 @@ pub(crate) fn cdc_tick_core(
 
                 // Step 3 (OutboxQos1 only): queue persisted ids for
                 // delivery, still inside this transaction — the whole
-                // cross-process handoff commits or rolls back with the slot
-                // advance and the message rows.
+                // cross-process handoff commits or rolls back with the
+                // message rows (the slot advances only after the commit).
                 if !outbox_ids.is_empty() {
                     let queued = outbox_ids.len();
                     let insert_result = with_subtransaction(|| {
@@ -493,27 +613,82 @@ pub(crate) fn cdc_tick_core(
                             e
                         );
                         crate::metrics::inc(&crate::metrics::shared_cdc().persist_errors);
-                        return (Vec::new(), 0, batch_count, false);
+                        return ((Vec::new(), 0, batch_count, None), false);
                     }
-                    return (to_publish, queued, batch_count, true);
+                    return ((to_publish, queued, batch_count, batch_end_lsn), true);
                 }
 
-                (to_publish, 0, batch_count, true)
+                ((to_publish, 0, batch_count, batch_end_lsn), true)
             },
         );
 
-        if !batch_ok {
-            log!("pgmqtt cdc: batch transaction failed or rolled back — events will be retried");
+        // Whether the batch committed or aborted, its enqueue transaction
+        // is over — release the floor (before the doorbell, so a woken
+        // reader's barrier already covers this batch's rows).
+        if matches!(mode, CdcQueueMode::OutboxQos1) && crate::server::multi_worker() {
+            crate::shmem_bridge::clear_enqueue_floor(crate::shmem_bridge::CDC_FLOOR_SLOT);
         }
 
-        if batch_ok {
-            if outbox_queued > 0 {
-                // After commit, so the woken reader always sees the rows.
-                crate::shmem_bridge::ring_outbox_doorbell();
+        if !batch_ok {
+            // The peek consumed nothing and no advance follows, so the same
+            // events come back on the next tick — do not retry in a tight
+            // loop here.
+            log!("pgmqtt cdc: batch transaction rolled back — events will be retried next tick");
+            break;
+        }
+
+        // An empty peek means all WAL up to the pre-peek flush point decodes
+        // to nothing for us — confirm it (throttled) so the slot's WAL
+        // retention stays bounded even when the broker's own (origin-
+        // filtered) bookkeeping is the only write traffic.
+        if batch_count == 0 {
+            if let Some(flush) = pre_peek_flush {
+                advance_slot_idle(slot_name, flush);
             }
-            if !to_publish.is_empty() {
-                sink(to_publish);
+            break;
+        }
+
+        // The batch is committed: advance the slot past it. This is the one
+        // place a processed batch is consumed, and it happens strictly after
+        // the messages and outbox rows are visible — a crash in between
+        // merely replays the batch (duplicates, not loss). An advance
+        // failure has the same effect; log it because each replay
+        // re-persists the batch.
+        if let Some(lsn) = batch_end_lsn {
+            let advanced = BackgroundWorker::transaction(|| {
+                Spi::connect_mut(|client| {
+                    suppress_decoding_logs(client);
+                    client
+                        .update(
+                            &format!(
+                                "SELECT pg_replication_slot_advance('{}', '{}')",
+                                slot_name, lsn
+                            ),
+                            None,
+                            &[],
+                        )
+                        .map(|_| ())
+                })
+                .is_ok()
+            });
+            if !advanced {
+                log!(
+                    "pgmqtt cdc: failed to advance slot '{}' to {} — the committed batch \
+                     will replay next tick (duplicate delivery possible)",
+                    slot_name,
+                    lsn
+                );
+                crate::metrics::inc(&crate::metrics::shared_cdc().slot_errors);
+                break;
             }
+        }
+
+        if outbox_queued > 0 {
+            // After commit, so the woken reader always sees the rows.
+            crate::shmem_bridge::ring_outbox_doorbell();
+        }
+        if !to_publish.is_empty() {
+            sink(to_publish);
         }
 
         // Stop when the batch was smaller than the limit — WAL fully drained.

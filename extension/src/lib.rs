@@ -100,13 +100,36 @@ static HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(8080);
 static SOCKET_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub(crate) const MAX_SOCKET_WORKERS: i32 = 8;
 
-/// The effective socket-worker count for this postmaster boot.
-pub(crate) fn socket_worker_count() -> i32 {
+/// The socket-worker count derived from the *current* license + GUC state.
+/// Only `_PG_init` may consult this — everything after postmaster start
+/// must use [`boot_socket_workers`], or a license/GUC change observed by a
+/// restarting worker would put it in a different topology than the worker
+/// set registered at boot (e.g. a worker running standalone CDC while
+/// `pgmqtt_cdc` also owns the slot).
+fn socket_worker_count() -> i32 {
     if crate::license::has_feature(crate::license::Feature::MultiProcess) {
         SOCKET_WORKERS.get().clamp(1, MAX_SOCKET_WORKERS)
     } else {
         1
     }
+}
+
+// The topology decision made in `_PG_init`, frozen for the life of the
+// postmaster. Plain process-inherited statics: `_PG_init` runs in the
+// postmaster (shared_preload_libraries) and every background worker is
+// forked from it, so workers see exactly the values the worker registration
+// used — regardless of what the license key or GUCs say by the time a
+// worker (re)starts.
+static BOOT_MULTIPROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BOOT_SOCKET_WORKERS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+pub(crate) fn boot_multiprocess() -> bool {
+    BOOT_MULTIPROCESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn boot_socket_workers() -> i32 {
+    BOOT_SOCKET_WORKERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -1561,13 +1584,17 @@ pub unsafe extern "C" fn _PG_init() {
     if multiprocess {
         crate::shmem_bridge::init();
     }
+    // Freeze the decision for every future worker (re)start — see
+    // boot_multiprocess/boot_socket_workers.
+    let socket_workers = socket_worker_count();
+    BOOT_MULTIPROCESS.store(multiprocess, std::sync::atomic::Ordering::Relaxed);
+    BOOT_SOCKET_WORKERS.store(socket_workers, std::sync::atomic::Ordering::Relaxed);
 
     // One or more socket workers. Slot 0 is named "pgmqtt_mqtt" and owns
     // the singleton duties (HTTP healthcheck, metrics flush, sweeps,
     // outbox GC); slots 1+ are pure socket/delivery workers sharing the
     // same ports via SO_REUSEPORT. The slot index travels as the BGW main
     // argument.
-    let socket_workers = socket_worker_count();
     for slot in 0..socket_workers {
         let name = if slot == 0 {
             "pgmqtt_mqtt".to_string()
@@ -1649,11 +1676,14 @@ pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
 
-    // Re-derives the same topology decisions _PG_init made when it
-    // registered the workers — both reads see the same GUC snapshot from
-    // this postmaster boot, so they always agree.
-    let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
-    let socket_workers = socket_worker_count();
+    // The topology decisions _PG_init made when it registered the workers,
+    // inherited through fork — NOT re-derived from license/GUC state, which
+    // can have changed since boot: the registered worker set is fixed for
+    // the postmaster's lifetime, and a worker restarting into a different
+    // answer would run a mixed topology (e.g. consuming the CDC slot inline
+    // while pgmqtt_cdc also owns it).
+    let multiprocess = boot_multiprocess();
+    let socket_workers = boot_socket_workers();
     pgrx::log!(
         "pgmqtt mqtt: starting ({}, slot {}/{}), connected to '{}'",
         if multiprocess {
@@ -1774,12 +1804,26 @@ unsafe extern "C-unwind" fn pg_decode_begin_txn(
 ) {
 }
 
+/// Emits a marker row at the commit record's LSN. The CDC consumer peeks
+/// the slot and advances it to the last emitted row's LSN after processing
+/// (see `cdc_tick_core`) — and only a row at the commit record's own
+/// position makes that boundary exact: change rows sit *below* their
+/// transaction's commit record, so advancing to one leaves the whole
+/// transaction "committing after confirmed_flush" and re-emitted forever.
+/// This also keeps the slot's WAL retention bounded under unrelated write
+/// load: transactions whose every change is skipped still surface one row
+/// to advance past.
 #[pg_guard]
 unsafe extern "C-unwind" fn pg_decode_commit_txn(
-    _ctx: *mut pg_sys::LogicalDecodingContext,
+    ctx: *mut pg_sys::LogicalDecodingContext,
     _txn: *mut pg_sys::ReorderBufferTXN,
     _commit_lsn: pg_sys::XLogRecPtr,
 ) {
+    unsafe {
+        pg_sys::OutputPluginPrepareWrite(ctx, true);
+        pg_sys::appendStringInfoString((*ctx).out, c"COMMIT".as_ptr());
+        pg_sys::OutputPluginWrite(ctx, true);
+    }
 }
 
 #[pg_guard]

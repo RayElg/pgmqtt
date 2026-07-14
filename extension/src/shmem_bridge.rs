@@ -5,8 +5,9 @@
 //! - **QoS >= 1 messages are never carried in shared memory at all.** They
 //!   are already durably persisted to `pgmqtt_messages` by the CDC worker,
 //!   and their ids are queued to `pgmqtt_cdc_outbox` *inside the same
-//!   transaction that advances the replication slot* (see
-//!   `server::cdc_worker`). The database is the handoff medium: it is
+//!   transaction that persists them*, with the replication slot advanced
+//!   only after that commit (see `server::cdc_worker`). The database is
+//!   the handoff medium: it is
 //!   durable across crashes, preserves insertion order, and never "fills
 //!   up" the way a fixed-size ring does — so at-least-once delivery holds
 //!   with no drop-on-overflow path anywhere. The only thing this module
@@ -106,6 +107,86 @@ pub fn take_wal_flush_request() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Outbox enqueue floors (socket_workers > 1)
+// ---------------------------------------------------------------------------
+//
+// Multi-worker delivery cursors consume `pgmqtt_cdc_outbox` in id order, but
+// ids (= pgmqtt_messages sequence values) are assigned in *allocation*
+// order while transactions commit in any order: a worker's fetch can see id
+// 100 committed while id 99's transaction is still in flight, advance its
+// cursor to 100, and never deliver 99 — even though 99's publisher gets a
+// PUBACK once that transaction commits. To make the consumed prefix stable,
+// every process that enqueues outbox rows publishes a *floor* — a
+// pgmqtt_messages sequence value read before any of its inserts, so every
+// id it will enqueue is strictly greater — for the duration of its write
+// transaction. Readers only trust ids at or below the minimum active floor
+// ([`enqueue_barrier`]): any in-flight enqueuer that could still commit a
+// smaller id is, by construction, holding a floor below that id.
+//
+// Only pgmqtt's own writers enqueue outbox rows, so the barrier can only be
+// held down by a pgmqtt write transaction (one tick, bounded) — unlike a
+// `pg_snapshot_xmin()` barrier, which any long-running user transaction
+// would pin for its whole lifetime, stalling delivery cluster-wide.
+
+/// One floor slot per socket worker plus one for the CDC worker.
+const FLOOR_SLOTS: usize = crate::MAX_SOCKET_WORKERS as usize + 1;
+
+/// Floor slot index for the CDC worker (socket workers use their own slot).
+pub const CDC_FLOOR_SLOT: usize = crate::MAX_SOCKET_WORKERS as usize;
+
+/// i64::MAX = no enqueue in flight from this slot.
+#[derive(Copy, Clone)]
+struct EnqueueFloors {
+    floors: [i64; FLOOR_SLOTS],
+}
+
+impl Default for EnqueueFloors {
+    fn default() -> Self {
+        Self {
+            floors: [i64::MAX; FLOOR_SLOTS],
+        }
+    }
+}
+
+unsafe impl pgrx::PGRXSharedMemory for EnqueueFloors {}
+
+static ENQUEUE_FLOORS: PgLwLock<EnqueueFloors> =
+    unsafe { PgLwLock::new(c"pgmqtt_bridge_enqueue_floors") };
+
+/// Publish this process's enqueue floor. Must be called *before* the first
+/// message/outbox insert of the write transaction, with a sequence value
+/// read at that point; cleared (with [`clear_enqueue_floor`]) only after
+/// the transaction commits or aborts.
+pub fn publish_enqueue_floor(slot: usize, floor: i64) {
+    if let Some(f) = ENQUEUE_FLOORS.exclusive().floors.get_mut(slot) {
+        *f = floor;
+    }
+}
+
+/// Clear this process's enqueue floor after its write transaction ends.
+/// Also called once at worker startup so a floor orphaned by a crash (which
+/// would freeze every cursor) never outlives the transaction it covered —
+/// by restart time that transaction has certainly committed or aborted.
+pub fn clear_enqueue_floor(slot: usize) {
+    if let Some(f) = ENQUEUE_FLOORS.exclusive().floors.get_mut(slot) {
+        *f = i64::MAX;
+    }
+}
+
+/// Highest outbox id that delivery cursors may consume: every id above this
+/// might still gain a smaller committed sibling from an in-flight enqueue.
+/// `i64::MAX` when no enqueue is in flight.
+pub fn enqueue_barrier() -> i64 {
+    ENQUEUE_FLOORS
+        .share()
+        .floors
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(i64::MAX)
+}
+
+// ---------------------------------------------------------------------------
 // Cross-worker command rings (socket_workers > 1)
 // ---------------------------------------------------------------------------
 //
@@ -116,12 +197,31 @@ pub fn take_wal_flush_request() -> bool {
 // pgmqtt_admin_commands table and fans the command out — disconnects and
 // ACL reloads must reach every worker's local clients). Commands are tiny
 // and rare, so a small fixed ring per worker suffices; on overflow the
-// oldest command is dropped with a log line — a lost takeover kick
-// self-heals via keepalive timeout, and admin commands can be re-issued.
+// oldest command is dropped with a log line.
+//
+// The two traffics get *separate* rings per worker: takeover kicks are
+// best-effort CONNECT-rate traffic (a lost kick self-heals via keepalive
+// timeout), while admin commands are one-shot security controls whose DB
+// row is already consumed by the time they're queued here — CONNECT churn
+// must not be able to evict a pending disconnect or ACL reload.
 
 const CMD_RING_CAPACITY: usize = 256;
-const CMD_ARG_CAP: usize = 128;
+/// Also the broker's client-id admission bound: CONNECT enforces
+/// `client_id.len() <= CMD_ARG_CAP` (see `finish_connect`), so every
+/// admitted client can be addressed by cross-worker commands. Role names
+/// fit for free (PostgreSQL caps them at NAMEDATALEN-1 = 63 bytes).
+pub const CMD_ARG_CAP: usize = 128;
 const MAX_RINGS: usize = crate::MAX_SOCKET_WORKERS as usize;
+
+/// Which per-worker ring a command travels through (see above).
+#[derive(Copy, Clone)]
+pub enum RingClass {
+    /// Best-effort session-takeover kicks (CONNECT-rate, self-healing).
+    Takeover,
+    /// One-shot admin/security commands (rare, must not be evicted by
+    /// takeover churn).
+    Admin,
+}
 
 /// Decoded cross-worker command (mirrors `admin_commands::Command`).
 pub enum WorkerCommand {
@@ -206,13 +306,24 @@ unsafe impl pgrx::PGRXSharedMemory for CmdRing {}
 
 #[derive(Copy, Clone)]
 struct CmdRings {
-    rings: [CmdRing; MAX_RINGS],
+    takeover: [CmdRing; MAX_RINGS],
+    admin: [CmdRing; MAX_RINGS],
 }
 
 impl Default for CmdRings {
     fn default() -> Self {
         Self {
-            rings: [CmdRing::default(); MAX_RINGS],
+            takeover: [CmdRing::default(); MAX_RINGS],
+            admin: [CmdRing::default(); MAX_RINGS],
+        }
+    }
+}
+
+impl CmdRings {
+    fn class(&mut self, class: RingClass) -> &mut [CmdRing; MAX_RINGS] {
+        match class {
+            RingClass::Takeover => &mut self.takeover,
+            RingClass::Admin => &mut self.admin,
         }
     }
 }
@@ -261,17 +372,28 @@ fn decode(slot: &CmdSlot) -> Option<WorkerCommand> {
     }
 }
 
-/// Queue `cmd` for every socket worker except `exclude_slot` (pass -1 to
-/// include all). Drops the oldest queued command per ring on overflow.
-pub fn broadcast_command(exclude_slot: i32, workers: i32, cmd: &WorkerCommand) {
-    let Some(encoded) = encode(cmd) else { return };
+/// Queue `cmd` on the given ring class for every socket worker except
+/// `exclude_slot` (pass -1 to include all). Drops the oldest queued command
+/// per ring on overflow. Returns whether the command was encodable — a
+/// `false` means it reached **no** worker (argument over [`CMD_ARG_CAP`]),
+/// which callers must treat as a delivery failure, not silently ignore.
+#[must_use]
+pub fn broadcast_command(
+    exclude_slot: i32,
+    workers: i32,
+    class: RingClass,
+    cmd: &WorkerCommand,
+) -> bool {
+    let Some(encoded) = encode(cmd) else {
+        return false;
+    };
     let workers = (workers.clamp(1, MAX_RINGS as i32)) as usize;
     let mut rings = CMD_RINGS.exclusive();
-    for slot_idx in 0..workers {
+    let rings = rings.class(class);
+    for (slot_idx, ring) in rings.iter_mut().enumerate().take(workers) {
         if slot_idx as i32 == exclude_slot {
             continue;
         }
-        let ring = &mut rings.rings[slot_idx];
         if ring.len as usize >= CMD_RING_CAPACITY {
             ring.head = (ring.head + 1) % CMD_RING_CAPACITY as u32;
             ring.len -= 1;
@@ -284,27 +406,33 @@ pub fn broadcast_command(exclude_slot: i32, workers: i32, cmd: &WorkerCommand) {
         ring.slots[tail as usize] = encoded;
         ring.len += 1;
     }
+    true
 }
 
-/// Drain every command queued for `slot`, in FIFO order.
+/// Drain every command queued for `slot`, in FIFO order. Admin commands
+/// come first: they are rarer, security-relevant, and must not wait behind
+/// takeover churn.
 pub fn drain_commands(slot: i32) -> Vec<WorkerCommand> {
     if slot < 0 || slot as usize >= MAX_RINGS {
         return Vec::new();
     }
     let mut rings = CMD_RINGS.exclusive();
-    let ring = &mut rings.rings[slot as usize];
-    if ring.len == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(ring.len as usize);
-    for i in 0..ring.len {
-        let idx = (ring.head + i) % CMD_RING_CAPACITY as u32;
-        if let Some(cmd) = decode(&ring.slots[idx as usize]) {
-            out.push(cmd);
+    let mut out = Vec::new();
+    for class in [RingClass::Admin, RingClass::Takeover] {
+        let ring = &mut rings.class(class)[slot as usize];
+        if ring.len == 0 {
+            continue;
         }
+        out.reserve(ring.len as usize);
+        for i in 0..ring.len {
+            let idx = (ring.head + i) % CMD_RING_CAPACITY as u32;
+            if let Some(cmd) = decode(&ring.slots[idx as usize]) {
+                out.push(cmd);
+            }
+        }
+        ring.head = 0;
+        ring.len = 0;
     }
-    ring.head = 0;
-    ring.len = 0;
     out
 }
 
@@ -417,4 +545,5 @@ pub fn init() {
     pg_shmem_init!(FLUSH_REQUEST);
     pg_shmem_init!(INLINE_RING);
     pg_shmem_init!(CMD_RINGS);
+    pg_shmem_init!(ENQUEUE_FLOORS);
 }

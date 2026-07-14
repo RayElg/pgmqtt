@@ -353,7 +353,7 @@ How a message crosses the process boundary depends on its durability class:
 
 | Path | Carries | Mechanism | Loss behavior |
 |------|---------|-----------|---------------|
-| Outbox (`pgmqtt_cdc_outbox`) | QoS ≥ 1 messages, plus any QoS 0 message too large for the inline ring | Message ids are queued **in the same transaction that persists the rows and advances the replication slot**; `pgmqtt_mqtt` fetches them in id (= WAL) order and dequeues in the same transaction that records delivery state | **Lossless.** There is no fixed capacity to overflow and the queue survives crashes of either worker or the whole server; a crash mid-delivery re-delivers (at-least-once, per MQTT QoS 1 semantics) |
+| Outbox (`pgmqtt_cdc_outbox`) | QoS ≥ 1 messages, plus any QoS 0 message too large for the inline ring | Message ids are queued **in the same transaction that persists the rows**, and the replication slot is advanced only after that transaction commits; `pgmqtt_mqtt` fetches them in id (= WAL) order and dequeues in the same transaction that records delivery state | **Lossless.** There is no fixed capacity to overflow and the queue survives crashes of either worker or the whole server; a crash mid-delivery (or between the batch commit and the slot advance) re-delivers (at-least-once, per MQTT QoS 1 semantics) |
 | Inline ring (shared memory) | QoS 0 messages with topic ≤ 256 bytes and payload ≤ 1,024 bytes | Fixed-capacity ring (8,192 messages); a shared-memory doorbell also wakes the delivery worker for outbox work without idle polling | Drops the oldest message on sustained overflow — QoS 0 is fire-and-forget, and this keeps never-persisted messages off the WAL entirely |
 
 Inline-ring drops increment the `cdc_bridge_dropped` counter (see [Observability & Metrics](#observability--metrics)). A nonzero value means the QoS 0 write rate exceeded what the ring absorbs while `pgmqtt_mqtt` was busy or stuck; QoS ≥ 1 traffic is never affected.
@@ -377,13 +377,15 @@ How the workers stay coherent:
 - **All publishes route through the shared outbox** — client publishes (QoS 0 included) and CDC messages alike — and each worker delivers rows past its own cursor (`pgmqtt_outbox_cursors`) to its own subscribers. Slot 0 garbage-collects rows once every cursor has passed them, reclaiming orphaned messages at the same time. This is the explicit trade: QoS 0 gives up its no-database fast path when `socket_workers > 1`.
 - **Session takeover broadcasts a kick** through shared memory: a new CONNECT with an existing client_id disconnects the old connection whichever worker holds it (reason 0x8E), and the session resumes from its persisted state.
 - **Admin commands fan out**: slot 0 drains `pgmqtt_admin_commands` and broadcasts each command to every worker, so disconnects and ACL reloads reach clients wherever they live.
-- **Slot 0 owns the singleton duties**: metrics flush (counters are in shared memory, so the totals cover all workers), session-expiry sweeps, outbox GC. The connection cap from the license is enforced against the cluster-wide connection gauge. The HTTP healthcheck is answered by whichever worker the kernel picks — a 200 means "a worker's loop is ticking".
+- **Slot 0 owns the singleton duties**: metrics flush (counters are in shared memory, so the totals cover all workers), the database-side session-expiry sweep, outbox GC. Every worker additionally sweeps its own in-memory session state. The connection cap from the license is enforced against the cluster-wide connection gauge. The HTTP healthcheck is answered by whichever worker the kernel picks — a 200 means "a worker's loop is ticking".
+- **Sessions are owned per worker** (`pgmqtt_sessions.owner_slot`): a restarting worker marks only *its own* orphaned sessions as disconnected, so one worker's crash never resets sessions live on its siblings.
+- **Durable sessions are bound to the authenticated identity** that created them (`auth_principal`: the password-auth role, the JWT subject/client-id binding, or "anonymous"). A CONNECT reusing a client_id under a *different* accepted identity gets a fresh session; the previous identity's queued and in-flight messages are deleted, never handed over.
 
 v1 caveats, deliberate and documented:
 
 - **Shared subscriptions (`$share`)** deliver each message to exactly one member cluster-wide (workers claim each `(message, group)` pair through `pgmqtt_share_claims`), but the winning member is picked by each worker's local rotation — balancing is not globally round-robin.
-- **A crashed socket worker's sessions** stay "connected" in `pgmqtt_sessions` until their clients reconnect (only a full PostgreSQL restart resets all sessions). On reconnect, a session that last lived on another worker is resumed from its persisted state, including queued and unacknowledged messages.
-- **QoS 1 PUBACK and delivery latency** gain the outbox round trip (~1–2 ticks) relative to a single socket worker; QoS 0 end-to-end roughly doubles (measured ~12 ms vs ~5.5 ms at defaults).
+- **A crashed socket worker's sessions** stay "connected" in `pgmqtt_sessions` until that worker restarts (~5 s) and marks them disconnected, or their clients reconnect. On reconnect, a session that last lived on another worker is resumed from its persisted state, including queued and unacknowledged messages.
+- **QoS 1 PUBACK and delivery latency** gain the outbox round trip plus the WAL-flush gate (~2–4 ticks) relative to a single socket worker — cross-worker delivery is only signalled once the publishing batch is durably flushed, the same point at which its PUBACKs release; QoS 0 end-to-end roughly doubles (measured ~12 ms vs ~5.5 ms at defaults).
 
 ### Restart required
 
@@ -394,6 +396,7 @@ Process topology is decided **once, at PostgreSQL startup**: background workers 
 - **Delivery guarantees are unchanged.** QoS ≥ 1 CDC messages are persisted *and queued for delivery* atomically with the slot advance (at-least-once, end to end); QoS 0 remains fire-and-forget.
 - **No-subscriber cleanup moved.** The CDC worker cannot see subscriptions (that state lives in the `pgmqtt_mqtt` process), so it persists every rendered QoS ≥ 1 message; `pgmqtt_mqtt` reclaims any row that turns out to have zero subscribers at delivery time. No orphaned rows either way.
 - **`pgmqtt.cdc_every_n_ticks` changes meaning.** It paces only the CDC worker's slot polling; bridge draining and delivery in `pgmqtt_mqtt` run every tick. Raising it still reduces WAL-decode overhead but no longer trades away socket responsiveness.
+- **Client IDs are capped at 128 bytes.** Longer IDs are rejected at CONNECT with reason 0x85 (Client Identifier not valid): every admitted client must be addressable by the fixed-size cross-worker command channel (takeover kicks, admin disconnects, ACL reloads). Empty client IDs are assigned a broker-unique identifier, returned to MQTT 5 clients in the CONNACK Assigned Client Identifier property.
 
 ---
 

@@ -163,6 +163,15 @@ pub(super) fn sweep_defunct_slots() {
                 None,
                 &args,
             )?;
+            // Sessions last owned by a defunct slot have no worker left to
+            // mark them disconnected at its own startup — start their
+            // expiry timers here or they linger as "connected" forever.
+            client.update(
+                "UPDATE pgmqtt_sessions SET disconnected_at = now() \
+                 WHERE disconnected_at IS NULL AND owner_slot >= $1",
+                None,
+                &args,
+            )?;
             if socket_workers() == 1 {
                 // Claims are only written and GC'd with several workers; a
                 // downsize to one strands whatever the last epoch left.
