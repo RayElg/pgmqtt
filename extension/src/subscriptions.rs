@@ -455,29 +455,12 @@ pub fn has_subscribers(topic: &str) -> bool {
     })
 }
 
-/// Find all client IDs whose topic filters match a concrete topic, with their granted QoS.
-///
-/// For regular subscriptions: returns all matching clients (deduped, highest QoS wins).
-/// For shared subscriptions: returns exactly one client per matching group (round-robin,
-/// preferring connected clients).
-///
-/// `connected_clients` is the set of currently-connected client IDs, used to prefer
-/// online members when selecting from a shared group.
-pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(String, u8)> {
-    let (regular, shared) = match_topic_split(topic, connected_clients);
-    let mut matched: HashMap<String, u8> = regular.into_iter().collect();
-    for (_group, cid, qos) in shared {
-        let entry = matched.entry(cid).or_insert(qos);
-        if qos > *entry {
-            *entry = qos;
-        }
-    }
-    matched.into_iter().collect()
-}
-
-/// [`match_topic`] with shared-group picks kept separate as
-/// `(group_filter, member_id, qos)`, so multi-worker delivery can gate each
-/// group on a cluster-wide claim. Advances the groups' round-robin state.
+/// Find all client IDs whose topic filters match a concrete topic, with
+/// their granted QoS. Regular matches come back deduped (highest QoS wins);
+/// shared-group picks are kept separate as `(group_filter, member_id, qos)`
+/// — one member per matching group, round-robin preferring members in
+/// `connected_clients` — so multi-worker delivery can gate each group on a
+/// cluster-wide claim. Advances the groups' round-robin state.
 pub fn match_topic_split(
     topic: &str,
     connected_clients: &HashSet<String>,

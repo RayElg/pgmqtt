@@ -117,56 +117,38 @@ pub enum SessionDbAction {
         client_id: String,
         topic_filter: String,
     },
-    /// Reclaim a persisted message that turned out to have no subscribers at
-    /// delivery time (no-op if it's still retained or otherwise referenced).
+    /// Reclaim a persisted message with no subscribers at delivery time
+    /// (no-op while still referenced).
     CleanupOrphanedMessage {
         message_id: i64,
     },
-    /// Remove delivered ids from `pgmqtt_cdc_outbox` (enterprise
-    /// multiprocess, single socket worker). Queued in the same tick that
-    /// delivered the messages, so the dequeue commits atomically with the
-    /// delivery state — if this transaction never commits, the ids stay
-    /// queued and the messages are re-fetched and re-delivered
-    /// (at-least-once).
+    /// Dequeue delivered outbox ids (single socket worker) — commits with
+    /// the delivery state, so an uncommitted tick re-delivers.
     DrainCdcOutbox {
         ids: Vec<i64>,
     },
-    /// Multi-worker counterpart of `DrainCdcOutbox`: rows are shared with
-    /// the other socket workers, so instead of deleting, advance this
-    /// worker's delivery cursor (slot-0 GC reclaims rows below the minimum
-    /// cursor). GREATEST() keeps a delayed/replayed action from moving the
-    /// cursor backwards.
+    /// Multi-worker counterpart: rows are shared, so advance this worker's
+    /// cursor instead (slot-0 GC reclaims below the minimum). GREATEST()
+    /// keeps a replayed action from moving it backwards.
     AdvanceOutboxCursor {
         worker_slot: i32,
         last_id: i64,
     },
 }
 
-/// Execute all queued DB actions in one transaction.
-///
-/// The batch is applied inside a subtransaction: on success everything
-/// commits atomically. If any statement fails, the subtransaction rolls the
-/// whole batch back and each action is retried individually in its own
-/// subtransaction, so one poisoned action cannot poison the rest. Actions
-/// that still fail are dropped (logged + counted in `db_*_errors`); there
-/// is no cross-tick retry queue — recovery relies on the surrounding
-/// at-least-once design (outbox re-delivery, session/subscription state
-/// re-upserted on the next event).
-///
-/// Hot-path queries use session-level prepared statements created by
-/// `crate::statements::prepare_hot_path_statements()` at BGW startup.
+/// Execute all queued DB actions in one transaction. The batch runs in one
+/// subtransaction; on failure each action retries individually so one
+/// poisoned action can't sink the rest, and stragglers are dropped
+/// (logged + counted) — recovery relies on the surrounding at-least-once
+/// design. Hot-path queries use the session-prepared statements.
 pub fn execute_session_db_actions(actions: Vec<SessionDbAction>) {
     execute_session_db_actions_inner(actions, true)
 }
 
-/// [`execute_session_db_actions`] with an asynchronous commit
-/// (`SET LOCAL synchronous_commit = off`) — enterprise multiprocess only,
-/// where the socket loop must not block on a WAL flush. Safe because every
-/// action here is reconstructible or at-least-once: a lost `DrainCdcOutbox`
-/// delete re-delivers, session/subscription state is re-upserted on the
-/// next event, and losing the final few milliseconds of bookkeeping on a
-/// postmaster crash sits inside the same recovery window as the crash
-/// itself (which also destroys the in-memory state those rows mirror).
+/// [`execute_session_db_actions`] with an asynchronous commit (enterprise
+/// multiprocess — the socket loop must not block on a WAL flush). Safe:
+/// every action is reconstructible or at-least-once, and a postmaster
+/// crash loses only bookkeeping inside its own recovery window.
 pub fn execute_session_db_actions_async(actions: Vec<SessionDbAction>) {
     execute_session_db_actions_inner(actions, false)
 }
@@ -180,8 +162,8 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
         let m = crate::metrics::get();
 
         if !synchronous {
-            // Outside the subtransactions below: set_config(..., true) is
-            // transaction-local, and a batch rollback must not undo it.
+            // Outside the subtransactions: a batch rollback must not undo
+            // the transaction-local set_config.
             let _ = pgrx::spi::Spi::connect_mut(|client| {
                 client
                     .select(
@@ -193,10 +175,8 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
             });
         }
 
-        // Fast path: the whole batch in one subtransaction — atomic, and a
-        // PostgreSQL-level error is caught instead of aborting the outer
-        // transaction (which would silently discard every action while
-        // per-statement logs claimed partial progress).
+        // Whole batch in one subtransaction: atomic, and an ERROR is
+        // caught instead of aborting the outer transaction.
         let batch = super::with_subtransaction(|| {
             pgrx::spi::Spi::connect_mut(|client| {
                 for action in &actions {
@@ -210,10 +190,8 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
             return;
         }
 
-        // Isolation path: one action poisoned the batch — retry each in its
-        // own subtransaction so the rest still commit, and drop (log +
-        // count) the failures. No cross-tick retry: recovery relies on the
-        // surrounding at-least-once design.
+        // One action poisoned the batch: retry each individually, drop
+        // (log + count) the failures.
         let mut dropped = 0usize;
         for action in &actions {
             let one = super::with_subtransaction(|| {

@@ -115,16 +115,10 @@ fn persist_plain_run(
     Ok(())
 }
 
-/// Persist one batch of QoS >= 1 / retained publishes in a single
-/// transaction; returns the persisted messages ready for delivery and
-/// whether the transaction committed.
-///
-/// With `synchronous = false` (enterprise multiprocess only), the commit
-/// skips its own WAL flush (`SET LOCAL synchronous_commit = off`): the rows
-/// are immediately visible and correctly ordered, but the caller MUST NOT
-/// emit client-visible effects (PUBACKs, QoS >= 1 delivery) until
-/// `pg_current_wal_flush_lsn()` passes the transaction — see
-/// [`DeferredQueue`].
+/// Persist one batch of QoS >= 1 / retained publishes in one transaction.
+/// With `synchronous = false` the commit skips its WAL flush: rows are
+/// visible and ordered, but the caller MUST NOT emit client-visible
+/// effects until the flush LSN passes the commit — see [`DeferredQueue`].
 fn persist_publish_batch(
     persistent: &[PendingPublish],
     synchronous: bool,
@@ -142,21 +136,17 @@ fn persist_publish_batch(
                 );
             }
             if multi {
-                // Everything below lands in the shared outbox: hold an
-                // enqueue floor before the first message insert so delivery
-                // cursors can't advance past ids this transaction commits
-                // later (see shmem_bridge). Cleared after the transaction.
+                // Floor before the first insert, or delivery cursors
+                // could pass ids this transaction commits later.
                 outbox::arm_enqueue_floor(client, floor_slot)?;
             }
             let mut inbound_rows: Vec<(i64, Arc<str>)> = Vec::new();
             let mut i = 0;
             while i < persistent.len() {
                 if !persistent[i].retain {
-                    // Set-based fast path: a run of consecutive plain
-                    // publishes becomes a single INSERT. Chunking by runs
-                    // (rather than partitioning the whole batch) keeps
-                    // sequence-id order equal to batch order across a
-                    // retain/plain mix — id order is delivery order.
+                    // Runs of plain publishes become one INSERT; chunking
+                    // by runs (not partitioning) keeps id order = batch
+                    // order across a retain/plain mix.
                     let start = i;
                     while i < persistent.len() && !persistent[i].retain {
                         i += 1;
@@ -173,13 +163,11 @@ fn persist_publish_batch(
                 i += 1;
                 let mut msg_id_opt: Option<i64> = None;
 
-                // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
-                // non-retained row at QoS 1 so the forwarded clear has DB
-                // backing for reconnect redelivery. Multi-worker persists
-                // the QoS 0 clear too: cross-worker delivery only travels
-                // through the outbox (which carries message ids), so an
-                // unpersisted clear would reach no live subscriber on any
-                // worker — they'd keep believing the retained value exists.
+                // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, persisting the
+                // forwarded clear at QoS 1 for reconnect redelivery.
+                // Multi-worker persists the QoS 0 clear too — an
+                // unpersisted clear can't travel the outbox and would reach
+                // no subscriber on any worker.
                 if p.retain && p.payload.is_empty() {
                     let topic_ref: &str = &p.topic;
                     let args: Vec<pgrx::datum::DatumWithOid> = vec![topic_ref.into()];
@@ -282,10 +270,8 @@ fn persist_publish_batch(
                 )?;
             }
 
-            // Multi-worker: every persisted publish also goes on the shared
-            // outbox, in this same transaction, so every socket worker's
-            // subscribers see it (this worker included — no direct local
-            // delivery in that topology).
+            // Multi-worker: every persisted publish rides the outbox (no
+            // direct local delivery), enqueued in this same transaction.
             if multi {
                 let outbox_ids: Vec<i64> = to_publish.iter().filter_map(|m| m.id).collect();
                 if !outbox_ids.is_empty() {
@@ -303,10 +289,9 @@ fn persist_publish_batch(
     result
 }
 
-/// Deliver transient (QoS 0, non-retained) publishes immediately — they
-/// have no durability contract, so nothing gates them on a WAL flush in
-/// either topology. Returns any cascading will-publishes for the caller to
-/// route back through its own (sync or deferred) publish path.
+/// Deliver transient (QoS 0, non-retained) publishes immediately — no
+/// durability contract gates them. Returns cascading will-publishes for
+/// the caller's own publish path.
 fn deliver_transient(
     transient: Vec<PendingPublish>,
     clients: &mut HashMap<String, MqttClient>,
@@ -341,10 +326,8 @@ pub(super) fn publish_messages_batch(
     if pending.is_empty() {
         return;
     }
-    // Multi-worker: everything (QoS 0 included) is persisted and routed
-    // through the shared outbox so every worker's subscribers see it; no
-    // direct local delivery. An explicit trade: QoS 0 loses its no-DB fast
-    // path when socket_workers > 1.
+    // Multi-worker routes everything (QoS 0 included) through the outbox
+    // — the explicit trade: QoS 0 loses its no-DB fast path.
     let multi = multi_worker();
     let (persistent, transient) = if multi {
         (pending, Vec::new())
@@ -388,31 +371,24 @@ pub(super) fn publish_messages_batch(
     }
 }
 
-/// One batch of asynchronously-committed publishes whose client-visible
-/// effects (delivery to subscribers, PUBACKs to the publishers) are parked
-/// until `pg_current_wal_flush_lsn()` reaches `watermark` — the point at
-/// which the batch's commit record is durably on disk. Watermarks are
-/// captured in commit order, so FIFO release preserves publish order.
+/// An async-committed batch whose client-visible effects are parked until
+/// the flush LSN reaches `watermark` (commit record on disk). Watermarks
+/// are captured in commit order, so FIFO release preserves publish order.
 struct DeferredRelease {
     watermark: u64,
     queued_at: std::time::Instant,
     messages: Vec<MqttMessage>,
     /// `(client_id, packet_id)` PUBACKs owed once durable.
     pubacks: Vec<(String, u16)>,
-    /// Multi-worker: ring the outbox doorbell when this batch releases —
-    /// not at commit time, or the other workers would deliver QoS 1+
-    /// effects before the durability point the PUBACK gate promises.
+    /// Multi-worker: ring the doorbell at release, not commit — siblings
+    /// must not deliver before the durability point the PUBACKs promise.
     ring_doorbell: bool,
 }
 
 /// How long a [`DeferredRelease`] may wait before the socket loop stops
-/// trusting the off-loop flush path (CDC-worker beacon, WAL writer, other
-/// backends' commits) and pays one synchronous flush itself. The beacon
-/// round trip normally completes within ~3 ticks; past this threshold the
-/// CDC worker is stalled or restarting, or the WAL writer is on its default
-/// 200 ms cadence — and one bounded fsync here beats a 200 ms PUBACK tail.
-/// Worst case this degrades to the pre-split behavior (a sync commit on the
-/// loop), never below it.
+/// trusting the off-loop flush path and pays one synchronous flush itself
+/// — one bounded fsync beats a wal_writer_delay-sized (200 ms) PUBACK
+/// tail. Worst case degrades to pre-split behavior, never below it.
 fn flush_fallback_after() -> Duration {
     std::cmp::max(latch_interval() * 4, Duration::from_millis(20))
 }
@@ -428,11 +404,9 @@ impl DeferredQueue {
         Self::default()
     }
 
-    /// Release every batch whose WAL is now durably flushed: deliver to
-    /// subscribers and send the owed PUBACKs. Watermarks are monotonic, so
-    /// releasing from the front preserves publish order. If the flush
-    /// pointer hasn't caught up, ask the CDC worker to force it — the fsync
-    /// happens in that process, not on this loop.
+    /// Release every durably-flushed batch: deliver, send owed PUBACKs
+    /// (FIFO — watermarks are monotonic). If the flush pointer lags, ask
+    /// the CDC worker to force it; the fsync happens off this loop.
     pub(super) fn release_due(
         &mut self,
         clients: &mut HashMap<String, MqttClient>,
@@ -443,10 +417,8 @@ impl DeferredQueue {
             return;
         }
         let mut flush = wal::read_lsn("pg_current_wal_flush_lsn()");
-        // Local fallback: if the oldest batch has outlived the normal
-        // beacon round trip, stop waiting on the off-loop flush path and
-        // pay one synchronous flush here — bounded, rare, and strictly
-        // better than a wal_writer_delay-sized PUBACK tail.
+        // Oldest batch outlived the beacon round trip: pay one bounded
+        // synchronous flush here rather than a 200 ms PUBACK tail.
         if self.queue.front().is_some_and(|d| {
             flush.map_or(true, |f| d.watermark > f)
                 && d.queued_at.elapsed() >= flush_fallback_after()
@@ -476,11 +448,7 @@ impl DeferredQueue {
             }
         }
         if ring {
-            // Durability confirmed for everything just released — now the
-            // other workers may fetch and deliver it. (Their fetches woken
-            // by unrelated doorbells can still see the rows earlier — async
-            // commits are visible before they are flushed — but the common
-            // path respects the gate.)
+            // Durability confirmed — now siblings may fetch and deliver.
             crate::shmem_bridge::ring_outbox_doorbell();
         }
         if !self.queue.is_empty() {
@@ -488,12 +456,10 @@ impl DeferredQueue {
         }
     }
 
-    /// Shutdown: one synchronous flush makes every earlier asynchronous
-    /// commit durable (we're exiting — blocking is fine), then everything
-    /// parked is delivered and acked before clients are disconnected. If
-    /// even that flush fails, the PUBACKs are withheld — the publishers
-    /// retransmit on reconnect (at-least-once) instead of being told a
-    /// possibly-unflushed message is safe.
+    /// Shutdown: one synchronous flush (blocking is fine here), then
+    /// deliver and ack everything parked. If the flush fails, PUBACKs are
+    /// withheld — publishers retransmit rather than being told an
+    /// unflushed message is safe.
     pub(super) fn release_all(
         &mut self,
         clients: &mut HashMap<String, MqttClient>,
@@ -529,17 +495,11 @@ impl DeferredQueue {
     }
 }
 
-/// Enterprise (Bridged) variant of [`publish_messages_batch`]: persists
-/// with an asynchronous commit and parks delivery + PUBACKs in the
-/// [`DeferredQueue`] instead of blocking the socket loop on the WAL flush.
-/// Only sound with the process split: in the single-worker topology the CDC
-/// tick's own synchronous commits would force catch-up flushes on this same
-/// loop, paying the fsync anyway.
-///
-/// Transient messages still deliver immediately, so a same-publisher QoS 0
-/// message can overtake an earlier QoS 1 message — MQTT ordering guarantees
-/// are per-QoS-flow, so this is permitted (and already happened across
-/// ticks).
+/// Bridged variant of [`publish_messages_batch`]: async commit, delivery +
+/// PUBACKs parked in the [`DeferredQueue`]. Only sound with the process
+/// split — inline CDC's sync commits would force catch-up flushes on this
+/// loop anyway. Transient messages still deliver immediately (QoS 0 may
+/// overtake QoS 1: MQTT ordering is per-QoS-flow).
 pub(super) fn publish_messages_batch_deferred(
     pending: Vec<PendingPublish>,
     clients: &mut HashMap<String, MqttClient>,

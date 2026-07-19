@@ -1,26 +1,13 @@
-//! Cross-process signals between the pgmqtt workers, backed by PostgreSQL
-//! shared memory. What crosses here, and what doesn't, is split by
-//! durability — not everything belongs in shared memory:
+//! Cross-process signals between the pgmqtt workers, in PostgreSQL shared
+//! memory. Split by durability:
 //!
-//! - **QoS >= 1 messages are never carried in shared memory at all.** They
-//!   are already durably persisted to `pgmqtt_messages` by the CDC worker,
-//!   and their ids are queued to `pgmqtt_cdc_outbox` *inside the same
-//!   transaction that persists them*, with the replication slot advanced
-//!   only after that commit (see `server::cdc_worker`). The database is
-//!   the handoff medium: it is
-//!   durable across crashes, preserves insertion order, and never "fills
-//!   up" the way a fixed-size ring does — so at-least-once delivery holds
-//!   with no drop-on-overflow path anywhere. The only thing this module
-//!   contributes for that flow is the [`ring_outbox_doorbell`] counter, a
-//!   wakeup hint that lets `pgmqtt_mqtt` skip polling the outbox table on
-//!   idle ticks.
-//! - **QoS 0 messages that fit the fixed byte caps travel inline** through a
-//!   bounded ring. They were never persisted (fire-and-forget), so there is
-//!   no id to pass; loss on overflow is acceptable for QoS 0 and the ring
-//!   avoids paying a database write for every fire-and-forget message.
-//!   QoS 0 messages that *don't* fit ([`fits_inline`]) take the outbox path
-//!   above instead — persisted, delivered once, then reclaimed — so an
-//!   oversize payload is delivered rather than dropped.
+//! - QoS >= 1 never rides shared memory: the durable, ordered, unbounded
+//!   handoff is the DB itself (`pgmqtt_cdc_outbox`, enqueued in the
+//!   persisting transaction). This module only adds the doorbell wakeup
+//!   hint for it.
+//! - QoS 0 that fits the byte caps rides a bounded inline ring
+//!   (drop-oldest — acceptable for fire-and-forget, and no DB write).
+//!   Oversize QoS 0 spills to the outbox instead of being dropped.
 
 // `pg_shmem_init!`'s expansion refers to `pg_sys` and `#[pg_guard]` unqualified,
 // so both must already be in scope at the call site — hence the prelude import.
@@ -28,15 +15,10 @@ use pgrx::prelude::*;
 use pgrx::{pg_shmem_init, PgAtomic, PgLwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Max buffered QoS 0 messages awaiting delivery.
-///
-/// A single large transaction (e.g. one bulk `INSERT ... SELECT
-/// generate_series(...)`) is replayed to the output plugin as one atomic
-/// unit — `pg_logical_slot_get_changes`'s `upto_nchanges` limit is a soft
-/// cap that yields to transaction boundaries — so a single push burst can
-/// exceed the CDC batch size. QoS 0 is best-effort (matches ring_buffer's
-/// own DEFAULT_CAPACITY for the same reason), so this is sized generously
-/// rather than exactly — it bounds worst-case loss, not eliminates it.
+/// Max buffered QoS 0 messages. One bulk transaction decodes as an atomic
+/// unit (`upto_nchanges` is a soft cap), so a burst can exceed the CDC
+/// batch size; sized generously to bound — not eliminate — worst-case
+/// loss.
 const INLINE_RING_CAPACITY: usize = 8192;
 
 /// Max inline topic length. Longer topics take the outbox path (see module docs).
@@ -67,13 +49,9 @@ pub fn ring_outbox_doorbell() {
     OUTBOX_DOORBELL.get().fetch_add(1, Ordering::Relaxed);
 }
 
-/// Current doorbell value. `pgmqtt_mqtt` compares against the last value it
-/// saw and queries the outbox only when it changed — a missed increment is
-/// impossible (the counter only grows) and at worst costs one extra query.
-/// This is purely an idle-tick optimization: correctness never depends on
-/// it, because the delivery worker also does an unconditional first-tick
-/// query (crash recovery) and keeps re-querying while a fetch comes back
-/// full.
+/// Current doorbell value; readers query the outbox only when it changed.
+/// Purely an idle-tick optimization — the first-tick query and full-fetch
+/// re-query keep correctness independent of it.
 pub fn outbox_doorbell_seq() -> u64 {
     OUTBOX_DOORBELL.get().load(Ordering::Relaxed)
 }
@@ -82,14 +60,11 @@ pub fn outbox_doorbell_seq() -> u64 {
 // WAL flush request (pgmqtt_mqtt -> pgmqtt_cdc)
 // ---------------------------------------------------------------------------
 //
-// In the enterprise topology, pgmqtt_mqtt commits its write transactions
-// with synchronous_commit = off and defers client-visible effects (PUBACKs,
-// QoS >= 1 delivery) until pg_current_wal_flush_lsn() covers them, so the
-// socket loop never blocks on an fsync. Under CDC load the flush advances
-// for free (the CDC worker's batch commits are synchronous); when it
-// doesn't, pgmqtt_mqtt raises this flag and the CDC worker issues one small
-// synchronous commit, which group-flushes all earlier WAL — the fsync
-// happens off the socket loop either way.
+// pgmqtt_mqtt commits async and gates client-visible effects on the flush
+// LSN. Under CDC load the flush advances for free (the CDC worker's sync
+// commits); otherwise this flag asks the CDC worker for one small sync
+// commit that group-flushes all earlier WAL — the fsync stays off the
+// socket loop either way.
 
 static FLUSH_REQUEST: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pgmqtt_bridge_flush_request") };
@@ -110,23 +85,13 @@ pub fn take_wal_flush_request() -> bool {
 // Outbox enqueue floors (socket_workers > 1)
 // ---------------------------------------------------------------------------
 //
-// Multi-worker delivery cursors consume `pgmqtt_cdc_outbox` in id order, but
-// ids (= pgmqtt_messages sequence values) are assigned in *allocation*
-// order while transactions commit in any order: a worker's fetch can see id
-// 100 committed while id 99's transaction is still in flight, advance its
-// cursor to 100, and never deliver 99 — even though 99's publisher gets a
-// PUBACK once that transaction commits. To make the consumed prefix stable,
-// every process that enqueues outbox rows publishes a *floor* — a
-// pgmqtt_messages sequence value read before any of its inserts, so every
-// id it will enqueue is strictly greater — for the duration of its write
-// transaction. Readers only trust ids at or below the minimum active floor
-// ([`enqueue_barrier`]): any in-flight enqueuer that could still commit a
-// smaller id is, by construction, holding a floor below that id.
-//
-// Only pgmqtt's own writers enqueue outbox rows, so the barrier can only be
-// held down by a pgmqtt write transaction (one tick, bounded) — unlike a
-// `pg_snapshot_xmin()` barrier, which any long-running user transaction
-// would pin for its whole lifetime, stalling delivery cluster-wide.
+// Ids are allocated in sequence order but commit in any order: a cursor
+// could see id 100 committed while 99 is still in flight, advance past it,
+// and never deliver 99 despite its PUBACK. So every enqueuer publishes a
+// floor (sequence value read before its first insert — all its ids come
+// later) for the life of its write transaction, and readers only trust ids
+// at or below the minimum active floor. Unlike a pg_snapshot_xmin()
+// barrier, only pgmqtt's own bounded transactions can hold this down.
 
 /// One floor slot per socket worker plus one for the CDC worker.
 const FLOOR_SLOTS: usize = crate::MAX_SOCKET_WORKERS as usize + 1;
@@ -153,20 +118,16 @@ unsafe impl pgrx::PGRXSharedMemory for EnqueueFloors {}
 static ENQUEUE_FLOORS: PgLwLock<EnqueueFloors> =
     unsafe { PgLwLock::new(c"pgmqtt_bridge_enqueue_floors") };
 
-/// Publish this process's enqueue floor. Must be called *before* the first
-/// message/outbox insert of the write transaction, with a sequence value
-/// read at that point; cleared (with [`clear_enqueue_floor`]) only after
-/// the transaction commits or aborts.
+/// Publish this process's enqueue floor; call before the transaction's
+/// first insert, clear only after it commits or aborts.
 pub fn publish_enqueue_floor(slot: usize, floor: i64) {
     if let Some(f) = ENQUEUE_FLOORS.exclusive().floors.get_mut(slot) {
         *f = floor;
     }
 }
 
-/// Clear this process's enqueue floor after its write transaction ends.
-/// Also called once at worker startup so a floor orphaned by a crash (which
-/// would freeze every cursor) never outlives the transaction it covered —
-/// by restart time that transaction has certainly committed or aborted.
+/// Clear the floor after the write transaction ends. Also called at
+/// worker startup: a crash-orphaned floor would freeze every cursor.
 pub fn clear_enqueue_floor(slot: usize) {
     if let Some(f) = ENQUEUE_FLOORS.exclusive().floors.get_mut(slot) {
         *f = i64::MAX;
@@ -190,20 +151,11 @@ pub fn enqueue_barrier() -> i64 {
 // Cross-worker command rings (socket_workers > 1)
 // ---------------------------------------------------------------------------
 //
-// With several socket workers, a client's connection can live in any of
-// them, so two things need a cross-worker control path: session takeover
-// (a new CONNECT with an existing client_id must disconnect the old
-// connection wherever it is) and admin commands (slot 0 drains the
-// pgmqtt_admin_commands table and fans the command out — disconnects and
-// ACL reloads must reach every worker's local clients). Commands are tiny
-// and rare, so a small fixed ring per worker suffices; on overflow the
-// oldest command is dropped with a log line.
-//
-// The two traffics get *separate* rings per worker: takeover kicks are
-// best-effort CONNECT-rate traffic (a lost kick self-heals via keepalive
-// timeout), while admin commands are one-shot security controls whose DB
-// row is already consumed by the time they're queued here — CONNECT churn
-// must not be able to evict a pending disconnect or ACL reload.
+// A client can live on any worker, so takeover kicks and admin fan-out
+// need a cross-worker path; commands are tiny and rare, so fixed
+// drop-oldest rings suffice. Separate rings per class: CONNECT-rate
+// takeover churn must not evict a one-shot admin/security command whose
+// DB row is already consumed.
 
 const CMD_RING_CAPACITY: usize = 256;
 /// Also the broker's client-id admission bound: CONNECT enforces
@@ -223,11 +175,16 @@ pub enum RingClass {
     Admin,
 }
 
-/// Decoded cross-worker command (mirrors `admin_commands::Command`).
+/// Decoded cross-worker command (mirrors `admin_commands::Command`, plus
+/// broker-internal control that has no admin-command counterpart).
 pub enum WorkerCommand {
     DisconnectClient { client_id: String, reason: u8 },
     DisconnectRole { role_name: String, reason: u8 },
     ReloadAcls { target: String },
+    /// The session expired and was deleted DB-side (slot-0 sweep): drop any
+    /// offline in-memory replica — map entry and subscription-tree entries —
+    /// so it can neither be resurrected on reconnect nor keep queueing.
+    EvictSession { client_id: String },
 }
 
 impl From<&crate::admin_commands::Command> for WorkerCommand {
@@ -245,21 +202,6 @@ impl From<&crate::admin_commands::Command> for WorkerCommand {
             Command::ReloadAcls { target } => WorkerCommand::ReloadAcls {
                 target: target.clone(),
             },
-        }
-    }
-}
-
-impl From<WorkerCommand> for crate::admin_commands::Command {
-    fn from(wc: WorkerCommand) -> Self {
-        use crate::admin_commands::Command;
-        match wc {
-            WorkerCommand::DisconnectClient { client_id, reason } => {
-                Command::DisconnectClient { client_id, reason }
-            }
-            WorkerCommand::DisconnectRole { role_name, reason } => {
-                Command::DisconnectRole { role_name, reason }
-            }
-            WorkerCommand::ReloadAcls { target } => Command::ReloadAcls { target },
         }
     }
 }
@@ -337,6 +279,7 @@ fn encode(cmd: &WorkerCommand) -> Option<CmdSlot> {
         WorkerCommand::DisconnectClient { client_id, reason } => (0, *reason, client_id),
         WorkerCommand::DisconnectRole { role_name, reason } => (1, *reason, role_name),
         WorkerCommand::ReloadAcls { target } => (2, 0, target),
+        WorkerCommand::EvictSession { client_id } => (3, 0, client_id),
     };
     if arg.len() > CMD_ARG_CAP {
         pgrx::log!(
@@ -368,6 +311,7 @@ fn decode(slot: &CmdSlot) -> Option<WorkerCommand> {
             reason: slot.reason,
         }),
         2 => Some(WorkerCommand::ReloadAcls { target: arg }),
+        3 => Some(WorkerCommand::EvictSession { client_id: arg }),
         _ => None,
     }
 }

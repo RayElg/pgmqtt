@@ -92,20 +92,15 @@ static MQTTS_PORT: GucSetting<i32> = GucSetting::<i32>::new(8883);
 static WSS_PORT: GucSetting<i32> = GucSetting::<i32>::new(9002);
 static HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(8080);
 
-/// Number of `pgmqtt_mqtt` socket workers (enterprise `multiprocess`
-/// only; forced to 1 otherwise). Like the license-gated topology itself,
-/// this is read once in `_PG_init` — background workers can only be
-/// registered at postmaster start, so changing it requires a full
-/// PostgreSQL restart.
+/// Number of `pgmqtt_mqtt` socket workers (enterprise `multiprocess` only;
+/// forced to 1 otherwise). Read once in `_PG_init` — changing it requires
+/// a full restart.
 static SOCKET_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 pub(crate) const MAX_SOCKET_WORKERS: i32 = 8;
 
-/// The socket-worker count derived from the *current* license + GUC state.
-/// Only `_PG_init` may consult this — everything after postmaster start
-/// must use [`boot_socket_workers`], or a license/GUC change observed by a
-/// restarting worker would put it in a different topology than the worker
-/// set registered at boot (e.g. a worker running standalone CDC while
-/// `pgmqtt_cdc` also owns the slot).
+/// Socket-worker count from the *current* license + GUC state. Only
+/// `_PG_init` may consult this; workers must use [`boot_socket_workers`],
+/// or a restart could observe a different topology than was registered.
 fn socket_worker_count() -> i32 {
     if crate::license::has_feature(crate::license::Feature::MultiProcess) {
         SOCKET_WORKERS.get().clamp(1, MAX_SOCKET_WORKERS)
@@ -114,12 +109,9 @@ fn socket_worker_count() -> i32 {
     }
 }
 
-// The topology decision made in `_PG_init`, frozen for the life of the
-// postmaster. Plain process-inherited statics: `_PG_init` runs in the
-// postmaster (shared_preload_libraries) and every background worker is
-// forked from it, so workers see exactly the values the worker registration
-// used — regardless of what the license key or GUCs say by the time a
-// worker (re)starts.
+// The `_PG_init` topology decision, frozen for the postmaster's life.
+// Workers inherit these by fork, so they see the registration-time values
+// regardless of later license/GUC changes.
 static BOOT_MULTIPROCESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static BOOT_SOCKET_WORKERS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
@@ -319,16 +311,10 @@ pub fn get_tls_key_file_guc() -> String {
 // SQL-callable functions
 // ---------------------------------------------------------------------------
 
-/// Serialize schema migrations with an advisory lock, released automatically
-/// at the end of the enclosing transaction.
-///
-/// `pgmqtt_mqtt` and `pgmqtt_cdc` both call this at startup and can start in
-/// either order (or simultaneously), so without this lock two sessions can
-/// race the same `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE` — Postgres DDL
-/// isn't safe against true concurrent execution, so a naive race can throw
-/// duplicate-key errors or deadlock (the .set_restart_time(5s) BGW retry
-/// self-heals either way, but this avoids the noise and the extra ~5s to
-/// converge on first boot).
+/// Serialize schema migrations (and all other worker-startup writes) with
+/// a transaction-scoped advisory lock: both workers run them at startup in
+/// any order, and concurrent IF-NOT-EXISTS DDL can still throw or
+/// deadlock.
 pub(crate) const SCHEMA_MIGRATION_LOCK_KEY: i64 = 0x706D71_7400_0001; // arbitrary, "pmqt" + version
 fn ensure_tables_exist() {
     let _ = pgrx::spi::Spi::run(&format!(
@@ -1563,23 +1549,16 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
-    // Postgres shared memory: fixed-size cross-process structures must be
-    // requested here, in _PG_init, before the postmaster forks any backend
-    // (the extension must be loaded via shared_preload_libraries).
+    // Shared memory must be requested in _PG_init, before the postmaster
+    // forks any backend.
     crate::metrics::init_shared();
 
-    // Process topology is decided once, here, from the license key GUC
-    // (config-file GUCs are parsed before shared_preload_libraries load).
-    // Background workers registered in _PG_init are fixed for the life of
-    // the postmaster, so unlike every other license feature this one needs
-    // a full PostgreSQL restart to change.
-    //
-    // Community: one "pgmqtt_mqtt" worker does everything, CDC inline
-    // (server::run_standalone). Enterprise ('multiprocess'): "pgmqtt_mqtt"
-    // is delivery-only and a separate "pgmqtt_cdc" worker owns the slot
-    // plus the other DB-only pipelines, so a backlogged WAL drain or an
-    // fsync can never stall socket I/O (see server::cdc_worker::run_cdc
-    // and crate::shmem_bridge for the handoff design).
+    // Topology is decided once, here, from the license key GUC — worker
+    // registration is fixed for the postmaster's life, so unlike every
+    // other license feature this needs a full restart to change.
+    // Community: one worker, CDC inline. Enterprise 'multiprocess': a
+    // separate pgmqtt_cdc worker owns the slot and the DB-only pipelines,
+    // so WAL drains and fsyncs never stall socket I/O.
     let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
     if multiprocess {
         crate::shmem_bridge::init();
@@ -1590,11 +1569,8 @@ pub unsafe extern "C" fn _PG_init() {
     BOOT_MULTIPROCESS.store(multiprocess, std::sync::atomic::Ordering::Relaxed);
     BOOT_SOCKET_WORKERS.store(socket_workers, std::sync::atomic::Ordering::Relaxed);
 
-    // One or more socket workers. Slot 0 is named "pgmqtt_mqtt" and owns
-    // the singleton duties (HTTP healthcheck, metrics flush, sweeps,
-    // outbox GC); slots 1+ are pure socket/delivery workers sharing the
-    // same ports via SO_REUSEPORT. The slot index travels as the BGW main
-    // argument.
+    // Slot 0 ("pgmqtt_mqtt") owns the singleton duties; slots 1+ share the
+    // ports via SO_REUSEPORT. The slot index is the BGW main argument.
     for slot in 0..socket_workers {
         let name = if slot == 0 {
             "pgmqtt_mqtt".to_string()
@@ -1635,17 +1611,11 @@ fn ensure_replication_slot(slot_name: &str) {
     );
 
     match Spi::connect(|client| {
-        // Serialize against the other worker's startup write transactions
-        // (schema migrations, replication-origin creation — all taken under
-        // this same advisory lock). Slot creation waits for every
-        // in-progress write transaction to finish before it can find a
-        // decoding start point, and that wait does not observe the BGW's
-        // SIGTERM flag — so racing a concurrent startup write can wedge
-        // this worker long enough to fail a fast shutdown (observed as
-        // one-in-a-few container boot failures: the initdb temp server's
-        // immediate shutdown hits exactly this window). Taking the lock
-        // first means no partner write transaction is in flight while the
-        // slot searches for its start point.
+        // Slot creation waits for in-progress write transactions to find
+        // its decoding start point, and that wait ignores the BGW SIGTERM
+        // flag — racing an unserialized partner startup write wedged fast
+        // shutdowns (observed container boot failures). The advisory lock
+        // keeps partner writes out of flight during the search.
         let _ = client.select(
             &format!("SELECT pg_advisory_xact_lock({SCHEMA_MIGRATION_LOCK_KEY})"),
             None,
@@ -1676,12 +1646,9 @@ pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
 
-    // The topology decisions _PG_init made when it registered the workers,
-    // inherited through fork — NOT re-derived from license/GUC state, which
-    // can have changed since boot: the registered worker set is fixed for
-    // the postmaster's lifetime, and a worker restarting into a different
-    // answer would run a mixed topology (e.g. consuming the CDC slot inline
-    // while pgmqtt_cdc also owns it).
+    // Boot-frozen topology, inherited through fork — never re-derived
+    // from license/GUC state, or a restarting worker could run a mixed
+    // topology (e.g. inline CDC while pgmqtt_cdc also owns the slot).
     let multiprocess = boot_multiprocess();
     let socket_workers = boot_socket_workers();
     pgrx::log!(
@@ -1696,23 +1663,16 @@ pub unsafe extern "C-unwind" fn pgmqtt_mqtt_worker_main(arg: pg_sys::Datum) {
         db_name
     );
 
-    // Ensure tables exist. In multiprocess mode also called by
-    // pgmqtt_cdc_worker_main at its own startup (both idempotent, CREATE ...
-    // IF NOT EXISTS, and serialized by an advisory lock) since the workers
-    // can start in any order.
+    // Also run by pgmqtt_cdc at its startup — idempotent, advisory-locked.
     BackgroundWorker::transaction(|| {
         ensure_tables_exist();
     });
 
     let ports = get_port_gucs();
     if multiprocess {
-        // CDC slot consumption happens in the separate pgmqtt_cdc worker;
-        // this loop delivers what it queues (outbox + shmem bridge).
         server::run_delivery(ports, worker_slot, socket_workers);
     } else {
-        // Community: no second worker — own the replication slot and tick
-        // CDC inline, in this same process, exactly like the original
-        // combined-worker design. socket_workers is always 1 here.
+        // Community: own the slot and tick CDC inline (socket_workers = 1).
         let slot_name = "pgmqtt_slot";
         BackgroundWorker::transaction(|| {
             ensure_replication_slot(slot_name);
@@ -1764,12 +1724,12 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
     cb.filter_by_origin_cb = Some(pg_decode_filter_by_origin);
 }
 
-/// Skip decoding WAL that pgmqtt's own workers committed (message
-/// persistence, outbox bookkeeping, session state, ...). That WAL can
-/// never yield an outbound event — `pg_decode_change` already drops every
-/// `pgmqtt_*` table by name — but without this callback each such record
-/// still pays full reorder-buffer processing on every slot read. Filtering
-/// by origin rejects them before they are queued at all.
+/// Skip decoding the workers' own WAL (message persistence, outbox and
+/// session bookkeeping): `pg_decode_change` would drop it by table name
+/// anyway, but this rejects it before reorder-buffer processing. The one
+/// worker flow that MUST stay decodable — inbound-mapped writes into user
+/// tables (MQTT → table → MQTT echo) — detaches the session origin first
+/// (`server::topology::suspend_session_origin`), arriving here untagged.
 ///
 /// Origin ids are registered in shared memory by each worker session at
 /// startup (`server::setup_replication_origin`). Records with no origin
@@ -1804,15 +1764,11 @@ unsafe extern "C-unwind" fn pg_decode_begin_txn(
 ) {
 }
 
-/// Emits a marker row at the commit record's LSN. The CDC consumer peeks
-/// the slot and advances it to the last emitted row's LSN after processing
-/// (see `cdc_tick_core`) — and only a row at the commit record's own
-/// position makes that boundary exact: change rows sit *below* their
-/// transaction's commit record, so advancing to one leaves the whole
-/// transaction "committing after confirmed_flush" and re-emitted forever.
-/// This also keeps the slot's WAL retention bounded under unrelated write
-/// load: transactions whose every change is skipped still surface one row
-/// to advance past.
+/// Emits a marker row at the commit record's LSN. The consumer advances
+/// the slot to the last emitted row — change rows sit *below* their commit
+/// record, so advancing to one re-emits the transaction forever; only the
+/// marker makes the boundary exact. Also gives fully-skipped transactions
+/// a row to advance past (bounds WAL retention).
 #[pg_guard]
 unsafe extern "C-unwind" fn pg_decode_commit_txn(
     ctx: *mut pg_sys::LogicalDecodingContext,

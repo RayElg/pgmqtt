@@ -13,11 +13,9 @@ pub struct BrokerMetrics {
     // Connections
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
-    /// Live connections per socket-worker slot. Split per slot (rather than
-    /// one shared gauge) so a restarting worker can zero its own count: the
-    /// license connection cap is enforced against the sum, and a crashed
-    /// worker's un-decremented connections would otherwise shrink the
-    /// effective cap until a full PostgreSQL restart.
+    /// Live connections per worker slot, so a restarting worker can zero
+    /// its own count — a crashed worker's un-decremented gauge would
+    /// shrink the license cap until a full restart.
     pub connections_per_slot: [AtomicU64; crate::MAX_SOCKET_WORKERS as usize],
     pub disconnections_clean: AtomicU64,
     pub disconnections_unclean: AtomicU64,
@@ -47,11 +45,8 @@ pub struct BrokerMetrics {
     pub subscribe_ops: AtomicU64,
     pub unsubscribe_ops: AtomicU64,
 
-    // CDC / outbound pipeline counters and inbound (MQTT -> DB) pipeline
-    // counters live in `SharedCdcCounters` (real PostgreSQL shared memory)
-    // instead of here, since with the enterprise multiprocess topology they
-    // are written by the separate `pgmqtt_cdc` worker process and read by
-    // `pgmqtt_mqtt`'s metrics flush — see `shared_cdc()` below.
+    // CDC/inbound pipeline counters live in `SharedCdcCounters`: the
+    // pgmqtt_cdc process writes them, pgmqtt_mqtt's flush reads them.
 
     // DB batch operations
     pub db_batches_committed: AtomicU64,
@@ -107,11 +102,8 @@ impl Default for BrokerMetrics {
     }
 }
 
-/// Broker counters live in PostgreSQL shared memory: with
-/// `pgmqtt.socket_workers > 1` several socket workers increment them
-/// concurrently and slot 0 flushes the combined totals; it also makes
-/// `connections_current` a cluster-wide gauge (used for license
-/// connection-cap enforcement) and lets SQL backends read live values.
+/// In PostgreSQL shared memory: N workers increment, slot 0 flushes the
+/// totals, and the connection gauge is cluster-wide (license cap).
 static METRICS: pgrx::PgAtomic<BrokerMetrics> =
     unsafe { pgrx::PgAtomic::new(c"pgmqtt_broker_metrics") };
 
@@ -152,13 +144,9 @@ pub fn slot_connections_reset(slot: i32) {
     }
 }
 
-/// CDC / outbound pipeline counters, in real PostgreSQL shared memory.
-///
-/// Every field is an `AtomicU64`, so concurrent `fetch_add` from both the
-/// `pgmqtt_cdc` worker (which increments these) and `pgmqtt_mqtt` (which
-/// reads them for `flush_metrics_snapshot`/Prometheus) is safe without an
-/// `LWLock` — `PgAtomic` just hands out `&SharedCdcCounters` to whichever
-/// process asks, backed by the same shared memory segment.
+/// CDC / outbound / inbound pipeline counters in shared memory — written
+/// by pgmqtt_cdc, read by pgmqtt_mqtt's flush. All AtomicU64, no LWLock
+/// needed.
 pub struct SharedCdcCounters {
     pub events_processed: AtomicU64,
     pub msgs_published: AtomicU64,
@@ -166,28 +154,18 @@ pub struct SharedCdcCounters {
     pub slot_errors: AtomicU64,
     pub persist_errors: AtomicU64,
     pub ring_buffer_dropped: AtomicU64,
-    /// QoS 0 messages dropped by the `pgmqtt_cdc` -> `pgmqtt_mqtt`
-    /// shared-memory inline ring on overflow. Persisted (QoS >= 1 and
-    /// oversize QoS 0) messages travel through the durable
-    /// `pgmqtt_cdc_outbox` queue instead and are never dropped.
+    /// QoS 0 drops from the inline ring on overflow; persisted messages
+    /// ride the durable outbox and are never dropped.
     pub bridge_dropped: AtomicU64,
 
-    // Inbound (MQTT -> DB) pipeline. In the enterprise multiprocess
-    // topology the QoS 1 pending pump runs in the pgmqtt_cdc worker while
-    // QoS 0 direct writes stay in pgmqtt_mqtt, so these must be visible
-    // across both processes.
     pub inbound_writes_ok: AtomicU64,
     pub inbound_writes_failed: AtomicU64,
     pub inbound_retries: AtomicU64,
     pub inbound_dead_letters: AtomicU64,
 
-    /// Replication-origin ids of pgmqtt's own worker sessions (0 = empty
-    /// slot). Registered by `server::setup_replication_origin` at worker
-    /// startup; read by the output plugin's `filter_by_origin_cb` (which
-    /// may run in any backend that reads the slot) to skip decoding WAL
-    /// the workers generated themselves. Ids are never unregistered: a
-    /// worker restart re-attaches the same named origin and therefore the
-    /// same id, and origins are never dropped while the cluster runs.
+    /// Replication-origin ids of pgmqtt's worker sessions (0 = empty),
+    /// read by `filter_by_origin_cb` from any backend. Never
+    /// unregistered: a restart re-attaches the same named origin/id.
     pub worker_origins: [AtomicU64; MAX_WORKER_ORIGINS],
 }
 

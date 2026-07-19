@@ -1,30 +1,15 @@
-//! Readiness-based client polling (Linux epoll).
+//! Readiness-based client polling (Linux epoll): the read pass is
+//! O(active) instead of O(connections); epoll is consulted with a zero
+//! timeout, never waited on. Correctness notes:
 //!
-//! The tick loop used to attempt a nonblocking `read()` on every connected
-//! client every tick — O(connections) syscalls at 200 ticks/s regardless of
-//! activity, which is what capped connection counts in practice. An epoll
-//! set makes each tick's read pass O(active clients): `epoll_wait` with a
-//! zero timeout reports exactly which sockets have bytes (or errors /
-//! hangups — those also wake a read, which then surfaces them through the
-//! normal error paths), and everything else is skipped. Tick pacing stays
-//! on the BGW latch; epoll is consulted, never waited on.
-//!
-//! Correctness notes:
-//!
-//! - **Level-triggered** (the epoll default): unconsumed kernel bytes keep
-//!   the fd in every subsequent ready set, so a partial drain can never
-//!   strand data.
-//! - **Carry-over rule:** a client that actually read bytes this tick, or
-//!   stopped early on the per-tick buffer cap, is re-polled next tick even
-//!   if its fd shows nothing new — TLS and WebSocket transports can hold
-//!   decrypted/decoded bytes internally after the kernel buffer drains,
-//!   and a cap-limited client still has backlog by definition.
-//! - **Reconnect takeover:** inserting a new connection under an existing
-//!   client_id swaps the transport (new fd). `sync` compares fds, not just
-//!   ids, so the replacement is re-registered.
-//! - **Fallback:** on non-Linux builds, or if any epoll call fails, the
-//!   ready set is `None` and the caller polls every client exactly as
-//!   before. Readiness is an optimization, never a correctness dependency.
+//! - Level-triggered: unconsumed kernel bytes keep the fd in every ready
+//!   set, so a partial drain can't strand data.
+//! - Carry-over: a client that read bytes or hit the per-tick cap is
+//!   re-polled next tick — TLS/WS transports buffer decrypted bytes
+//!   internally.
+//! - Takeover swaps the transport; `sync` compares fds, not just ids.
+//! - Fallback: `None` (poll everyone) on non-Linux or any epoll failure —
+//!   readiness is an optimization, never a correctness dependency.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,10 +20,14 @@ pub(crate) struct ReadinessPoller {
     by_fd: HashMap<i32, String>,
     /// client_id -> fd mirror of `by_fd`.
     by_id: HashMap<String, i32>,
-    /// Clients whose registration failed — always polled.
-    always: HashSet<String>,
-    /// Clients to force into the next ready set (see carry-over rule).
-    pub(crate) carry: HashSet<String>,
+    /// Fds whose registration failed — always polled. Rebuilt every sync.
+    always: HashSet<i32>,
+    /// Fds to force into the next ready set (see carry-over rule). Keyed by
+    /// fd, not client_id: the per-event/per-chunk inserts and lookups stay
+    /// integer-hashed and allocation-free on the hot path. A stale fd (its
+    /// client departed, the number possibly reused) costs at most one
+    /// spurious WouldBlock read next tick.
+    pub(crate) carry: HashSet<i32>,
     /// Reusable `epoll_wait` output buffer, grown to the interest-set size.
     #[cfg(target_os = "linux")]
     events: Vec<libc::epoll_event>,
@@ -96,7 +85,9 @@ impl ReadinessPoller {
             }
             live
         });
-        self.always.retain(|id| clients.contains_key(id));
+        // Repopulated below from this tick's registration failures, so
+        // departed fds never linger to force-poll an unrelated newcomer.
+        self.always.clear();
 
         for (id, client) in clients {
             let fd = client.transport.raw_fd();
@@ -122,9 +113,8 @@ impl ReadinessPoller {
                     }
                 }
                 self.by_id.insert(id.clone(), fd);
-                self.always.remove(id);
             } else {
-                self.always.insert(id.clone());
+                self.always.insert(fd);
             }
         }
     }
@@ -157,14 +147,14 @@ impl ReadinessPoller {
         false
     }
 
-    /// The set of clients worth attempting a read on this tick, or `None`
-    /// to poll everyone (fallback mode / epoll error).
-    pub(crate) fn ready_set(&mut self) -> Option<HashSet<String>> {
+    /// The set of fds worth attempting a read on this tick, or `None` to
+    /// poll everyone (fallback mode / epoll error).
+    pub(crate) fn ready_set(&mut self) -> Option<HashSet<i32>> {
         #[cfg(target_os = "linux")]
         {
             let epfd = self.epfd?;
             let mut ready = std::mem::take(&mut self.carry);
-            ready.extend(self.always.iter().cloned());
+            ready.extend(self.always.iter().copied());
 
             // One wait, with the buffer sized to the interest set, reports
             // every currently-ready fd exactly once. Level-triggered epoll
@@ -201,9 +191,7 @@ impl ReadinessPoller {
                 return None;
             };
             for ev in self.events.iter().take(n as usize) {
-                if let Some(id) = self.by_fd.get(&(ev.u64 as i32)) {
-                    ready.insert(id.clone());
-                }
+                ready.insert(ev.u64 as i32);
             }
             Some(ready)
         }

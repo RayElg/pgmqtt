@@ -16,6 +16,10 @@ tests/enterprise/integration/test_multiprocess.py):
 - A burst of simultaneously-readable sockets larger than the old 256-event
   epoll buffer must not stall the tick loop (level-triggered re-reporting
   made the old drain loop a remotely triggerable livelock).
+- A table with both an inbound and an outbound mapping echoes MQTT-written
+  rows back out through CDC: the worker's replication-origin tagging (which
+  the decoder filters) must be suspended for inbound target-table writes,
+  or the echo silently disappears.
 """
 
 import os
@@ -33,6 +37,7 @@ from proto_utils import (  # noqa: E402
     MQTTControlPacket,
     create_connect_packet,
     create_disconnect_packet,
+    create_puback_packet,
     create_publish_packet,
     create_subscribe_packet,
     encode_properties,
@@ -41,6 +46,7 @@ from proto_utils import (  # noqa: E402
     recv_packet,
     validate_connack,
     validate_puback,
+    validate_publish,
     validate_suback,
 )
 from test_utils import get_db_conn, run_sql  # noqa: E402
@@ -401,3 +407,67 @@ def test_many_simultaneously_ready_sockets_do_not_stall_the_loop():
                 s.close()
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Inbound → outbound echo through a doubly-mapped table
+# ---------------------------------------------------------------------------
+
+
+def test_inbound_write_echoes_through_outbound_mapping():
+    """A table with both an inbound and an outbound mapping must echo
+    MQTT-written rows back out through CDC. The broker's own writes are
+    tagged with a replication origin the decoder filters, so the inbound
+    pump has to suspend that origin for its target-table writes — without
+    that, the echo silently disappears."""
+    run_sql("DROP TABLE IF EXISTS secrev_echo")
+    run_sql("CREATE TABLE secrev_echo (id serial PRIMARY KEY, device text, reading text)")
+    run_sql("ALTER TABLE secrev_echo REPLICA IDENTITY FULL")
+    run_sql(
+        "SELECT pgmqtt_add_outbound_mapping('public', 'secrev_echo', "
+        "'secrev/echo-out/{{ columns.device }}', '{{ columns.reading }}', 1, 'echo_out')"
+    )
+    run_sql(
+        """
+        SELECT pgmqtt_add_inbound_mapping(
+            'secrev/echo-in/{device}',
+            'secrev_echo',
+            '{"device": "{device}", "reading": "$.reading"}'::jsonb,
+            'insert',
+            NULL,
+            'public',
+            'secrev_echo_in'
+        )
+        """
+    )
+    time.sleep(6)  # outbound mapping propagates to the slot cache through WAL
+
+    sub, _p, rc, _pr = _connect("secrev-echo-sub")
+    pub, _p2, rc2, _pr2 = _connect("secrev-echo-pub")
+    try:
+        assert rc == RC_SUCCESS and rc2 == RC_SUCCESS
+        _subscribe(sub, 1, "secrev/echo-out/#", qos=1)
+        _publish_qos1_acked(pub, "secrev/echo-in/dev7", b'{"reading": "42"}', 9)
+
+        got = None
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            pkt = recv_packet(sub, timeout=2.0)
+            if pkt is not None and (pkt[0] & 0xF0) >> 4 == MQTTControlPacket.PUBLISH:
+                got = pkt
+                break
+        assert got is not None, (
+            "inbound-written row never echoed through the outbound mapping — "
+            "origin filtering swallowed the pump's target-table write"
+        )
+        topic, payload, qos, _d, _r, pid, _props = validate_publish(got)
+        assert topic == "secrev/echo-out/dev7", topic
+        assert bytes(payload) == b"42", payload
+        if qos == 1 and pid is not None:
+            sub.sendall(create_puback_packet(pid))
+    finally:
+        sub.close()
+        pub.close()
+        run_sql("SELECT pgmqtt_remove_outbound_mapping('public', 'secrev_echo', 'echo_out')")
+        run_sql("SELECT pgmqtt_remove_inbound_mapping('secrev_echo_in')")
+        run_sql("DROP TABLE IF EXISTS secrev_echo")

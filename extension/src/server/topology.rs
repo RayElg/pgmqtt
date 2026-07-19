@@ -127,17 +127,10 @@ fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
     }
 }
 
-/// Remove rows owned by worker slots that no longer exist. The worker count
-/// is fixed per postmaster boot, so after `pgmqtt.socket_workers` shrinks
-/// (or the license lapses back to community), any row with
-/// `worker_slot >= socket_workers()` is defunct: its outbox cursor would
-/// pin the slot-0 GC watermark forever (unbounded `pgmqtt_cdc_outbox`
-/// growth — nothing else ever advances a defunct cursor), and its
-/// connections-cache rows would linger as phantom connections (each worker
-/// prunes only its own slot's rows).
-///
-/// Runs once at startup on slot 0. Safe on a mere worker restart too: no
-/// live worker can hold a slot >= the boot-time count.
+/// Remove rows owned by slots beyond the boot-time worker count (topology
+/// shrank): a defunct outbox cursor pins the GC watermark forever, and
+/// defunct connections-cache/session rows linger as phantoms. Slot 0, at
+/// startup; safe on any restart — no live worker holds a slot >= count.
 pub(super) fn sweep_defunct_slots() {
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
@@ -182,22 +175,16 @@ pub(super) fn sweep_defunct_slots() {
     });
 }
 
-/// Tag every transaction this worker session commits with a named
-/// replication origin, and register the origin's id in shared memory so the
-/// output plugin can skip the worker's own WAL *before* it enters the
-/// reorder buffer (`pg_decode_filter_by_origin` in lib.rs). User writes (no
-/// origin) and foreign replication origins are unaffected.
-///
-/// Failure is logged and tolerated — the broker is fully correct without
-/// origin tagging, just slower to decode under write load.
+/// Tag this session's commits with a named replication origin and register
+/// its id in shared memory, so the output plugin skips the worker's own
+/// WAL pre-reorder-buffer. Failure is tolerated — correct without it,
+/// just slower to decode.
 pub(crate) fn setup_replication_origin(name: &str) {
     let ident = BackgroundWorker::transaction(|| {
         super::with_subtransaction(|| {
             pgrx::spi::Spi::connect_mut(|client| {
-                // Serialized with the partner worker's slot creation: a write
-                // transaction in flight while the slot searches for its
-                // decoding start point can wedge that worker through a fast
-                // shutdown (see ensure_replication_slot in lib.rs).
+                // Advisory-locked against the partner worker's slot
+                // creation (see ensure_replication_slot in lib.rs).
                 let _ = client.select(
                     &format!(
                         "SELECT pg_advisory_xact_lock({})",
@@ -235,6 +222,7 @@ pub(crate) fn setup_replication_origin(name: &str) {
     match ident {
         Ok(Some(id)) if id > 0 => {
             crate::metrics::register_worker_origin(id as u16);
+            let _ = SESSION_ORIGIN_NAME.set(name.to_string());
             log!("pgmqtt: replication origin '{}' attached (id {})", name, id);
         }
         other => {
@@ -245,5 +233,58 @@ pub(crate) fn setup_replication_origin(name: &str) {
                 other
             );
         }
+    }
+}
+
+// The session origin tags every WAL record — including inbound-mapped
+// rows in user target tables, which must stay decodable (a doubly-mapped
+// table echoes MQTT-written rows back out through CDC). Inbound write
+// batches detach it for their duration. Origin state is not
+// transactional; the flag tracks reality across aborts.
+static SESSION_ORIGIN_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SESSION_ORIGIN_SUSPENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Detach the session origin so the caller's writes decode as ordinary user
+/// writes. Must run inside the caller's transaction *before* its first WAL
+/// write; stays detached until [`resume_session_origin`]. No-op when no
+/// origin is attached (or it is already suspended).
+pub(crate) fn suspend_session_origin(
+    client: &mut pgrx::spi::SpiClient<'_>,
+) -> Result<(), pgrx::spi::Error> {
+    use std::sync::atomic::Ordering;
+    if SESSION_ORIGIN_NAME.get().is_none() || SESSION_ORIGIN_SUSPENDED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    client.select("SELECT pg_replication_origin_session_reset()", None, &[])?;
+    SESSION_ORIGIN_SUSPENDED.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Re-attach the session origin after a run of inbound writes. On failure
+/// the flag stays set so the next call retries; until then this process's
+/// own WAL is decoded and discarded by name instead of filtered — correct,
+/// just slower.
+pub(crate) fn resume_session_origin() {
+    use std::sync::atomic::Ordering;
+    if !SESSION_ORIGIN_SUSPENDED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(name) = SESSION_ORIGIN_NAME.get() else {
+        return;
+    };
+    let ok = BackgroundWorker::transaction(|| {
+        pgrx::spi::Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![name.as_str().into()];
+            client
+                .update("SELECT pg_replication_origin_session_setup($1)", None, &args)
+                .map(|_| ())
+        })
+        .is_ok()
+    });
+    if ok {
+        SESSION_ORIGIN_SUSPENDED.store(false, Ordering::Relaxed);
+    } else {
+        log!("pgmqtt: failed to re-attach replication origin '{}' — will retry", name);
     }
 }
