@@ -8,7 +8,6 @@ use super::{
     MqttMessage, SessionDbAction,
 };
 use crate::mqtt;
-use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -125,9 +124,12 @@ fn persist_publish_batch(
 ) -> (Vec<MqttMessage>, bool) {
     let multi = multi_worker();
     let floor_slot = super::worker_slot().max(0) as usize;
-    let result = BackgroundWorker::transaction(|| {
+    // transaction_or_abort, not BackgroundWorker::transaction: the latter
+    // commits even when the closure returns Err, which would leave partial
+    // message rows committed but never enqueued (nothing reclaims them).
+    let (result, _) = super::transaction_or_abort(|| {
         let mut to_publish = Vec::new();
-        pgrx::spi::Spi::connect_mut(|client| {
+        let spi_result = pgrx::spi::Spi::connect_mut(|client| {
             if !synchronous {
                 let _ = client.select(
                     "SELECT set_config('synchronous_commit', 'off', true)",
@@ -279,10 +281,15 @@ fn persist_publish_batch(
                 }
             }
             Ok::<_, pgrx::spi::Error>(())
-        })?;
-        Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
-    })
-    .unwrap_or((Vec::new(), false));
+        });
+        match spi_result {
+            Ok(()) => ((to_publish, true), true),
+            Err(e) => {
+                log!("pgmqtt: publish batch persist failed, rolling back: {}", e);
+                ((Vec::new(), false), false)
+            }
+        }
+    });
     if multi {
         crate::shmem_bridge::clear_enqueue_floor(floor_slot);
     }

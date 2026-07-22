@@ -956,6 +956,24 @@ def test_multiworker_disconnected_sessions_expire_on_any_worker(multi_broker):
     )
 
 
+def test_multiworker_client_id_over_cap_rejected(multi_broker):
+    """With socket_workers > 1 every admitted client must fit the fixed
+    cross-worker command slots (CMD_ARG_CAP = 128 bytes), so longer ids are
+    rejected with 0x85. Single-worker acceptance of long ids is covered in
+    tests/integration/test_security_review.py."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5.0)
+    s.connect(("127.0.0.1", multi_broker.mqtt_port))
+    try:
+        s.sendall(create_connect_packet("c" * 129))
+        connack = recv_packet(s)
+        assert connack is not None, "no CONNACK"
+        _present, rc, _props = validate_connack(connack)
+        assert rc == 0x85, hex(rc)
+    finally:
+        s.close()
+
+
 def test_multiworker_concurrent_qos1_publishers_no_loss(multi_broker):
     """Concurrent publishers commit their outbox batches in arbitrary order
     while ids are assigned in allocation order; without the enqueue-floor

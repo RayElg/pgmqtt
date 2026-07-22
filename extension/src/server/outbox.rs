@@ -78,7 +78,7 @@ fn seed_cursor(slot: i32) -> i64 {
             client.update(
                 "INSERT INTO pgmqtt_outbox_cursors (worker_slot, last_id) \
                  VALUES ($1, COALESCE((SELECT MIN(last_id) FROM pgmqtt_outbox_cursors), 0)) \
-                 ON CONFLICT (worker_slot) DO NOTHING",
+                 ON CONFLICT (worker_slot) DO UPDATE SET last_seen = now()",
                 None,
                 &args,
             )?;
@@ -154,18 +154,50 @@ pub(super) fn claim_share_groups(
 /// Slot-0 GC (multi-worker): delete outbox rows every cursor has passed
 /// and reclaim orphaned messages — per-delivery cleanup would race the
 /// other workers. Bounded per pass; the swept count lets the caller tell a
-/// drained pass from leftover backlog.
-fn gc_below_min_cursor() -> usize {
+/// drained pass from leftover backlog. Also returns how many cursors were
+/// ignored as stale (no heartbeat within `pgmqtt.outbox_cursor_stale_secs`)
+/// — a wedged or crash-looping worker must not pin the watermark and grow
+/// the outbox, messages table, and WAL without bound. The ignored worker,
+/// if it revives, resumes above the watermark and misses whatever GC
+/// reclaimed for its local subscribers: bounded growth wins over a worker
+/// dead for minutes.
+fn gc_below_min_cursor() -> (usize, u64) {
+    let stale_secs = crate::get_outbox_cursor_stale_secs_guc();
+    // Watermark = MIN(last_id) over live cursors; stale_secs = 0 disables
+    // staleness and every cursor counts.
+    let watermark = format!(
+        "SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors \
+         WHERE {} = 0 OR last_seen >= now() - make_interval(secs => {})",
+        stale_secs, stale_secs
+    );
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect_mut(|client| {
+            let stale: i64 = if stale_secs == 0 {
+                0
+            } else {
+                client
+                    .select(
+                        &format!(
+                            "SELECT count(*) FROM pgmqtt_outbox_cursors \
+                             WHERE last_seen < now() - make_interval(secs => {})",
+                            stale_secs
+                        ),
+                        None,
+                        &[],
+                    )?
+                    .first()
+                    .get_one::<i64>()?
+                    .unwrap_or(0)
+            };
             let swept = client.update(
                 &format!(
                     "DELETE FROM pgmqtt_cdc_outbox \
                      WHERE id IN (\
                          SELECT id FROM pgmqtt_cdc_outbox \
-                         WHERE id <= (SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors) \
+                         WHERE id <= ({}) \
                          ORDER BY id LIMIT {}) \
                      RETURNING id",
+                    watermark,
                     cdc_worker::CDC_BATCH_SIZE
                 ),
                 None,
@@ -179,17 +211,19 @@ fn gc_below_min_cursor() -> usize {
                 let _ = db_action::cleanup_orphaned_message(client, *id);
             }
             client.update(
-                "DELETE FROM pgmqtt_share_claims \
-                 WHERE message_id <= (SELECT COALESCE(MIN(last_id), 0) FROM pgmqtt_outbox_cursors)",
+                &format!(
+                    "DELETE FROM pgmqtt_share_claims WHERE message_id <= ({})",
+                    watermark
+                ),
                 None,
                 &[],
             )?;
-            Ok::<_, pgrx::spi::Error>(ids.len())
+            Ok::<_, pgrx::spi::Error>((ids.len(), stale as u64))
         })
     })
     .unwrap_or_else(|e| {
         log!("pgmqtt: outbox GC failed: {}", e);
-        0
+        (0, 0)
     })
 }
 
@@ -220,9 +254,9 @@ fn message_from_row(
 
 /// Fetch one bounded batch. `after`: multi-worker cursor mode (rows stay
 /// for the other workers; slot-0 GC reclaims). `None`: single-worker mode
-/// (the caller deletes delivered ids). `view_capped` = the enqueue barrier
-/// truncated the fetch, so keep re-querying — the rows above it may never
-/// get another doorbell.
+/// (the caller deletes delivered ids). `view_capped` = a committed outbox
+/// row sits above the enqueue cap, so keep re-querying — the rows above it
+/// may never get another doorbell.
 fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>, bool) {
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect(|client| {
@@ -241,9 +275,26 @@ fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>, bool) {
                 // The barrier caps the fetch: ids above it may still gain a
                 // smaller committed sibling from an in-flight enqueue, and
                 // passing that hole skips the message forever (see
-                // shmem_bridge). Read after this snapshot was taken.
-                let barrier = crate::shmem_bridge::enqueue_barrier();
-                view_capped = barrier != i64::MAX;
+                // shmem_bridge). Under READ COMMITTED the statement snapshot
+                // is taken at execution — after the barrier read — so a
+                // writer arming its floor in that gap is invisible to the
+                // barrier while a later sibling's commit is visible to the
+                // snapshot. Reading the id sequence FIRST closes the gap:
+                // every id <= seq_cap was allocated before the barrier read,
+                // so its writer either armed its floor first (the barrier
+                // covers it) or already ended (the snapshot sees it). Ids
+                // above seq_cap wait for a later fetch.
+                let seq_cap: i64 = client
+                    .select(
+                        "SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END \
+                         FROM pgmqtt_messages_id_seq",
+                        None,
+                        &[],
+                    )?
+                    .first()
+                    .get_one::<i64>()?
+                    .unwrap_or(0);
+                let barrier = crate::shmem_bridge::enqueue_barrier().min(seq_cap);
                 let query = format!(
                     "SELECT o.id, m.topic \
                      FROM pgmqtt_cdc_outbox o \
@@ -270,6 +321,21 @@ fn fetch_batch(after: Option<i64>) -> (Vec<i64>, Vec<MqttMessage>, bool) {
                     if subscriptions::has_subscribers(&topic) {
                         wanted.push(id);
                     }
+                }
+                // The cap is now always finite, so "capped" must mean "a
+                // committed row sits above it" — its doorbell ring may have
+                // been consumed by this very tick, so keep polling instead
+                // of waiting out the 30s safety check. Skipped when the
+                // fetch came back full (the caller re-polls anyway).
+                if ids.len() < cdc_worker::CDC_BATCH_SIZE {
+                    let args: Vec<pgrx::datum::DatumWithOid> = vec![barrier.into()];
+                    view_capped = !client
+                        .select(
+                            "SELECT 1 FROM pgmqtt_cdc_outbox WHERE id > $1 LIMIT 1",
+                            None,
+                            &args,
+                        )?
+                        .is_empty();
                 }
                 if !wanted.is_empty() {
                     let args: Vec<pgrx::datum::DatumWithOid> = vec![wanted.into()];
@@ -332,6 +398,9 @@ pub(super) struct Drain {
     /// Last GC pass swept a full batch — keep sweeping every tick or the
     /// table grows without bound.
     gc_backlog: bool,
+    /// Stale-cursor count from the last GC pass, to log only transitions
+    /// (GC runs every second).
+    stale_seen: u64,
 }
 
 impl Drain {
@@ -347,6 +416,7 @@ impl Drain {
             last_safety_check: Instant::now(),
             last_gc: Instant::now(),
             gc_backlog: false,
+            stale_seen: 0,
         }
     }
 
@@ -365,6 +435,12 @@ impl Drain {
         if self.last_safety_check.elapsed() >= Duration::from_secs(30) {
             self.last_safety_check = Instant::now();
             self.pending = true;
+            // Cursor heartbeat: last_seen otherwise only moves when rows
+            // are consumed, and an idle worker must not look dead to
+            // slot-0 GC's staleness check.
+            if multi {
+                session_db_actions.push(SessionDbAction::TouchOutboxCursor { worker_slot: slot });
+            }
         }
         if self.pending || doorbell != self.doorbell_seen {
             self.doorbell_seen = doorbell;
@@ -415,7 +491,20 @@ impl Drain {
             && (self.gc_backlog || self.last_gc.elapsed() >= Duration::from_secs(1))
         {
             self.last_gc = Instant::now();
-            self.gc_backlog = gc_below_min_cursor() >= cdc_worker::CDC_BATCH_SIZE;
+            let (swept, stale) = gc_below_min_cursor();
+            self.gc_backlog = swept >= cdc_worker::CDC_BATCH_SIZE;
+            crate::metrics::get()
+                .outbox_stale_cursors
+                .store(stale, std::sync::atomic::Ordering::Relaxed);
+            if stale != self.stale_seen {
+                log!(
+                    "pgmqtt: outbox GC ignoring {} stale delivery cursor(s), was {} — \
+                     a worker has not heartbeated within pgmqtt.outbox_cursor_stale_secs",
+                    stale,
+                    self.stale_seen
+                );
+                self.stale_seen = stale;
+            }
         }
 
         // Small QoS 0 rides the shared-memory ring; draining an empty ring

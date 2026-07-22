@@ -158,10 +158,11 @@ pub fn enqueue_barrier() -> i64 {
 // DB row is already consumed.
 
 const CMD_RING_CAPACITY: usize = 256;
-/// Also the broker's client-id admission bound: CONNECT enforces
-/// `client_id.len() <= CMD_ARG_CAP` (see `finish_connect`), so every
-/// admitted client can be addressed by cross-worker commands. Role names
-/// fit for free (PostgreSQL caps them at NAMEDATALEN-1 = 63 bytes).
+/// Also the broker's client-id admission bound with several workers:
+/// CONNECT enforces `client_id.len() <= CMD_ARG_CAP` when
+/// `socket_workers > 1` (see `finish_connect`), so every admitted client
+/// can be addressed by cross-worker commands. Role names fit for free
+/// (PostgreSQL caps them at NAMEDATALEN-1 = 63 bytes).
 pub const CMD_ARG_CAP: usize = 128;
 const MAX_RINGS: usize = crate::MAX_SOCKET_WORKERS as usize;
 

@@ -202,6 +202,7 @@ The following limits are compiled into the extension binary and cannot be change
 | Max concurrent connections (community) | **1,000** | Enterprise licenses can raise this via the license payload. |
 | Max subscriptions per client | **1,000** | Additional SUBSCRIBE requests beyond this are rejected with an error reason code. |
 | Client receive maximum (default) | **65,535** | MQTT 5.0 default; clients may negotiate a lower value via the CONNECT `Receive Maximum` property. |
+| Max client ID length (`socket_workers > 1` only) | **128 bytes** | With several socket workers (enterprise `multiprocess`), longer IDs are rejected at CONNECT with reason 0x85 — every admitted client must fit the fixed-size cross-worker command channel. Single-worker deployments have no broker-imposed client ID limit. |
 
 ## Message & Packet Limits
 

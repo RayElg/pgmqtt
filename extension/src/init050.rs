@@ -25,8 +25,17 @@ pub fn init_050() {
     run_ddl(
         "CREATE TABLE IF NOT EXISTS pgmqtt_outbox_cursors (\
              worker_slot int PRIMARY KEY, \
-             last_id bigint NOT NULL DEFAULT 0)",
+             last_id bigint NOT NULL DEFAULT 0, \
+             last_seen timestamptz NOT NULL DEFAULT now())",
         "create pgmqtt_outbox_cursors",
+    );
+    // Heartbeat column: GC ignores cursors whose worker has not advanced or
+    // touched them within pgmqtt.outbox_cursor_stale_secs — one wedged
+    // worker must not pin the GC watermark (and outbox/messages/WAL growth)
+    // forever.
+    run_ddl(
+        "ALTER TABLE pgmqtt_outbox_cursors ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now()",
+        "add last_seen to pgmqtt_outbox_cursors",
     );
     // Cluster-wide $share arbitration: first worker to claim
     // (message_id, group) delivers. worker_slot lets a crashed worker
@@ -70,5 +79,13 @@ pub fn init_050() {
     run_ddl(
         "ALTER TABLE pgmqtt_metrics_snapshots ADD COLUMN IF NOT EXISTS cdc_bridge_dropped bigint NOT NULL DEFAULT 0",
         "add cdc_bridge_dropped to metrics_snapshots",
+    );
+    run_ddl(
+        "ALTER TABLE pgmqtt_metrics_current   ADD COLUMN IF NOT EXISTS outbox_stale_cursors bigint NOT NULL DEFAULT 0",
+        "add outbox_stale_cursors to metrics_current",
+    );
+    run_ddl(
+        "ALTER TABLE pgmqtt_metrics_snapshots ADD COLUMN IF NOT EXISTS outbox_stale_cursors bigint NOT NULL DEFAULT 0",
+        "add outbox_stale_cursors to metrics_snapshots",
     );
 }

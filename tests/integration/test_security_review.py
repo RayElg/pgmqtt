@@ -145,16 +145,21 @@ def test_client_id_at_cap_accepted():
     assert rc == RC_SUCCESS
 
 
-def test_client_id_over_cap_rejected_v5():
+def test_client_id_over_cap_accepted_single_worker_v5():
+    """The 128-byte cap only exists for cross-worker command addressing, so
+    it applies only when socket_workers > 1 (multi-worker rejection is
+    covered in tests/enterprise/integration/test_multiprocess.py). A
+    single-worker broker must keep accepting long ids — pre-0.5.0 clients
+    depend on it."""
     s, _present, rc, _props = _connect("c" * (CLIENT_ID_CAP + 1))
     s.close()
-    assert rc == RC_CLIENT_IDENTIFIER_NOT_VALID, hex(rc)
+    assert rc == RC_SUCCESS, hex(rc)
 
 
-def test_client_id_over_cap_rejected_v311():
+def test_client_id_over_cap_accepted_single_worker_v311():
     s, _present, rc, _props = _connect("c" * (CLIENT_ID_CAP + 1), protocol_version=4)
     s.close()
-    assert rc == V3_IDENTIFIER_REJECTED, hex(rc)
+    assert rc == RC_SUCCESS, hex(rc)
 
 
 # ---------------------------------------------------------------------------

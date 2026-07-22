@@ -134,6 +134,12 @@ pub enum SessionDbAction {
         worker_slot: i32,
         last_id: i64,
     },
+    /// Heartbeat this worker's cursor row without moving it — slot-0 GC
+    /// treats a cursor with no recent heartbeat as dead and stops letting
+    /// it pin the watermark.
+    TouchOutboxCursor {
+        worker_slot: i32,
+    },
 }
 
 /// Execute all queued DB actions in one transaction. The batch runs in one
@@ -390,8 +396,16 @@ fn apply_action(
             let args: Vec<DatumWithOid> = vec![(*worker_slot).into(), (*last_id).into()];
             client.update(
                 "UPDATE pgmqtt_outbox_cursors \
-                 SET last_id = GREATEST(last_id, $2) \
+                 SET last_id = GREATEST(last_id, $2), last_seen = now() \
                  WHERE worker_slot = $1",
+                None,
+                &args,
+            )?;
+        }
+        SessionDbAction::TouchOutboxCursor { worker_slot } => {
+            let args: Vec<DatumWithOid> = vec![(*worker_slot).into()];
+            client.update(
+                "UPDATE pgmqtt_outbox_cursors SET last_seen = now() WHERE worker_slot = $1",
                 None,
                 &args,
             )?;

@@ -48,6 +48,10 @@ pub struct BrokerMetrics {
     // CDC/inbound pipeline counters live in `SharedCdcCounters`: the
     // pgmqtt_cdc process writes them, pgmqtt_mqtt's flush reads them.
 
+    // Multi-worker outbox: delivery cursors currently ignored by slot-0 GC
+    // for missing their heartbeat (gauge, stored each GC pass).
+    pub outbox_stale_cursors: AtomicU64,
+
     // DB batch operations
     pub db_batches_committed: AtomicU64,
     pub db_session_errors: AtomicU64,
@@ -84,6 +88,7 @@ impl BrokerMetrics {
             pubacks_received: AtomicU64::new(0),
             subscribe_ops: AtomicU64::new(0),
             unsubscribe_ops: AtomicU64::new(0),
+            outbox_stale_cursors: AtomicU64::new(0),
             db_batches_committed: AtomicU64::new(0),
             db_session_errors: AtomicU64::new(0),
             db_message_errors: AtomicU64::new(0),
@@ -298,6 +303,7 @@ pub struct MetricsSnapshot {
     pub inbound_writes_failed: i64,
     pub inbound_retries: i64,
     pub inbound_dead_letters: i64,
+    pub outbox_stale_cursors: i64,
     pub db_batches_committed: i64,
     pub db_session_errors: i64,
     pub db_message_errors: i64,
@@ -343,6 +349,7 @@ impl MetricsSnapshot {
             inbound_writes_failed: cdc.inbound_writes_failed.load(Ordering::Relaxed) as i64,
             inbound_retries: cdc.inbound_retries.load(Ordering::Relaxed) as i64,
             inbound_dead_letters: cdc.inbound_dead_letters.load(Ordering::Relaxed) as i64,
+            outbox_stale_cursors: m.outbox_stale_cursors.load(Ordering::Relaxed) as i64,
             db_batches_committed: m.db_batches_committed.load(Ordering::Relaxed) as i64,
             db_session_errors: m.db_session_errors.load(Ordering::Relaxed) as i64,
             db_message_errors: m.db_message_errors.load(Ordering::Relaxed) as i64,
@@ -367,6 +374,7 @@ impl MetricsSnapshot {
                 r#""cdc_render_errors":{cre},"cdc_slot_errors":{cse},"cdc_persist_errors":{cpe},"cdc_ring_buffer_dropped":{crbd},"#,
                 r#""cdc_bridge_dropped":{cbd},"#,
                 r#""inbound_writes_ok":{iwo},"inbound_writes_failed":{iwf},"inbound_retries":{ir},"inbound_dead_letters":{idl},"#,
+                r#""outbox_stale_cursors":{osc},"#,
                 r#""db_batches_committed":{dbc},"db_session_errors":{dse},"db_message_errors":{dme},"db_subscription_errors":{dsue}}}"#,
             ),
             captured_at = self.captured_at_unix,
@@ -403,6 +411,7 @@ impl MetricsSnapshot {
             iwf = self.inbound_writes_failed,
             ir = self.inbound_retries,
             idl = self.inbound_dead_letters,
+            osc = self.outbox_stale_cursors,
             dbc = self.db_batches_committed,
             dse = self.db_session_errors,
             dme = self.db_message_errors,
@@ -447,6 +456,7 @@ impl MetricsSnapshot {
         "inbound_writes_failed",
         "inbound_retries",
         "inbound_dead_letters",
+        "outbox_stale_cursors",
         "db_batches_committed",
         "db_session_errors",
         "db_message_errors",
@@ -491,6 +501,7 @@ impl MetricsSnapshot {
             self.inbound_writes_failed,
             self.inbound_retries,
             self.inbound_dead_letters,
+            self.outbox_stale_cursors,
             self.db_batches_committed,
             self.db_session_errors,
             self.db_message_errors,
@@ -688,6 +699,12 @@ impl MetricsSnapshot {
                 "Messages moved to dead-letter table",
             ),
             (
+                "pgmqtt_outbox_stale_cursors",
+                "gauge",
+                self.outbox_stale_cursors,
+                "Outbox delivery cursors currently ignored by GC for missing their heartbeat",
+            ),
+            (
                 "pgmqtt_db_batches_committed_total",
                 "counter",
                 self.db_batches_committed,
@@ -739,7 +756,7 @@ impl MetricsSnapshot {
         out
     }
 
-    pub const FIELD_COUNT: usize = 38;
+    pub const FIELD_COUNT: usize = 39;
 }
 
 #[cfg(test)]
@@ -784,6 +801,7 @@ mod tests {
             inbound_writes_failed: 1,
             inbound_retries: 5,
             inbound_dead_letters: 0,
+            outbox_stale_cursors: 0,
             db_batches_committed: 100,
             db_session_errors: 1,
             db_message_errors: 0,

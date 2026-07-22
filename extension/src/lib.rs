@@ -143,6 +143,10 @@ static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1048576);
 static MAX_QUEUE_BYTES_PER_CLIENT: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
 static CDC_EVERY_N_TICKS: GucSetting<i32> = GucSetting::<i32>::new(1);
+/// Seconds without a heartbeat before outbox GC ignores a worker's
+/// delivery cursor. 0 = never ignore (pre-0.5.0 behavior: a wedged worker
+/// pins the GC watermark and the outbox grows without bound).
+static OUTBOX_CURSOR_STALE_SECS: GucSetting<i32> = GucSetting::<i32>::new(300);
 static DEBUG_LOG: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Observability GUCs (enterprise: metrics feature)
 /// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.
@@ -180,6 +184,10 @@ pub fn get_cdc_every_n_ticks_guc() -> u64 {
 
 pub fn get_debug_log_guc() -> bool {
     DEBUG_LOG.get()
+}
+
+pub fn get_outbox_cursor_stale_secs_guc() -> i32 {
+    OUTBOX_CURSOR_STALE_SECS.get().max(0)
 }
 
 pub fn get_license_key_guc() -> String {
@@ -1318,6 +1326,16 @@ pub unsafe extern "C" fn _PG_init() {
         &SOCKET_WORKERS,
         1,
         MAX_SOCKET_WORKERS,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.outbox_cursor_stale_secs",
+        c"Seconds without a heartbeat before outbox GC ignores a worker's delivery cursor (0 = never; enterprise multiprocess)",
+        c"A worker wedged longer than this may permanently miss messages for its local subscribers once GC passes its cursor; the alternative is unbounded outbox/WAL growth.",
+        &OUTBOX_CURSOR_STALE_SECS,
+        0,
+        86400,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );

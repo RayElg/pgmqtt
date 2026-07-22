@@ -2144,10 +2144,12 @@ fn finish_connect(
         return;
     }
 
-    // Every accepted client must fit the cross-worker command channel's
-    // fixed CMD_ARG_CAP slots, or it would be admitted but unaddressable
-    // by kicks/admin commands — reject up front (MQTT permits this).
-    if packet.client_id.len() > crate::shmem_bridge::CMD_ARG_CAP {
+    // With several workers every accepted client must fit the cross-worker
+    // command channel's fixed CMD_ARG_CAP slots, or it would be admitted
+    // but unaddressable by kicks/admin commands — reject up front (MQTT
+    // permits this). Single-worker mode never routes commands through the
+    // rings, so it keeps accepting long ids (no 0.5.0 breaking change).
+    if multi_worker() && packet.client_id.len() > crate::shmem_bridge::CMD_ARG_CAP {
         log!(
             "pgmqtt mqtt: client ID too long ({} bytes, cap {}) — rejecting",
             packet.client_id.len(),
@@ -2453,7 +2455,12 @@ fn finish_connect(
     // Connection limit — before the takeover below, or rejecting a
     // replacement after the kick would disconnect the old client and admit
     // nobody. Local takeover always proceeds (frees its own slot);
-    // cross-worker is enforced conservatively against the shared gauge.
+    // cross-worker is enforced conservatively against the shared gauge: a
+    // reconnect landing on a different worker counts as new while the old
+    // connection still holds a slot, so at exactly the cap it is rejected
+    // until the old connection drops (keepalive timeout at worst). The
+    // alternative — exempting any id with a session row — would let a
+    // takeover storm overshoot the licensed cap.
     let limit = crate::license::max_connections();
     let active_connections = if multi_worker() {
         crate::metrics::connections_total() as usize
@@ -3823,12 +3830,14 @@ fn db_sweep_expired_sessions() {
             });
             // Siblings' replicas loaded as "connected" never expire via
             // their own in-memory sweeps — evict them or they keep
-            // queueing. Best-effort (ring overflow drops oldest); the
-            // DB-authoritative resume at CONNECT is the backstop.
+            // queueing. Admin ring: the session row is already deleted, so
+            // this is a one-shot command that CONNECT-rate takeover churn
+            // must not evict. Still best-effort; the DB-authoritative
+            // resume at CONNECT is the backstop.
             let _ = crate::shmem_bridge::broadcast_command(
                 worker_slot(),
                 topology::socket_workers(),
-                crate::shmem_bridge::RingClass::Takeover,
+                crate::shmem_bridge::RingClass::Admin,
                 &crate::shmem_bridge::WorkerCommand::EvictSession {
                     client_id: id.clone(),
                 },
