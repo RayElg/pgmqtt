@@ -55,9 +55,6 @@ fn broker_max_packet_size() -> u32 {
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
 
-/// Threshold for warning when a client's message queue exceeds this size.
-const QUEUE_WARNING_THRESHOLD: usize = 10_000;
-
 /// Hard cap on the per-client pending queue.  Clients that exceed this are
 /// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
 const MAX_QUEUE_SIZE: usize = 50_000;
@@ -4048,14 +4045,6 @@ fn deliver_messages(
                             payload: msg.payload.clone(),
                             qos: delivery_qos,
                         });
-                        if session.queue.len() > QUEUE_WARNING_THRESHOLD {
-                            pgrx::log!(
-                                "pgmqtt: client '{}' queue exceeded {} messages ({}). Consider investigating client health.",
-                                sub_id,
-                                QUEUE_WARNING_THRESHOLD,
-                                session.queue.len()
-                            );
-                        }
                         if msg.id.is_some() {
                             batch_entries.push((sub_id.clone(), None));
                         }
