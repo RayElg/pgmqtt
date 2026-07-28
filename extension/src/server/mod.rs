@@ -46,9 +46,6 @@ fn broker_max_packet_size() -> u32 {
 /// Maximum number of unacked QoS 1 messages per client.
 const MAX_INFLIGHT_MESSAGES: usize = 800;
 
-/// Threshold for warning when a client's message queue exceeds this size.
-const QUEUE_WARNING_THRESHOLD: usize = 10_000;
-
 /// Hard cap on the per-client pending queue.  Clients that exceed this are
 /// disconnected to prevent unbounded memory growth inside the PostgreSQL process.
 const MAX_QUEUE_SIZE: usize = 50_000;
@@ -1332,6 +1329,8 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
     // Tick counter for throttling low-priority periodic work.
     let mut tick: u64 = 0;
+    // Set when a bounded CDC drain yielded with WAL still pending.
+    let mut cdc_drain_pending = false;
     // Wall-clock timers for periodic tasks — their frequency must stay stable
     // regardless of tick rate (pgmqtt.tick_interval_ms).
     let mut last_inbound_reload = std::time::Instant::now();
@@ -1446,8 +1445,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
         execute_inbound_writes(pending_inbound_writes);
 
-        if tick % crate::get_cdc_every_n_ticks_guc() == 0 {
-            let cdc_messages = cdc_tick(slot_name);
+        if tick % crate::get_cdc_every_n_ticks_guc() == 0 || cdc_drain_pending {
+            let (cdc_messages, fully_drained) = cdc_tick(slot_name);
+            cdc_drain_pending = !fully_drained;
             if !cdc_messages.is_empty() {
                 deliver_messages(
                     &cdc_messages,
@@ -1569,6 +1569,11 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 /// cost if a batch fails; larger values reduce per-batch transaction overhead.
 const CDC_BATCH_SIZE: usize = 4096;
 
+/// Max drain batches per `cdc_tick` call. It runs inline in the socket loop,
+/// so an unbounded drain of a deep backlog would starve socket I/O; the
+/// caller re-invokes next tick while a backlog remains.
+const MAX_DRAIN_BATCHES_PER_TICK: usize = 4;
+
 /// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
 /// batches, persisting QOS ≥ 1 messages within the same transaction.
 ///
@@ -1592,7 +1597,11 @@ const CDC_BATCH_SIZE: usize = 4096;
 ///
 /// QOS 0 messages are not persisted; they are collected during the transaction
 /// and returned after commit (fire-and-forget).
-fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
+///
+/// Returns `(messages, fully_drained)`. `fully_drained == false` means the
+/// per-tick batch budget was hit with WAL still pending; the caller
+/// re-invokes next tick.
+fn cdc_tick(slot_name: &str) -> (Vec<MqttMessage>, bool) {
     use crate::ring_buffer;
     use crate::topic_map;
     use pgrx::spi::{self, Spi};
@@ -1711,7 +1720,8 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
     // only after the transaction commits, ensuring QOS ≥ 1 messages are
     // durably persisted before delivery.
     let mut all_messages: Vec<MqttMessage> = Vec::new();
-    loop {
+    let mut batches = 0usize;
+    let fully_drained = loop {
         let (to_publish, batch_count, batch_ok) = BackgroundWorker::transaction(
             || -> (Vec<MqttMessage>, usize, bool) {
                 let mut to_publish: Vec<MqttMessage> = Vec::new();
@@ -1954,18 +1964,23 @@ fn cdc_tick(slot_name: &str) -> Vec<MqttMessage> {
 
         if !batch_ok {
             log!("pgmqtt cdc: batch transaction failed or rolled back — events will be retried");
+            break true;
         }
 
-        if batch_ok {
-            all_messages.extend(to_publish);
-        }
+        all_messages.extend(to_publish);
 
-        // Stop when the batch was smaller than the limit — WAL fully drained.
+        // Batch smaller than the limit — WAL fully drained.
         if batch_count < CDC_BATCH_SIZE {
-            break;
+            break true;
         }
-    }
-    all_messages
+
+        // Yield after the budget so a deep backlog can't monopolize the loop.
+        batches += 1;
+        if batches >= MAX_DRAIN_BATCHES_PER_TICK {
+            break false;
+        }
+    };
+    (all_messages, fully_drained)
 }
 /// Accept new MQTTS (TCP + TLS) connections and perform the MQTT CONNECT handshake.
 fn accept_mqtts_connections(
@@ -3324,8 +3339,10 @@ fn publish_messages_batch(
                 if p.qos == 1 {
                     if let Some(pid) = p.packet_id {
                         if let Some(client) = clients.get_mut(&p.log_sender) {
+                            // try_write buffers on WouldBlock; a mid-PUBACK
+                            // truncation would desync the client's reader.
                             let puback = mqtt::build_puback(pid);
-                            let _ = client.transport.write_all(&puback);
+                            let _ = client.try_write(&puback);
                             crate::metrics::inc(&crate::metrics::get().pubacks_sent);
                         }
                     }
@@ -3463,7 +3480,7 @@ fn handle_mqtt_packet(
             }
 
             if let Some(pkt) = next_pkt {
-                let _ = client.transport.write_all(&pkt);
+                let _ = client.try_write(&pkt);
             }
             true
         }
@@ -3535,7 +3552,7 @@ fn handle_mqtt_packet(
                 );
             }
             let suback = mqtt::build_suback(sub.packet_id, &reason_codes, client.v5());
-            if client.transport.write_all(&suback).is_err() {
+            if client.try_write(&suback).is_err() {
                 return false;
             }
 
@@ -3638,7 +3655,7 @@ fn handle_mqtt_packet(
                                     client.v5(),
                                 );
                                 if !client.exceeds_max_packet(pkt.len()) {
-                                    let _ = client.transport.write_all(&pkt);
+                                    let _ = client.try_write(&pkt);
                                 }
                             } else {
                                 let pkt = mqtt::build_publish(
@@ -3651,7 +3668,7 @@ fn handle_mqtt_packet(
                                     client.v5(),
                                 );
                                 if !client.exceeds_max_packet(pkt.len()) {
-                                    let _ = client.transport.write_all(&pkt);
+                                    let _ = client.try_write(&pkt);
                                 }
                             }
                             break; // deliver each retained message at most once per SUBSCRIBE
@@ -3683,14 +3700,14 @@ fn handle_mqtt_packet(
                 );
             }
             let unsuback = mqtt::build_unsuback(unsub.packet_id, &reason_codes, client.v5());
-            if client.transport.write_all(&unsuback).is_err() {
+            if client.try_write(&unsuback).is_err() {
                 return false;
             }
             true
         }
         mqtt::InboundPacket::Pingreq => {
             let resp = mqtt::build_pingresp();
-            client.transport.write_all(&resp).is_ok()
+            client.try_write(&resp).is_ok()
         }
         mqtt::InboundPacket::Disconnect(reason_code, expiry_override) => {
             log!(
@@ -3757,13 +3774,12 @@ fn handle_mqtt_packet(
                     if pub_pkt.qos == 1 {
                         if let Some(pid) = pub_pkt.packet_id {
                             if client.v5() {
-                                let _ =
-                                    client.transport.write_all(&mqtt::build_puback_with_reason(
-                                        pid,
-                                        mqtt::reason::NOT_AUTHORIZED,
-                                    ));
+                                let _ = client.try_write(&mqtt::build_puback_with_reason(
+                                    pid,
+                                    mqtt::reason::NOT_AUTHORIZED,
+                                ));
                             } else {
-                                let _ = client.transport.write_all(&mqtt::build_puback(pid));
+                                let _ = client.try_write(&mqtt::build_puback(pid));
                             }
                         }
                     }
@@ -3819,7 +3835,7 @@ fn handle_mqtt_packet(
                             pub_pkt.topic
                         );
                         let puback = mqtt::build_puback(pid);
-                        let _ = client.transport.write_all(&puback);
+                        let _ = client.try_write(&puback);
                     }
                 } else {
                     log!(
@@ -3962,14 +3978,9 @@ fn deliver_messages(
                             payload: msg.payload.clone(),
                             qos: delivery_qos,
                         });
-                        if session.queue.len() > QUEUE_WARNING_THRESHOLD {
-                            pgrx::log!(
-                                "pgmqtt: client '{}' queue exceeded {} messages ({}). Consider investigating client health.",
-                                sub_id,
-                                QUEUE_WARNING_THRESHOLD,
-                                session.queue.len()
-                            );
-                        }
+                        // No per-enqueue queue-depth warning: at high depth it
+                        // fires every message and the elog volume starves the
+                        // loop. MAX_QUEUE_SIZE below disconnects the client.
                         if msg.id.is_some() {
                             batch_entries.push((sub_id.clone(), None));
                         }
