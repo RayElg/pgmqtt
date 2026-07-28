@@ -109,6 +109,9 @@ static TICK_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static MAX_CLIENT_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1048576);
 static MAX_QUEUE_BYTES_PER_CLIENT: GucSetting<i32> = GucSetting::<i32>::new(64 * 1024 * 1024);
 static CDC_EVERY_N_TICKS: GucSetting<i32> = GucSetting::<i32>::new(1);
+/// Max CDC events staged in the decode ring buffer; 0 = unbounded (never
+/// drop a decoded change before the slot advances past it).
+static CDC_RING_MAX_EVENTS: GucSetting<i32> = GucSetting::<i32>::new(0);
 static DEBUG_LOG: GucSetting<bool> = GucSetting::<bool>::new(false);
 // Observability GUCs (enterprise: metrics feature)
 /// How often (seconds) to flush metrics snapshot to DB. 0 = disabled.
@@ -146,6 +149,12 @@ pub fn get_cdc_every_n_ticks_guc() -> u64 {
 
 pub fn get_debug_log_guc() -> bool {
     DEBUG_LOG.get()
+}
+
+/// 0 = unbounded (durable default); >0 = bounded drop-oldest ring (opt-in,
+/// lossy). Negative coerced to 0.
+pub fn get_cdc_ring_max_events_guc() -> usize {
+    CDC_RING_MAX_EVENTS.get().max(0) as usize
 }
 
 pub fn get_license_key_guc() -> String {
@@ -1482,6 +1491,16 @@ pub unsafe extern "C" fn _PG_init() {
         &CDC_EVERY_N_TICKS,
         1,
         1000,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
+    GucRegistry::define_int_guc(
+        c"pgmqtt.cdc_ring_max_events",
+        c"Hard cap on CDC events staged in the decode ring buffer (0 = unbounded)",
+        c"0 never drops a decoded change before the slot advances past it. A positive value bounds memory but drops CDC messages for any single transaction larger than the cap.",
+        &CDC_RING_MAX_EVENTS,
+        0,
+        i32::MAX,
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
