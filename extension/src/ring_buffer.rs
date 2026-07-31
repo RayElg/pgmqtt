@@ -1,8 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-/// Maximum number of events the ring buffer will hold before dropping the oldest.
-const DEFAULT_CAPACITY: usize = 8192;
+/// Initial reservation only; the buffer grows past this.
+const INITIAL_CAPACITY: usize = 8192;
 
 /// A single CDC event extracted by the output plugin.
 #[derive(Debug, Clone)]
@@ -32,30 +32,34 @@ pub enum RingEvent {
     },
 }
 
-/// Fixed-capacity ring buffer that drops the oldest entry on overflow.
+/// Staging buffer for CDC events decoded within one slot read. Unbounded by
+/// default so no change is dropped before the slot advances; a positive
+/// `pgmqtt.cdc_ring_max_events` re-enables bounded drop-oldest.
 struct RingBuffer {
     buf: VecDeque<RingEvent>,
-    capacity: usize,
     dropped: u64,
 }
 
 impl RingBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
-            buf: VecDeque::with_capacity(capacity),
-            capacity,
+            buf: VecDeque::with_capacity(INITIAL_CAPACITY),
             dropped: 0,
         }
     }
 
     fn push(&mut self, event: RingEvent) {
-        if self.buf.len() >= self.capacity {
+        // cap 0 = unbounded: never drop.
+        let cap = crate::get_cdc_ring_max_events_guc();
+        if cap > 0 && self.buf.len() >= cap {
             self.buf.pop_front();
             self.dropped += 1;
             crate::metrics::inc(&crate::metrics::get().cdc_ring_buffer_dropped);
             if self.dropped % 100 == 1 {
                 pgrx::log!(
-                    "WARNING: pgmqtt ring buffer overflow! Dropped {} CDC events so far.",
+                    "pgmqtt CDC ring buffer at cap {} — dropped {} events \
+                     (raise or unset pgmqtt.cdc_ring_max_events)",
+                    cap,
                     self.dropped
                 );
             }
@@ -66,7 +70,6 @@ impl RingBuffer {
     fn drain(&mut self) -> Vec<RingEvent> {
         self.buf.drain(..).collect()
     }
-
 }
 
 static RING: Mutex<Option<RingBuffer>> = Mutex::new(None);
@@ -74,15 +77,13 @@ static RING: Mutex<Option<RingBuffer>> = Mutex::new(None);
 /// Push a change event into the global ring buffer.
 pub fn push(event: RingEvent) {
     let mut lock = RING.lock().unwrap_or_else(|e| e.into_inner());
-    lock.get_or_insert_with(|| RingBuffer::new(DEFAULT_CAPACITY))
-        .push(event);
+    lock.get_or_insert_with(RingBuffer::new).push(event);
 }
 
 /// Drain all buffered events, returning them in FIFO order.
 pub fn drain() -> Vec<RingEvent> {
     let mut lock = RING.lock().unwrap_or_else(|e| e.into_inner());
-    lock.get_or_insert_with(|| RingBuffer::new(DEFAULT_CAPACITY))
-        .drain()
+    lock.get_or_insert_with(RingBuffer::new).drain()
 }
 
 // ── Mapped-table fast-path filter ────────────────────────────────────────────
