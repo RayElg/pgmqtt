@@ -60,6 +60,12 @@ pub fn prepare_hot_path_statements() {
 
         let del_orphan_msg = client
             .prepare_mut(
+                // The pgmqtt_cdc_outbox check keeps a row alive while any
+                // worker's delivery cursor still has it pending: references
+                // (session_messages) are only created at delivery time, so a
+                // fast ACK on one worker could otherwise reap a message
+                // another worker has not delivered yet. The slot-0 GC
+                // reclaims once every cursor has passed.
                 "DELETE FROM pgmqtt_messages \
                  WHERE id = $1 \
                    AND NOT EXISTS \
@@ -67,7 +73,9 @@ pub fn prepare_hot_path_statements() {
                    AND NOT EXISTS \
                      (SELECT 1 FROM pgmqtt_inbound_pending WHERE message_id = $1) \
                    AND NOT EXISTS \
-                     (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1)",
+                     (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1) \
+                   AND NOT EXISTS \
+                     (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1)",
                 &[PgOid::from_untagged(pgrx::pg_sys::INT8OID)],
             )?
             .keep();

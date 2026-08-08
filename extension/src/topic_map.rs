@@ -137,7 +137,7 @@ pub fn render(
                     mapping.name,
                     e
                 );
-                crate::metrics::inc(&crate::metrics::get().cdc_render_errors);
+                crate::metrics::inc(&crate::metrics::shared_cdc().render_errors);
                 continue;
             }
         };
@@ -158,7 +158,7 @@ pub fn render(
                     mapping.name,
                     e
                 );
-                crate::metrics::inc(&crate::metrics::get().cdc_render_errors);
+                crate::metrics::inc(&crate::metrics::shared_cdc().render_errors);
                 continue;
             }
         };

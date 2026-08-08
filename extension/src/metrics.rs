@@ -3,14 +3,19 @@
 //! The BGW periodically flushes snapshots to `pgmqtt_metrics_current` /
 //! `pgmqtt_metrics_snapshots`, which SQL accessor functions query.
 
+// `pg_shmem_init!`'s expansion refers to `pg_sys` and `#[pg_guard]` unqualified,
+// so both must already be in scope at the call site — hence the prelude import.
+use pgrx::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 /// Broker-level metric counters (lock-free atomics, `Relaxed` ordering).
 pub struct BrokerMetrics {
     // Connections
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+    /// Live connections, zeroed at worker startup — a crashed worker's
+    /// un-decremented gauge would shrink the license cap until a full
+    /// restart.
     pub connections_current: AtomicU64,
     pub disconnections_clean: AtomicU64,
     pub disconnections_unclean: AtomicU64,
@@ -40,19 +45,8 @@ pub struct BrokerMetrics {
     pub subscribe_ops: AtomicU64,
     pub unsubscribe_ops: AtomicU64,
 
-    // CDC / outbound pipeline
-    pub cdc_events_processed: AtomicU64,
-    pub cdc_msgs_published: AtomicU64,
-    pub cdc_render_errors: AtomicU64,
-    pub cdc_slot_errors: AtomicU64,
-    pub cdc_persist_errors: AtomicU64,
-    pub cdc_ring_buffer_dropped: AtomicU64,
-
-    // Inbound pipeline (MQTT -> DB)
-    pub inbound_writes_ok: AtomicU64,
-    pub inbound_writes_failed: AtomicU64,
-    pub inbound_retries: AtomicU64,
-    pub inbound_dead_letters: AtomicU64,
+    // CDC/inbound pipeline counters live in `SharedCdcCounters`: the
+    // pgmqtt_cdc process writes them, pgmqtt_mqtt's flush reads them.
 
     // DB batch operations
     pub db_batches_committed: AtomicU64,
@@ -89,16 +83,6 @@ impl BrokerMetrics {
             pubacks_received: AtomicU64::new(0),
             subscribe_ops: AtomicU64::new(0),
             unsubscribe_ops: AtomicU64::new(0),
-            cdc_events_processed: AtomicU64::new(0),
-            cdc_msgs_published: AtomicU64::new(0),
-            cdc_render_errors: AtomicU64::new(0),
-            cdc_slot_errors: AtomicU64::new(0),
-            cdc_persist_errors: AtomicU64::new(0),
-            cdc_ring_buffer_dropped: AtomicU64::new(0),
-            inbound_writes_ok: AtomicU64::new(0),
-            inbound_writes_failed: AtomicU64::new(0),
-            inbound_retries: AtomicU64::new(0),
-            inbound_dead_letters: AtomicU64::new(0),
             db_batches_committed: AtomicU64::new(0),
             db_session_errors: AtomicU64::new(0),
             db_message_errors: AtomicU64::new(0),
@@ -109,10 +93,137 @@ impl BrokerMetrics {
     }
 }
 
-static METRICS: OnceLock<BrokerMetrics> = OnceLock::new();
+unsafe impl pgrx::PGRXSharedMemory for BrokerMetrics {}
+
+impl Default for BrokerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// In PostgreSQL shared memory: both workers increment, `pgmqtt_mqtt`
+/// flushes the totals.
+static METRICS: pgrx::PgAtomic<BrokerMetrics> =
+    unsafe { pgrx::PgAtomic::new(c"pgmqtt_broker_metrics") };
 
 pub fn get() -> &'static BrokerMetrics {
-    METRICS.get_or_init(BrokerMetrics::new)
+    METRICS.get()
+}
+
+/// Live connection count.
+pub fn connections_total() -> u64 {
+    get().connections_current.load(Ordering::Relaxed)
+}
+
+pub fn connections_inc() {
+    get().connections_current.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn connections_dec() {
+    get().connections_current.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Called at socket-worker startup: whatever the previous incarnation left
+/// in the gauge is gone with its connections.
+pub fn connections_reset() {
+    get().connections_current.store(0, Ordering::Relaxed);
+}
+
+/// CDC / outbound / inbound pipeline counters in shared memory — written
+/// by pgmqtt_cdc, read by pgmqtt_mqtt's flush. All AtomicU64, no LWLock
+/// needed.
+pub struct SharedCdcCounters {
+    pub events_processed: AtomicU64,
+    pub msgs_published: AtomicU64,
+    pub render_errors: AtomicU64,
+    pub slot_errors: AtomicU64,
+    pub persist_errors: AtomicU64,
+    pub ring_buffer_dropped: AtomicU64,
+    /// QoS 0 drops from the inline ring on overflow; persisted messages
+    /// ride the durable outbox and are never dropped.
+    pub bridge_dropped: AtomicU64,
+
+    pub inbound_writes_ok: AtomicU64,
+    pub inbound_writes_failed: AtomicU64,
+    pub inbound_retries: AtomicU64,
+    pub inbound_dead_letters: AtomicU64,
+
+    /// Replication-origin ids of pgmqtt's worker sessions (0 = empty),
+    /// read by `filter_by_origin_cb` from any backend. Never
+    /// unregistered: a restart re-attaches the same named origin/id.
+    pub worker_origins: [AtomicU64; MAX_WORKER_ORIGINS],
+}
+
+pub const MAX_WORKER_ORIGINS: usize = 16;
+
+/// Record a worker session's replication-origin id (idempotent).
+pub fn register_worker_origin(id: u16) {
+    let id = id as u64;
+    for slot in &shared_cdc().worker_origins {
+        if slot.load(Ordering::Relaxed) == id {
+            return;
+        }
+        if slot
+            .compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        // Lost the CAS to a concurrent registration — if it stored this
+        // same id, we're done; otherwise keep scanning.
+        if slot.load(Ordering::Relaxed) == id {
+            return;
+        }
+    }
+    pgrx::log!(
+        "pgmqtt: worker origin registry full — origin {} not registered; \
+         its WAL will be decoded and discarded by name instead of filtered",
+        id
+    );
+}
+
+/// Whether `id` is one of pgmqtt's own worker-session origins.
+pub fn is_worker_origin(id: u16) -> bool {
+    let id = id as u64;
+    shared_cdc()
+        .worker_origins
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == id)
+}
+
+impl Default for SharedCdcCounters {
+    fn default() -> Self {
+        Self {
+            events_processed: AtomicU64::new(0),
+            msgs_published: AtomicU64::new(0),
+            render_errors: AtomicU64::new(0),
+            slot_errors: AtomicU64::new(0),
+            persist_errors: AtomicU64::new(0),
+            ring_buffer_dropped: AtomicU64::new(0),
+            bridge_dropped: AtomicU64::new(0),
+            inbound_writes_ok: AtomicU64::new(0),
+            inbound_writes_failed: AtomicU64::new(0),
+            inbound_retries: AtomicU64::new(0),
+            inbound_dead_letters: AtomicU64::new(0),
+            worker_origins: [(); MAX_WORKER_ORIGINS].map(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+unsafe impl pgrx::PGRXSharedMemory for SharedCdcCounters {}
+
+static SHARED_CDC: pgrx::PgAtomic<SharedCdcCounters> =
+    unsafe { pgrx::PgAtomic::new(c"pgmqtt_shared_cdc_counters") };
+
+pub fn shared_cdc() -> &'static SharedCdcCounters {
+    SHARED_CDC.get()
+}
+
+/// Register the shared counter blocks with PostgreSQL shared memory. Must
+/// be called from `_PG_init`.
+pub fn init_shared() {
+    pgrx::pg_shmem_init!(METRICS);
+    pgrx::pg_shmem_init!(SHARED_CDC);
 }
 
 #[inline]
@@ -167,6 +278,7 @@ pub struct MetricsSnapshot {
     pub cdc_slot_errors: i64,
     pub cdc_persist_errors: i64,
     pub cdc_ring_buffer_dropped: i64,
+    pub cdc_bridge_dropped: i64,
     pub inbound_writes_ok: i64,
     pub inbound_writes_failed: i64,
     pub inbound_retries: i64,
@@ -180,13 +292,14 @@ pub struct MetricsSnapshot {
 impl MetricsSnapshot {
     pub fn capture() -> Self {
         let m = get();
+        let cdc = shared_cdc();
         Self {
             captured_at_unix: crate::license::now_secs(),
             started_at_unix: m.started_at_unix.load(Ordering::Relaxed) as i64,
             last_reset_at_unix: m.last_reset_at_unix.load(Ordering::Relaxed) as i64,
             connections_accepted: m.connections_accepted.load(Ordering::Relaxed) as i64,
             connections_rejected: m.connections_rejected.load(Ordering::Relaxed) as i64,
-            connections_current: m.connections_current.load(Ordering::Relaxed) as i64,
+            connections_current: connections_total() as i64,
             disconnections_clean: m.disconnections_clean.load(Ordering::Relaxed) as i64,
             disconnections_unclean: m.disconnections_unclean.load(Ordering::Relaxed) as i64,
             wills_fired: m.wills_fired.load(Ordering::Relaxed) as i64,
@@ -204,16 +317,17 @@ impl MetricsSnapshot {
             pubacks_received: m.pubacks_received.load(Ordering::Relaxed) as i64,
             subscribe_ops: m.subscribe_ops.load(Ordering::Relaxed) as i64,
             unsubscribe_ops: m.unsubscribe_ops.load(Ordering::Relaxed) as i64,
-            cdc_events_processed: m.cdc_events_processed.load(Ordering::Relaxed) as i64,
-            cdc_msgs_published: m.cdc_msgs_published.load(Ordering::Relaxed) as i64,
-            cdc_render_errors: m.cdc_render_errors.load(Ordering::Relaxed) as i64,
-            cdc_slot_errors: m.cdc_slot_errors.load(Ordering::Relaxed) as i64,
-            cdc_persist_errors: m.cdc_persist_errors.load(Ordering::Relaxed) as i64,
-            cdc_ring_buffer_dropped: m.cdc_ring_buffer_dropped.load(Ordering::Relaxed) as i64,
-            inbound_writes_ok: m.inbound_writes_ok.load(Ordering::Relaxed) as i64,
-            inbound_writes_failed: m.inbound_writes_failed.load(Ordering::Relaxed) as i64,
-            inbound_retries: m.inbound_retries.load(Ordering::Relaxed) as i64,
-            inbound_dead_letters: m.inbound_dead_letters.load(Ordering::Relaxed) as i64,
+            cdc_events_processed: cdc.events_processed.load(Ordering::Relaxed) as i64,
+            cdc_msgs_published: cdc.msgs_published.load(Ordering::Relaxed) as i64,
+            cdc_render_errors: cdc.render_errors.load(Ordering::Relaxed) as i64,
+            cdc_slot_errors: cdc.slot_errors.load(Ordering::Relaxed) as i64,
+            cdc_persist_errors: cdc.persist_errors.load(Ordering::Relaxed) as i64,
+            cdc_ring_buffer_dropped: cdc.ring_buffer_dropped.load(Ordering::Relaxed) as i64,
+            cdc_bridge_dropped: cdc.bridge_dropped.load(Ordering::Relaxed) as i64,
+            inbound_writes_ok: cdc.inbound_writes_ok.load(Ordering::Relaxed) as i64,
+            inbound_writes_failed: cdc.inbound_writes_failed.load(Ordering::Relaxed) as i64,
+            inbound_retries: cdc.inbound_retries.load(Ordering::Relaxed) as i64,
+            inbound_dead_letters: cdc.inbound_dead_letters.load(Ordering::Relaxed) as i64,
             db_batches_committed: m.db_batches_committed.load(Ordering::Relaxed) as i64,
             db_session_errors: m.db_session_errors.load(Ordering::Relaxed) as i64,
             db_message_errors: m.db_message_errors.load(Ordering::Relaxed) as i64,
@@ -236,6 +350,7 @@ impl MetricsSnapshot {
                 r#""subscribe_ops":{so},"unsubscribe_ops":{uo},"#,
                 r#""cdc_events_processed":{cep},"cdc_msgs_published":{cmp},"#,
                 r#""cdc_render_errors":{cre},"cdc_slot_errors":{cse},"cdc_persist_errors":{cpe},"cdc_ring_buffer_dropped":{crbd},"#,
+                r#""cdc_bridge_dropped":{cbd},"#,
                 r#""inbound_writes_ok":{iwo},"inbound_writes_failed":{iwf},"inbound_retries":{ir},"inbound_dead_letters":{idl},"#,
                 r#""db_batches_committed":{dbc},"db_session_errors":{dse},"db_message_errors":{dme},"db_subscription_errors":{dsue}}}"#,
             ),
@@ -268,6 +383,7 @@ impl MetricsSnapshot {
             cse = self.cdc_slot_errors,
             cpe = self.cdc_persist_errors,
             crbd = self.cdc_ring_buffer_dropped,
+            cbd = self.cdc_bridge_dropped,
             iwo = self.inbound_writes_ok,
             iwf = self.inbound_writes_failed,
             ir = self.inbound_retries,
@@ -311,6 +427,7 @@ impl MetricsSnapshot {
         "cdc_slot_errors",
         "cdc_persist_errors",
         "cdc_ring_buffer_dropped",
+        "cdc_bridge_dropped",
         "inbound_writes_ok",
         "inbound_writes_failed",
         "inbound_retries",
@@ -354,6 +471,7 @@ impl MetricsSnapshot {
             self.cdc_slot_errors,
             self.cdc_persist_errors,
             self.cdc_ring_buffer_dropped,
+            self.cdc_bridge_dropped,
             self.inbound_writes_ok,
             self.inbound_writes_failed,
             self.inbound_retries,
@@ -525,6 +643,12 @@ impl MetricsSnapshot {
                 "CDC events dropped due to BGW ring buffer overflow (data loss signal)",
             ),
             (
+                "pgmqtt_cdc_bridge_dropped_total",
+                "counter",
+                self.cdc_bridge_dropped,
+                "Messages dropped by the pgmqtt_cdc -> pgmqtt_mqtt shared-memory bridge (QoS 0 inline ring overflow)",
+            ),
+            (
                 "pgmqtt_inbound_writes_ok_total",
                 "counter",
                 self.inbound_writes_ok,
@@ -600,7 +724,7 @@ impl MetricsSnapshot {
         out
     }
 
-    pub const FIELD_COUNT: usize = 37;
+    pub const FIELD_COUNT: usize = 38;
 }
 
 #[cfg(test)]
@@ -640,6 +764,7 @@ mod tests {
             cdc_slot_errors: 0,
             cdc_persist_errors: 1,
             cdc_ring_buffer_dropped: 0,
+            cdc_bridge_dropped: 0,
             inbound_writes_ok: 300,
             inbound_writes_failed: 1,
             inbound_retries: 5,

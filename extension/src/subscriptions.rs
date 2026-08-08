@@ -455,37 +455,32 @@ pub fn has_subscribers(topic: &str) -> bool {
     })
 }
 
-/// Find all client IDs whose topic filters match a concrete topic, with their granted QoS.
-///
-/// For regular subscriptions: returns all matching clients (deduped, highest QoS wins).
-/// For shared subscriptions: returns exactly one client per matching group (round-robin,
-/// preferring connected clients).
-///
-/// `connected_clients` is the set of currently-connected client IDs, used to prefer
-/// online members when selecting from a shared group.
-pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(String, u8)> {
+/// Find all client IDs whose topic filters match a concrete topic, with
+/// their granted QoS. Regular matches come back deduped (highest QoS wins);
+/// shared-group picks are kept separate as `(group_filter, member_id, qos)`
+/// — one member per matching group, round-robin preferring members in
+/// `connected_clients` — so multi-worker delivery can gate each group on a
+/// cluster-wide claim. Advances the groups' round-robin state.
+pub fn match_topic_split(
+    topic: &str,
+    connected_clients: &HashSet<String>,
+) -> (Vec<(String, u8)>, Vec<(String, String, u8)>) {
     with_state(|state| {
         let mut matched: HashMap<String, u8> = HashMap::new();
-
-        // Regular subscriptions via trie.
         let segments: Vec<&str> = topic.split('/').collect();
         let is_dollar = topic.starts_with('$');
         state.trie.match_topic(&segments, is_dollar, &mut matched);
 
-        // Shared subscriptions: one client per matching group (linear scan
-        // is fine — shared groups are typically few).
-        for sg in state.shared_groups.values() {
+        let mut shared = Vec::new();
+        for (group_filter, sg) in state.shared_groups.iter() {
             if mqtt::topic_matches_filter(topic, &sg.filter) {
                 if let Some((cid, qos)) = sg.next_member(|c| connected_clients.contains(c)) {
-                    let entry = matched.entry(cid).or_insert(qos);
-                    if qos > *entry {
-                        *entry = qos;
-                    }
+                    shared.push((group_filter.to_string(), cid, qos));
                 }
             }
         }
 
-        matched.into_iter().collect()
+        (matched.into_iter().collect(), shared)
     })
 }
 

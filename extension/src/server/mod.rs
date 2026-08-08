@@ -1,15 +1,23 @@
 //! MQTT broker main event loop and client polling.
 
+mod cdc_worker;
 pub mod db_action;
+mod outbox;
+mod publish;
+mod readiness;
 pub mod session;
+mod topology;
 pub mod transport;
+mod wal;
 
 use crate::inbound_map;
 use crate::mqtt;
 use crate::subscriptions;
-pub use db_action::{execute_session_db_actions, SessionDbAction};
+pub use cdc_worker::run_cdc;
+pub use db_action::{execute_session_db_actions, execute_session_db_actions_async, SessionDbAction};
 pub use session::{with_sessions, MqttMessage, MqttSession};
 pub use transport::Transport;
+use publish::{publish_messages_batch, publish_messages_batch_deferred, PendingPublish};
 
 use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
@@ -93,22 +101,49 @@ fn with_subtransaction<T>(
     result
 }
 
-/// On startup, mark all sessions that have no `disconnected_at` as disconnected now.
-///
-/// After a crash, sessions keep `disconnected_at = NULL` because the broker never
-/// reached the normal disconnect path. This causes two problems:
-///   1. `pgmqtt_status()` reports them as active connections indefinitely.
-///   2. Session expiry timers never start, so stale sessions accumulate forever.
-///
-/// Setting `disconnected_at = now()` for all NULL-disconnected sessions fixes both:
-/// the status view is accurate, and expiry timers begin from broker restart.
-/// `db_load_sessions_on_startup` then reads the updated timestamps and
-/// correctly restores in-memory expiry state.
+/// `BackgroundWorker::transaction` variant whose closure picks the outcome:
+/// `(result, false)` aborts instead of committing. Plain `transaction`
+/// always commits, so a "failed" CDC batch would still commit its partial
+/// persists and the retry would replay on top of them.
+fn transaction_or_abort<R>(
+    body: impl FnOnce() -> (R, bool) + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+) -> (R, bool) {
+    unsafe {
+        pgrx::pg_sys::SetCurrentStatementStartTimestamp();
+        pgrx::pg_sys::StartTransactionCommand();
+        pgrx::pg_sys::PushActiveSnapshot(pgrx::pg_sys::GetTransactionSnapshot());
+    }
+    let (result, commit) = pgrx::pg_sys::pg_try::PgTryBuilder::new(body).execute();
+    unsafe {
+        pgrx::pg_sys::PopActiveSnapshot();
+        if commit {
+            pgrx::pg_sys::CommitTransactionCommand();
+        } else {
+            pgrx::pg_sys::AbortCurrentTransaction();
+        }
+    }
+    (result, commit)
+}
+
+/// On startup, mark orphaned sessions (crash left `disconnected_at =
+/// NULL`) as disconnected, so the status view is accurate and expiry
+/// timers start.
 fn db_mark_sessions_disconnected_on_startup() {
     BackgroundWorker::transaction(|| {
         let _ = pgrx::spi::Spi::connect_mut(|client| {
+            // Startup write — advisory-locked against the partner worker's
+            // slot creation (see ensure_replication_slot in lib.rs).
+            let _ = client.select(
+                &format!(
+                    "SELECT pg_advisory_xact_lock({})",
+                    crate::SCHEMA_MIGRATION_LOCK_KEY
+                ),
+                None,
+                &[],
+            );
             let _ = client.update(
-                "UPDATE pgmqtt_sessions SET disconnected_at = now() WHERE disconnected_at IS NULL",
+                "UPDATE pgmqtt_sessions SET disconnected_at = now() \
+                 WHERE disconnected_at IS NULL",
                 None,
                 &[],
             );
@@ -146,7 +181,8 @@ fn db_load_sessions_on_startup() {
 
             // Load sessions
             if let Ok(table) = client.select(
-                "SELECT client_id, next_packet_id, expiry_interval, disconnected_at::text \
+                "SELECT client_id, next_packet_id, expiry_interval, auth_principal, \
+                        disconnected_at::text \
                  FROM pgmqtt_sessions",
                 None,
                 &[],
@@ -168,6 +204,11 @@ fn db_load_sessions_on_startup() {
                             .ok()
                             .flatten()
                             .unwrap_or(0);
+                        let principal: String = row
+                            .get_by_name("auth_principal")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         let disconnected_str: Option<String> =
                             row.get_by_name("disconnected_at").ok().flatten();
 
@@ -181,6 +222,7 @@ fn db_load_sessions_on_startup() {
                         sess.next_packet_id = next_pid as u16;
                         sess.expiry_interval = expiry as u32;
                         sess.disconnected_at = disconnected_at;
+                        sess.auth_principal = principal;
 
                         s.insert(client_id, sess);
                         loaded_count += 1;
@@ -579,7 +621,7 @@ fn load_inbound_mappings() {
 ///
 /// Each write is executed in its own transaction so a single failure
 /// (constraint violation, bad data) doesn't roll back the entire batch.
-fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
+fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>, synchronous: bool) {
     if writes.is_empty() {
         return;
     }
@@ -590,6 +632,19 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
     for write in &writes {
         let ok: bool = BackgroundWorker::transaction(|| {
             pgrx::spi::Spi::connect_mut(|client| {
+                if !synchronous {
+                    // QoS 0 direct writes: no ack gates on their durability,
+                    // so skip the commit's WAL flush (enterprise multiprocess).
+                    let _ = client.select(
+                        "SELECT set_config('synchronous_commit', 'off', true)",
+                        None,
+                        &[],
+                    );
+                }
+                // Target-table rows must decode as user writes (see
+                // topology::suspend_session_origin); idempotent, so only
+                // the batch's first write pays the call.
+                topology::suspend_session_origin(client)?;
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = write
                     .args
                     .iter()
@@ -608,15 +663,17 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>) {
         }
     }
 
+    topology::resume_session_origin();
+
     let ok_count = total - err_count;
     if ok_count > 0 {
         log!("pgmqtt inbound: committed {} writes", ok_count);
-        crate::metrics::add(&crate::metrics::get().inbound_writes_ok, ok_count as u64);
+        crate::metrics::add(&crate::metrics::shared_cdc().inbound_writes_ok, ok_count as u64);
     }
     if err_count > 0 {
         log!("pgmqtt inbound: {} writes failed", err_count);
         crate::metrics::add(
-            &crate::metrics::get().inbound_writes_failed,
+            &crate::metrics::shared_cdc().inbound_writes_failed,
             err_count as u64,
         );
     }
@@ -739,6 +796,11 @@ fn process_inbound_pending() {
                     });
                 }
 
+                // Target-table rows must decode as user writes (see
+                // topology::suspend_session_origin); idempotent, and only
+                // reached when a pending row exists — idle ticks pay nothing.
+                topology::suspend_session_origin(client)?;
+
                 let spi_args: Vec<pgrx::datum::DatumWithOid> = match_result
                     .values
                     .iter()
@@ -780,7 +842,7 @@ fn process_inbound_pending() {
                 message_id,
                 mapping_name,
             } => {
-                crate::metrics::inc(&crate::metrics::get().inbound_writes_ok);
+                crate::metrics::inc(&crate::metrics::shared_cdc().inbound_writes_ok);
                 log!(
                     "pgmqtt inbound: processed message {} for mapping '{}'",
                     message_id,
@@ -813,7 +875,7 @@ fn process_inbound_pending() {
                 payload,
                 error,
             } => {
-                crate::metrics::inc(&crate::metrics::get().inbound_writes_failed);
+                crate::metrics::inc(&crate::metrics::shared_cdc().inbound_writes_failed);
                 handle_inbound_failure(
                     message_id,
                     &mapping_name,
@@ -827,6 +889,8 @@ fn process_inbound_pending() {
             }
         }
     }
+
+    topology::resume_session_origin();
 
     if processed > 0 {
         log!("pgmqtt inbound: processed {} pending rows", processed);
@@ -856,7 +920,7 @@ fn handle_inbound_failure(
             payload,
         );
     } else {
-        crate::metrics::inc(&crate::metrics::get().inbound_retries);
+        crate::metrics::inc(&crate::metrics::shared_cdc().inbound_retries);
         log!(
             "pgmqtt inbound: retry {}/{} for message {} mapping '{}': {}",
             retry_count + 1,
@@ -897,7 +961,7 @@ fn dead_letter_inbound(
     topic: &str,
     payload: &[u8],
 ) {
-    crate::metrics::inc(&crate::metrics::get().inbound_dead_letters);
+    crate::metrics::inc(&crate::metrics::shared_cdc().inbound_dead_letters);
     log!(
         "pgmqtt inbound: dead-lettering message {} for mapping '{}': {}",
         message_id,
@@ -1187,7 +1251,32 @@ method not allowed";
 ///
 /// Both share the same `clients` map, so CDC events are delivered to all
 /// connected clients regardless of transport.
-pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
+///
+/// Community entry point: this process also owns the replication slot and
+/// ticks CDC inline — the original combined-worker behavior.
+pub fn run_standalone(ports: crate::PortConfig, slot_name: &str) {
+    run_loop(ports, CdcMode::Standalone(slot_name));
+}
+
+/// Enterprise entry point, delivery-only: the separate `pgmqtt_cdc` worker
+/// owns the slot; this loop drains its outbox + inline ring.
+pub fn run_delivery(ports: crate::PortConfig) {
+    run_loop(ports, CdcMode::Bridged(outbox::Drain::new()));
+}
+
+/// Which process owns CDC slot consumption.
+enum CdcMode<'a> {
+    /// This process ticks the slot inline (community).
+    Standalone(&'a str),
+    /// A separate `pgmqtt_cdc` worker ticks the slot; drain its handoff
+    /// (enterprise).
+    Bridged(outbox::Drain),
+}
+
+fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
+    crate::metrics::connections_reset();
+    topology::setup_replication_origin("pgmqtt_mqtt");
+
     db_mark_sessions_disconnected_on_startup();
     db_load_sessions_on_startup();
     load_inbound_mappings();
@@ -1196,114 +1285,38 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         crate::statements::prepare_hot_path_statements();
     });
 
-    // Bind MQTT TCP listener (optional)
-    let mqtt_listener = if ports.mqtt_enabled {
-        let addr = format!("0.0.0.0:{}", ports.mqtt_port);
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt mqtt: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt mqtt: listening on {} (raw TCP)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt mqtt: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt mqtt: TCP listener disabled");
-        None
+    let Ok(mqtt_listener) =
+        topology::bind(ports.mqtt_enabled, ports.mqtt_port, "pgmqtt mqtt", "TCP", "raw TCP")
+    else {
+        return;
     };
-
-    // Bind WebSocket listener (optional)
-    let ws_listener = if ports.ws_enabled {
-        let addr = format!("0.0.0.0:{}", ports.ws_port);
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt ws: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt ws: listening on {} (WebSocket)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt ws: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt ws: WebSocket listener disabled");
-        None
+    let Ok(ws_listener) = topology::bind(
+        ports.ws_enabled,
+        ports.ws_port,
+        "pgmqtt ws",
+        "WebSocket",
+        "WebSocket",
+    ) else {
+        return;
     };
-
-    // Bind MQTT TLS listener (optional)
-    let mqtts_listener = if ports.mqtts_enabled {
-        let addr = format!("0.0.0.0:{}", ports.mqtts_port);
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt mqtts: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt mqtts: listening on {} (TLS)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt mqtts: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt mqtts: TLS listener disabled");
-        None
+    let Ok(mqtts_listener) =
+        topology::bind(ports.mqtts_enabled, ports.mqtts_port, "pgmqtt mqtts", "TLS", "TLS")
+    else {
+        return;
     };
-
-    // Bind WSS listener (optional)
-    let wss_listener = if ports.wss_enabled {
-        let addr = format!("0.0.0.0:{}", ports.wss_port);
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt wss: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt wss: listening on {} (WSS)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt wss: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt wss: WSS listener disabled");
-        None
+    let Ok(wss_listener) =
+        topology::bind(ports.wss_enabled, ports.wss_port, "pgmqtt wss", "WSS", "WSS")
+    else {
+        return;
     };
-
-    // Bind HTTP healthcheck listener (optional)
-    let http_listener = if ports.http_enabled {
-        let addr = format!("0.0.0.0:{}", ports.http_port);
-        match TcpListener::bind(&addr) {
-            Ok(l) => {
-                if let Err(e) = l.set_nonblocking(true) {
-                    log!("pgmqtt http: failed to set non-blocking: {}", e);
-                    return;
-                }
-                log!("pgmqtt http: listening on {} (healthcheck)", addr);
-                Some(l)
-            }
-            Err(e) => {
-                log!("pgmqtt http: failed to bind {}: {}", addr, e);
-                return;
-            }
-        }
-    } else {
-        log!("pgmqtt http: healthcheck listener disabled");
-        None
+    let Ok(http_listener) = topology::bind(
+        ports.http_enabled,
+        ports.http_port,
+        "pgmqtt http",
+        "healthcheck",
+        "healthcheck",
+    ) else {
+        return;
     };
 
     // Load TLS configuration if any secure listener is enabled
@@ -1325,12 +1338,19 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
         None
     };
 
+    let log_prefix = match cdc_mode {
+        CdcMode::Standalone(_) => "pgmqtt mqtt+cdc",
+        CdcMode::Bridged(_) => "pgmqtt mqtt",
+    };
+
     // client_id → MqttClient
     let mut clients: HashMap<String, MqttClient> = HashMap::new();
+    // Readiness poller: which clients have socket data this tick, so the
+    // read pass is O(active) instead of O(connections). Falls back to
+    // polling everyone if epoll is unavailable (see server::readiness).
+    let mut poller = readiness::ReadinessPoller::new();
     // Tick counter for throttling low-priority periodic work.
     let mut tick: u64 = 0;
-    // Set when a bounded CDC drain yielded with WAL still pending.
-    let mut cdc_drain_pending = false;
     // Wall-clock timers for periodic tasks — their frequency must stay stable
     // regardless of tick rate (pgmqtt.tick_interval_ms).
     let mut last_inbound_reload = std::time::Instant::now();
@@ -1340,11 +1360,16 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     // Enterprise metrics flush timers (only active when metrics feature is licensed).
     let mut last_metrics_flush = std::time::Instant::now();
     let mut last_connections_flush = std::time::Instant::now();
+    // Async-commit release queue; idle in Standalone mode.
+    let mut deferred_publishes = publish::DeferredQueue::new();
+    // Set when a bounded CDC drain yielded with WAL still pending
+    // (Standalone only; the Bridged CDC worker carries its own).
+    let mut cdc_drain_pending = false;
     while BackgroundWorker::wait_latch(Some(latch_interval())) {
         tick = tick.wrapping_add(1);
 
         if BackgroundWorker::sighup_received() {
-            log!("pgmqtt mqtt+cdc: SIGHUP received");
+            log!("{}: SIGHUP received", log_prefix);
             unsafe {
                 pgrx::pg_sys::ProcessConfigFile(pgrx::pg_sys::GucContext::PGC_SIGHUP);
             }
@@ -1435,28 +1460,52 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
                 );
             }
         }
+        poller.sync(&clients);
+        let ready = poller.ready_set();
         poll_mqtt_clients(
             &mut clients,
             &mut publishes,
             &mut session_db_actions,
             &mut pending_inbound_writes,
+            ready.as_ref(),
+            &mut poller.carry,
         );
 
-        // Execute inbound writes (MQTT → PostgreSQL) before CDC and message delivery
-        execute_inbound_writes(pending_inbound_writes);
+        // Execute inbound writes (MQTT → PostgreSQL) before CDC and message
+        // delivery. Bridged commits them asynchronously — QoS 0 direct
+        // writes have no ack to gate on the flush.
+        execute_inbound_writes(
+            pending_inbound_writes,
+            matches!(cdc_mode, CdcMode::Standalone(_)),
+        );
 
-        if tick % crate::get_cdc_every_n_ticks_guc() == 0 || cdc_drain_pending {
-            let (cdc_messages, fully_drained) = cdc_tick(slot_name);
-            cdc_drain_pending = !fully_drained;
-            if !cdc_messages.is_empty() {
-                deliver_messages(
-                    &cdc_messages,
-                    &mut clients,
-                    &mut publishes,
-                    &mut session_db_actions,
-                );
+        match &mut cdc_mode {
+            CdcMode::Standalone(slot_name) => {
+                // A drain that yielded mid-backlog must re-run next tick
+                // regardless of the cdc_every_n_ticks pacing.
+                if tick % crate::get_cdc_every_n_ticks_guc() == 0 || cdc_drain_pending {
+                    cdc_drain_pending = !cdc_worker::cdc_tick_core(
+                        slot_name,
+                        cdc_worker::CdcQueueMode::DeliverAll,
+                        |batch| {
+                            deliver_messages(
+                                &batch,
+                                &mut clients,
+                                &mut publishes,
+                                &mut session_db_actions,
+                            );
+                        },
+                    );
+                }
+            }
+            // Every tick — cdc_every_n_ticks paces the CDC worker's slot
+            // polling, not delivery.
+            CdcMode::Bridged(drain) => {
+                drain.tick(&mut clients, &mut publishes, &mut session_db_actions);
             }
         }
+
+        deferred_publishes.release_due(&mut clients, &mut publishes, &mut session_db_actions);
 
         // Periodically resend unacked QoS 1 messages (5s timeout; checking every 1s is sufficient)
         if last_redeliver_check.elapsed() >= Duration::from_secs(1) {
@@ -1464,21 +1513,44 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
             last_redeliver_check = std::time::Instant::now();
         }
 
-        publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
+        match cdc_mode {
+            CdcMode::Standalone(_) => {
+                publish_messages_batch(publishes, &mut clients, &mut session_db_actions);
+            }
+            // Async commit + deferred delivery/PUBACK — see
+            // publish_messages_batch_deferred for why this needs the split.
+            CdcMode::Bridged(_) => {
+                publish_messages_batch_deferred(
+                    publishes,
+                    &mut clients,
+                    &mut session_db_actions,
+                    &mut deferred_publishes,
+                );
+            }
+        }
 
-        // Virtual subscriber: drain QoS 1 inbound-pending rows every tick so
-        // that callers receive durable delivery (row in target table) in the
-        // same tick as the PUBACK.  The SELECT is a no-op when the table is
-        // empty, so per-tick overhead is negligible.
-        process_inbound_pending();
+        // QoS 1 inbound pump. In Bridged mode it runs in the pgmqtt_cdc
+        // worker instead: up to 50 single-row sync commits per tick, and
+        // its known target-table DDL crash then spares the sockets.
+        if matches!(cdc_mode, CdcMode::Standalone(_)) {
+            process_inbound_pending();
+        }
 
+        // Session expiry: every worker sweeps its own in-memory map; in
+        // multi-worker, slot 0 additionally runs the DB-authoritative sweep
+        // for sessions whose owner lost its copy.
         if last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
             last_session_sweep = std::time::Instant::now();
         }
-
-        // Execute all collected session DB actions in one transaction
-        execute_session_db_actions(session_db_actions);
+        // All collected session DB actions in one transaction. Bridged
+        // commits asynchronously: every action is reconstructible or
+        // at-least-once, so a postmaster crash loses only bookkeeping
+        // within its own recovery envelope — and no per-tick fsync.
+        match cdc_mode {
+            CdcMode::Standalone(_) => execute_session_db_actions(session_db_actions),
+            CdcMode::Bridged(_) => execute_session_db_actions_async(session_db_actions),
+        }
 
         // ── Enterprise metrics flush ──────────────────────────────────────────
         if crate::license::has_feature(crate::license::Feature::Metrics) {
@@ -1500,9 +1572,14 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
 
     // Graceful shutdown: send DISCONNECT to all clients, fire will messages,
     // and persist session state so reconnecting clients find correct disconnected_at.
-    log!("pgmqtt mqtt+cdc: SIGTERM received, shutting down gracefully");
+    log!("{}: SIGTERM received, shutting down gracefully", log_prefix);
     let mut shutdown_db_actions = Vec::new();
     let mut will_publishes = Vec::new();
+
+    // Anything still deferred gets flushed and released before teardown:
+    // clients are about to be disconnected, so the owed PUBACKs and
+    // deliveries go out now.
+    deferred_publishes.release_all(&mut clients, &mut shutdown_db_actions);
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
@@ -1558,430 +1635,9 @@ pub fn run_mqtt_cdc(ports: crate::PortConfig, slot_name: &str) {
     // Flush session disconnect state to DB.
     execute_session_db_actions(shutdown_db_actions);
 
-    log!("pgmqtt mqtt+cdc: shutdown complete");
+    log!("{}: shutdown complete", log_prefix);
 }
 
-/// Maximum number of WAL events to consume per `cdc_tick` batch transaction.
-///
-/// Each batch is one atomic PostgreSQL transaction: the replication slot LSN
-/// only advances when **all** QOS ≥ 1 messages from that batch have been
-/// durably inserted into `pgmqtt_messages`. Smaller values reduce the retry
-/// cost if a batch fails; larger values reduce per-batch transaction overhead.
-const CDC_BATCH_SIZE: usize = 4096;
-
-/// Max drain batches per `cdc_tick` call. It runs inline in the socket loop,
-/// so an unbounded drain of a deep backlog would starve socket I/O; the
-/// caller re-invokes next tick while a backlog remains.
-const MAX_DRAIN_BATCHES_PER_TICK: usize = 4;
-
-/// One CDC tick: load mappings from DB, then drain the WAL slot in atomic
-/// batches, persisting QOS ≥ 1 messages within the same transaction.
-///
-/// Returns all rendered messages ready for delivery. The caller is responsible
-/// for passing them to `deliver_messages`.
-///
-/// # Atomicity guarantee
-///
-/// For each batch the sequence is:
-///   1. `pg_logical_slot_get_changes(..., upto_nchanges = CDC_BATCH_SIZE)`
-///      fires the output plugin for each event, which pushes raw `ChangeEvent`s
-///      into the in-memory `ring_buffer`.
-///   2. The ring buffer is drained; every QOS ≥ 1 rendered message is
-///      `INSERT`ed into `pgmqtt_messages` **within the same transaction**.
-///   3. On commit, the slot's `confirmed_flush_lsn` advances to cover exactly
-///      those events — and only those events.
-///
-/// A crash between the two SPI calls is impossible: they share one transaction.
-/// If the inserts fail the whole batch rolls back; the slot does not advance;
-/// the same events will be re-read next tick (at-least-once delivery).
-///
-/// QOS 0 messages are not persisted; they are collected during the transaction
-/// and returned after commit (fire-and-forget).
-///
-/// Returns `(messages, fully_drained)`. `fully_drained == false` means the
-/// per-tick batch budget was hit with WAL still pending; the caller
-/// re-invokes next tick.
-fn cdc_tick(slot_name: &str) -> (Vec<MqttMessage>, bool) {
-    use crate::ring_buffer;
-    use crate::topic_map;
-    use pgrx::spi::{self, Spi};
-
-    // ── Startup: load mapping cache from pgmqtt_slot_mappings ────────────────
-    //
-    // pgmqtt_slot_mappings is the WAL-synchronized checkpoint: it is updated
-    // atomically inside the same BackgroundWorker::transaction that advances
-    // the slot LSN.  Loading from it on restart gives us the mapping state
-    // exactly at confirmed_flush_lsn — never a "future" version.
-    //
-    // On a fresh slot (confirmed_flush_lsn IS NULL — nothing consumed yet) we
-    // bootstrap by copying pgmqtt_topic_mappings → pgmqtt_slot_mappings once,
-    // since pre-slot mapping rows will never appear as WAL events.
-    if topic_map::get().is_none() {
-        BackgroundWorker::transaction(|| {
-            // Detect whether the slot has ever consumed data.
-            let is_fresh = Spi::connect(|client| {
-                let lsn: Option<String> = client
-                    .select(
-                        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
-                         WHERE slot_name = $1",
-                        None,
-                        &[slot_name.into()],
-                    )?
-                    .first()
-                    .get_one::<String>()?;
-                Ok::<bool, spi::Error>(lsn.is_none())
-            })
-            .unwrap_or(false);
-
-            if is_fresh {
-                // Bootstrap: copy current user-facing table into the slot checkpoint.
-                let _ = Spi::run(
-                    "INSERT INTO pgmqtt_slot_mappings \
-                         SELECT schema_name, table_name, mapping_name, \
-                                topic_template, payload_template, qos, template_type \
-                         FROM pgmqtt_topic_mappings \
-                         ON CONFLICT DO NOTHING",
-                );
-                log!("pgmqtt: fresh slot — bootstrapped slot mappings from pgmqtt_topic_mappings");
-            }
-
-            // Load from the checkpoint into the in-process cache.
-            if let Ok(mappings) = Spi::connect(|client| {
-                let mut rows = Vec::new();
-                if let Ok(table) = client.select(
-                    "SELECT schema_name, table_name, mapping_name, \
-                            topic_template, payload_template, qos, template_type \
-                     FROM pgmqtt_slot_mappings",
-                    None,
-                    &[],
-                ) {
-                    for row in table {
-                        let s: String = row
-                            .get_by_name("schema_name")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let t: String = row
-                            .get_by_name("table_name")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let mn: String = row
-                            .get_by_name("mapping_name")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "default".to_string());
-                        let tt: String = row
-                            .get_by_name("topic_template")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let pt: String = row
-                            .get_by_name("payload_template")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let q: i32 = row.get_by_name("qos").ok().flatten().unwrap_or_default();
-                        rows.push(topic_map::TopicMapping {
-                            name: mn,
-                            schema: s,
-                            table: t,
-                            topic_template: tt,
-                            payload_template: pt,
-                            qos: q as u8,
-                        });
-                    }
-                }
-                Ok::<_, spi::Error>(rows)
-            }) {
-                let count = mappings.len();
-                let mapped_set = mappings
-                    .iter()
-                    .map(|m| (m.schema.clone(), m.table.clone()))
-                    .collect::<std::collections::HashSet<_>>();
-                topic_map::set_mappings(mappings);
-                crate::ring_buffer::mapped_tables_init(mapped_set);
-                log!(
-                    "pgmqtt: loaded {} topic mappings from slot checkpoint",
-                    count
-                );
-            }
-        });
-    }
-
-    // ── Batched, atomic CDC drain loop ───────────────────────────────────────
-    //
-    // BackgroundWorker::transaction requires UnwindSafe + RefUnwindSafe, which
-    // &mut T does NOT satisfy.  The fix: all mutable state lives *inside* the
-    // closure (local variables, not captured).  The closure returns a
-    // (messages, batch_count, ok) tuple that we destructure after the commit.
-    //
-    // Messages are collected into `all_messages` and returned to the caller
-    // only after the transaction commits, ensuring QOS ≥ 1 messages are
-    // durably persisted before delivery.
-    let mut all_messages: Vec<MqttMessage> = Vec::new();
-    let mut batches = 0usize;
-    let fully_drained = loop {
-        let (to_publish, batch_count, batch_ok) = BackgroundWorker::transaction(
-            || -> (Vec<MqttMessage>, usize, bool) {
-                let mut to_publish: Vec<MqttMessage> = Vec::new();
-                let mut batch_count: usize = 0;
-
-                // ── Step 1: advance the slot by at most CDC_BATCH_SIZE events ──
-                //
-                // The output plugin (pg_decode_change) fires synchronously for each
-                // row, pushing a ChangeEvent into ring_buffer.  Because this runs
-                // inside the same transaction as the inserts below, the slot's
-                // confirmed_flush_lsn only moves forward on COMMIT.
-                let advance_query = format!(
-                    "SELECT * FROM pg_logical_slot_get_changes('{}', NULL, {})",
-                    slot_name, CDC_BATCH_SIZE
-                );
-                match Spi::connect(|client| {
-                    // Suppress PostgreSQL's "starting logical decoding" LOG messages
-                    // that fire on every slot read (every 80ms).  These are informational
-                    // and extremely noisy in production.  In PostgreSQL's log_min_messages
-                    // hierarchy, LOG sits above ERROR, so we need 'fatal' to suppress it.
-                    // The 'true' flag makes this local to the current transaction only.
-                    let _ = client.select(
-                        "SELECT set_config('log_min_messages', 'fatal', true)",
-                        None,
-                        &[],
-                    );
-                    let mut n = 0usize;
-                    let table = client.select(&advance_query, None, &[])?;
-                    for _ in table {
-                        n += 1;
-                    }
-                    Ok::<usize, spi::Error>(n)
-                }) {
-                    Ok(n) => {
-                        batch_count = n;
-                        if n > 0 {
-                            log!("pgmqtt: slot batch fetched {} raw logical messages", n);
-                            crate::metrics::add(
-                                &crate::metrics::get().cdc_events_processed,
-                                n as u64,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log!("pgmqtt: error advancing slot: {:?} — skipping batch", e);
-                        crate::metrics::inc(&crate::metrics::get().cdc_slot_errors);
-                        return (to_publish, batch_count, false);
-                    }
-                }
-
-                // ── Step 2: drain ring_buffer; process events in WAL order ──────
-                //
-                // MappingUpdate events apply mapping deltas both to the in-process
-                // cache and to pgmqtt_slot_mappings within this transaction, so the
-                // checkpoint stays atomically consistent with confirmed_flush_lsn.
-                let events = ring_buffer::drain();
-
-                for event in &events {
-                    match event {
-                        ring_buffer::RingEvent::MappingUpdate { op, columns } => {
-                            // Helper to pull a column value by name.
-                            let col = |name: &str| -> String {
-                                columns
-                                    .iter()
-                                    .find(|(k, _)| k == name)
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or_default()
-                            };
-                            let schema = col("schema_name");
-                            let table = col("table_name");
-                            let name = col("mapping_name");
-
-                            if *op == "DELETE" {
-                                topic_map::wal_remove(&schema, &table, &name);
-                                // Only remove from the fast-path set if no other
-                                // mappings remain for this (schema, table) pair.
-                                if !topic_map::has_any_mapping(&schema, &table) {
-                                    crate::ring_buffer::mapped_table_remove(&schema, &table);
-                                }
-                                let _ = pgrx::spi::Spi::connect_mut(|client| {
-                                    client.update(
-                                        "DELETE FROM pgmqtt_slot_mappings \
-                                         WHERE schema_name = $1 AND table_name = $2 AND mapping_name = $3",
-                                        None,
-                                        &[schema.as_str().into(), table.as_str().into(), name.as_str().into()],
-                                    ).map(|_| ())
-                                });
-                                log!("pgmqtt: WAL mapping DELETE {}.{} ({})", schema, table, name);
-                            } else {
-                                // INSERT or UPDATE
-                                let topic_template = col("topic_template");
-                                let payload_template = col("payload_template");
-                                let qos: u8 = col("qos").parse().unwrap_or(0);
-                                let mapping = topic_map::TopicMapping {
-                                    name: name.clone(),
-                                    schema: schema.clone(),
-                                    table: table.clone(),
-                                    topic_template: topic_template.clone(),
-                                    payload_template: payload_template.clone(),
-                                    qos,
-                                };
-                                topic_map::wal_upsert(mapping);
-                                crate::ring_buffer::mapped_table_add(&schema, &table);
-                                let tmpl_type = col("template_type");
-                                let _ = pgrx::spi::Spi::connect_mut(|client| {
-                                    client.update(
-                                        "INSERT INTO pgmqtt_slot_mappings \
-                                             (schema_name, table_name, mapping_name, \
-                                              topic_template, payload_template, qos, template_type) \
-                                         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                                         ON CONFLICT (schema_name, table_name, mapping_name) DO UPDATE \
-                                         SET topic_template = EXCLUDED.topic_template, \
-                                             payload_template = EXCLUDED.payload_template, \
-                                             qos = EXCLUDED.qos, \
-                                             template_type = EXCLUDED.template_type",
-                                        None,
-                                        &[
-                                            schema.as_str().into(),
-                                            table.as_str().into(),
-                                            name.as_str().into(),
-                                            topic_template.as_str().into(),
-                                            payload_template.as_str().into(),
-                                            (qos as i32).into(),
-                                            tmpl_type.as_str().into(),
-                                        ],
-                                    ).map(|_| ())
-                                });
-                                log!("pgmqtt: WAL mapping {} {}.{} ({})", op, schema, table, name);
-                            }
-                        }
-
-                        ring_buffer::RingEvent::Data(change) => {
-                            let rendered_messages = topic_map::render(
-                                &change.schema,
-                                &change.table,
-                                change.op,
-                                &change.columns,
-                            );
-
-                            if rendered_messages.is_empty() {
-                                log!(
-                                    "pgmqtt: no mapping match for {}.{}",
-                                    change.schema,
-                                    change.table
-                                );
-                                continue;
-                            }
-
-                            for rendered in rendered_messages {
-                                let topic_str = rendered.topic.clone();
-
-                                // Skip if no subscribers (CDC events are never retained).
-                                if !subscriptions::has_subscribers(&topic_str) {
-                                    log!(
-                                        "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
-                                        topic_str
-                                    );
-                                    continue;
-                                }
-
-                                if rendered.qos > 0 {
-                                    // Persist within this transaction — committed atomically
-                                    // with the slot advance above.  The subtransaction ensures a
-                                    // PostgreSQL error inside persist_message is caught and counted
-                                    // without crashing the background worker; the outer batch still
-                                    // rolls back so events are retried on the next tick.
-                                    let result = with_subtransaction(|| {
-                                        pgrx::spi::Spi::connect_mut(|client| {
-                                            let msg_id = db_action::persist_message(
-                                                client,
-                                                &topic_str,
-                                                &rendered.payload,
-                                                rendered.qos,
-                                                false,
-                                            )?;
-                                            Ok::<_, spi::Error>(Some(msg_id))
-                                        })
-                                    });
-
-                                    match result {
-                                        Ok(msg_id) => {
-                                            log!(
-                                                "pgmqtt cdc: persisted QOS {} to '{}' (msg_id={:?})",
-                                                rendered.qos,
-                                                rendered.topic,
-                                                msg_id
-                                            );
-                                            to_publish.push(MqttMessage {
-                                                id: msg_id,
-                                                topic: rendered.topic,
-                                                payload: rendered.payload,
-                                                qos: rendered.qos,
-                                            });
-                                            crate::metrics::inc(
-                                                &crate::metrics::get().cdc_msgs_published,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log!(
-                                                "pgmqtt cdc: error persisting QOS {} to '{}': {:?} \
-                                                 — batch rolls back, events retried next tick",
-                                                rendered.qos,
-                                                topic_str,
-                                                e
-                                            );
-                                            crate::metrics::inc(
-                                                &crate::metrics::get().cdc_persist_errors,
-                                            );
-                                            return (Vec::new(), batch_count, false);
-                                        }
-                                    }
-                                } else {
-                                    // QOS 0 — fire-and-forget, pushed after commit.
-                                    to_publish.push(MqttMessage {
-                                        id: None,
-                                        topic: rendered.topic,
-                                        payload: rendered.payload,
-                                        qos: 0,
-                                    });
-                                    crate::metrics::inc(&crate::metrics::get().cdc_msgs_published);
-                                }
-
-                                log!(
-                                    "pgmqtt: processed {} on {}.{} → topic='{}'",
-                                    change.op,
-                                    change.schema,
-                                    change.table,
-                                    topic_str
-                                );
-                            }
-                        }
-                    }
-                }
-
-                (to_publish, batch_count, true)
-            },
-        );
-        // ↑ COMMIT: slot LSN advances IFF all QOS ≥ 1 inserts committed.
-        //   batch_ok=false means the transaction rolled back; slot unchanged.
-
-        if !batch_ok {
-            log!("pgmqtt cdc: batch transaction failed or rolled back — events will be retried");
-            break true;
-        }
-
-        all_messages.extend(to_publish);
-
-        // Batch smaller than the limit — WAL fully drained.
-        if batch_count < CDC_BATCH_SIZE {
-            break true;
-        }
-
-        // Yield after the budget so a deep backlog can't monopolize the loop.
-        batches += 1;
-        if batches >= MAX_DRAIN_BATCHES_PER_TICK {
-            break false;
-        }
-    };
-    (all_messages, fully_drained)
-}
 /// Accept new MQTTS (TCP + TLS) connections and perform the MQTT CONNECT handshake.
 fn accept_mqtts_connections(
     listener: &TcpListener,
@@ -2241,9 +1897,12 @@ fn finish_connect(
         return;
     }
 
-    let client_id = if packet.client_id.is_empty() {
-        let id = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-        format!("pgmqtt-auto-{}", id)
+    let assigned_id = packet.client_id.is_empty();
+    let client_id = if assigned_id {
+        // The pid makes it unique across restarts; a bare counter would
+        // cross-connect unrelated clients via takeover.
+        let n = NEXT_AUTO_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("pgmqtt-auto-{}-{}", std::process::id(), n)
     } else {
         packet.client_id.clone()
     };
@@ -2272,6 +1931,9 @@ fn finish_connect(
     let mut sub_acl: Vec<String> = Vec::new();
     let mut pub_acl: Vec<String> = Vec::new();
     let mut authenticated_role: Option<String> = None;
+    // Identity string durable sessions are bound to (see
+    // MqttSession::auth_principal). Set by whichever auth path accepts.
+    let mut jwt_principal: Option<String> = None;
 
     let password_bytes = packet.password.as_deref();
     let password_looks_like_jwt = password_bytes
@@ -2319,6 +1981,14 @@ fn finish_connect(
                     sub_acl = claims.sub_claims;
                     pub_acl = claims.pub_claims;
                     routed_password_to_jwt = password_looks_like_jwt;
+                    // Best identity the token offers: subject, else the
+                    // client_id binding, else just "holder of a valid
+                    // token" — the deployment defined nothing finer.
+                    jwt_principal = Some(match (&claims.sub, &claims.client_id) {
+                        (Some(sub), _) => format!("jwt:sub:{}", sub),
+                        (None, Some(cid)) => format!("jwt:cid:{}", cid),
+                        (None, None) => "jwt".to_string(),
+                    });
                     log!("pgmqtt mqtt: JWT validated for '{}'", client_id);
                 }
                 Err(e) => {
@@ -2452,6 +2122,18 @@ fn finish_connect(
         return;
     }
 
+    // The identity durable session state is bound to. Password auth wins
+    // when both validated (matching the ACL precedence above); "anon" is as
+    // fine-grained as an unauthenticated deployment gets — MQTT's session
+    // key is the client_id itself there.
+    let auth_principal = if let Some(role) = &authenticated_role {
+        format!("role:{}", role)
+    } else if let Some(p) = jwt_principal {
+        p
+    } else {
+        "anon".to_string()
+    };
+
     // ── Will validation ───────────────────────────────────────────────────────
     // The Will is a deferred PUBLISH; it must satisfy the same authorization
     // (JWT pub_claims / pgmqtt_acls pub rules) and topic-name rules (MQTT-3.3.2-2:
@@ -2498,6 +2180,25 @@ fn finish_connect(
         }
     }
 
+    // Connection limit — before the takeover below, or rejecting a
+    // replacement after the kick would disconnect the old client and admit
+    // nobody. Takeover always proceeds (frees its own slot).
+    let limit = crate::license::max_connections();
+    if !clients.contains_key(&client_id) && clients.len() >= limit {
+        log!(
+            "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
+            limit,
+            client_id
+        );
+        let _ = transport.write_all(&mqtt::build_connack(
+            false,
+            mqtt::reason::QUOTA_EXCEEDED,
+            v5,
+        ));
+        crate::metrics::inc(&crate::metrics::get().connections_rejected);
+        return;
+    }
+
     // ── Session takeover (MQTT 5.0 §4.9) ──────────────────────────────────────
     // If the ClientID represents a Client already connected, send DISCONNECT
     // with reason code 0x8E (Session taken over), fire its Will, then close
@@ -2509,9 +2210,8 @@ fn finish_connect(
         );
         // Bypasses disconnect_client(), so do its metric bookkeeping inline.
         {
-            let m = crate::metrics::get();
-            crate::metrics::dec(&m.connections_current);
-            crate::metrics::inc(&m.disconnections_unclean);
+            crate::metrics::connections_dec();
+            crate::metrics::inc(&crate::metrics::get().disconnections_unclean);
         }
         let _ = old_client.transport.write_all(&mqtt::build_disconnect(
             mqtt::reason::SESSION_TAKEN_OVER,
@@ -2544,8 +2244,12 @@ fn finish_connect(
         // Session takeover acts as a disconnect for the old connection.
         // If the old session had expiry_interval == 0 (end at disconnect),
         // clean it up now so that the session_present check below is correct
-        // (MQTT 5.0 §3.2.2.1.1).
-        if old_client.session.expiry_interval == 0 {
+        // (MQTT 5.0 §3.2.2.1.1). A replacement under a *different*
+        // principal likewise never inherits the old identity's session.
+        let old_principal = &old_client.session.auth_principal;
+        if old_client.session.expiry_interval == 0
+            || (!old_principal.is_empty() && *old_principal != auth_principal)
+        {
             subscriptions::remove_client(&client_id);
             session_db_actions.push(SessionDbAction::DeleteSession {
                 client_id: client_id.clone(),
@@ -2557,25 +2261,6 @@ fn finish_connect(
                 s.insert(client_id.clone(), old_client.session);
             });
         }
-    }
-
-    // ── Connection limit enforcement ──────────────────────────────────────────
-    // A genuinely new client is rejected when the limit is reached so operators
-    // can control memory usage.  Session takeovers (handled above) always proceed.
-    let limit = crate::license::max_connections();
-    if !clients.contains_key(&client_id) && clients.len() >= limit {
-        log!(
-            "pgmqtt mqtt: connection limit ({}) reached, rejecting '{}'",
-            limit,
-            client_id
-        );
-        let _ = transport.write_all(&mqtt::build_connack(
-            false,
-            mqtt::reason::QUOTA_EXCEEDED,
-            v5,
-        ));
-        crate::metrics::inc(&crate::metrics::get().connections_rejected);
-        return;
     }
 
     // If clean_start, remove any previous session
@@ -2590,13 +2275,33 @@ fn finish_connect(
     }
 
     // Check for an existing disconnected session to resume.
-    let (session_present, mut session) = with_sessions(|s| {
+    let (mut session_present, mut session) = with_sessions(|s| {
         if let Some(sess) = s.remove(&client_id) {
             (true, sess)
         } else {
             (false, MqttSession::new())
         }
     });
+    // Same client_id under a different principal gets a fresh session; the
+    // old one (queued payloads included) is deleted, never handed over.
+    // "" = pre-upgrade session, resumable once, stamped below.
+    if session_present
+        && !session.auth_principal.is_empty()
+        && session.auth_principal != auth_principal
+    {
+        log!(
+            "pgmqtt mqtt: '{}' reconnected under a different identity — discarding the previous session",
+            client_id
+        );
+        subscriptions::remove_client(&client_id);
+        session_db_actions.push(SessionDbAction::DeleteSession {
+            client_id: client_id.clone(),
+        });
+        session_present = false;
+        session = MqttSession::new();
+    }
+    // Resume from the DB (clean_start requested a fresh session and
+    // deleted the rows above).
     {
         let m = crate::metrics::get();
         if session_present {
@@ -2610,6 +2315,7 @@ fn finish_connect(
     session.expiry_interval = packet.session_expiry_interval;
     session.receive_maximum = packet.receive_maximum;
     session.disconnected_at = None;
+    session.auth_principal = auth_principal;
 
     let next_pid = session.next_packet_id;
     let expiry = session.expiry_interval;
@@ -2617,14 +2323,23 @@ fn finish_connect(
         client_id: client_id.clone(),
         next_packet_id: next_pid,
         expiry_interval: expiry,
+        auth_principal: session.auth_principal.clone(),
     });
 
-    let connack = mqtt::build_connack_with_max_packet(
+    let connack = mqtt::build_connack_with_props(
         session_present,
         mqtt::reason::SUCCESS,
         v5,
         if v5 {
             Some(broker_max_packet_size())
+        } else {
+            None
+        },
+        // MQTT-3.1.3-7: a v5 client that sent an empty client ID must be
+        // told the identifier the server assigned, or it can never address
+        // its own session again.
+        if v5 && assigned_id {
+            Some(client_id.as_str())
         } else {
             None
         },
@@ -2641,9 +2356,8 @@ fn finish_connect(
     }
 
     {
-        let m = crate::metrics::get();
-        crate::metrics::inc(&m.connections_accepted);
-        crate::metrics::inc(&m.connections_current);
+        crate::metrics::inc(&crate::metrics::get().connections_accepted);
+        crate::metrics::connections_inc();
     }
 
     // Set non-blocking for ongoing reads
@@ -2813,20 +2527,6 @@ fn finish_connect(
     }
 }
 
-struct PendingPublish {
-    topic: Arc<str>,
-    payload: Arc<[u8]>,
-    qos: u8,
-    retain: bool,
-    log_sender: String,
-    packet_id: Option<u16>,
-    /// Mapping names that matched this publish for inbound table writes.
-    /// Only populated for QoS >= 1; used by publish_messages_batch to insert
-    /// tracking rows into pgmqtt_inbound_pending atomically with message
-    /// persistence.
-    inbound_mappings: Vec<Arc<str>>,
-}
-
 /// Dispatch a single admin command against the live client map.
 fn dispatch_admin_command(
     cmd: crate::admin_commands::Command,
@@ -2852,6 +2552,14 @@ fn dispatch_admin_command(
                     "pgmqtt admin: disconnect_client '{}': no such client",
                     client_id
                 );
+            }
+            // Takeover: the client now lives elsewhere — a copy kept here
+            // would go stale and keep matching/queueing.
+            if reason == 0x8E {
+                subscriptions::remove_client(&client_id);
+                with_sessions(|s| {
+                    s.remove(&client_id);
+                });
             }
         }
         Command::DisconnectRole { role_name, reason } => {
@@ -2923,6 +2631,7 @@ fn dispatch_admin_command(
                     }
                     log!("pgmqtt admin: reload_acls '*': refreshed {} client(s)", n);
                 }
+                prune_offline_role_sessions(clients, None, session_db_actions);
             } else if let Some(client) = clients.get_mut(&target) {
                 if let Some(role) = client.authenticated_role.clone() {
                     let rules = crate::password_auth::load_acls_for_role(&role);
@@ -2950,8 +2659,48 @@ fn dispatch_admin_command(
                     );
                 }
             } else {
-                log!("pgmqtt admin: reload_acls '{}': no such client", target);
+                // Not connected here — but this worker may still hold the
+                // client's durable session and tree subscriptions (loaded
+                // at startup or left by a disconnect) and keep queueing
+                // QoS 1 messages against them.
+                prune_offline_role_sessions(clients, Some(&target), session_db_actions);
             }
+        }
+    }
+}
+
+/// Apply an ACL reload to offline durable sessions: every worker's tree
+/// holds every DB subscription, so a revoked filter must be pruned on
+/// non-owner workers too or the replica keeps queueing under it. Only
+/// `role:` principals — JWT claims are re-checked on reconnect.
+fn prune_offline_role_sessions(
+    clients: &HashMap<String, MqttClient>,
+    target: Option<&str>,
+    session_db_actions: &mut Vec<SessionDbAction>,
+) {
+    let offline: Vec<(String, String)> = with_sessions(|s| {
+        s.iter()
+            .filter(|(id, _)| {
+                !clients.contains_key(*id) && target.is_none_or(|t| t == id.as_str())
+            })
+            .filter_map(|(id, sess)| {
+                sess.auth_principal
+                    .strip_prefix("role:")
+                    .map(|r| (id.clone(), r.to_string()))
+            })
+            .collect()
+    });
+    if offline.is_empty() {
+        if let Some(t) = target {
+            log!("pgmqtt admin: reload_acls '{}': no such client or session", t);
+        }
+        return;
+    }
+    let roles: Vec<String> = offline.iter().map(|(_, r)| r.clone()).collect();
+    let by_role = crate::password_auth::load_acls_for_roles(&roles);
+    for (id, role) in offline {
+        if let Some(rules) = by_role.get(&role) {
+            prune_unauthorized_subscriptions(&id, &rules.sub, session_db_actions);
         }
     }
 }
@@ -3015,7 +2764,7 @@ fn disconnect_client(
 ) {
     if let Some(mut client) = clients.remove(id) {
         let m = crate::metrics::get();
-        crate::metrics::dec(&m.connections_current);
+        crate::metrics::connections_dec();
         if client.clean_disconnect {
             crate::metrics::inc(&m.disconnections_clean);
         } else {
@@ -3073,25 +2822,41 @@ fn poll_mqtt_clients(
     pending_publishes: &mut Vec<PendingPublish>,
     session_db_actions: &mut Vec<SessionDbAction>,
     pending_inbound_writes: &mut Vec<inbound_map::PendingInboundWrite>,
+    ready: Option<&std::collections::HashSet<i32>>,
+    carry: &mut std::collections::HashSet<i32>,
 ) {
     let mut to_remove = Vec::new();
     let max_inbound_buf = crate::get_max_client_buffer_bytes_guc();
 
     for (client_id, client) in clients.iter_mut() {
         // Flush any bytes buffered from the previous tick before reading.
+        // (In-memory no-op when nothing is buffered, so this stays a
+        // per-client pass regardless of readiness.)
         if !client.flush_write_buf() {
             to_remove.push(client_id.clone());
             continue;
         }
+
+        // Only attempt reads on clients the readiness poller flagged
+        // (`None` = fallback: poll everyone, the pre-epoll behavior).
+        // Keepalive checks and packet processing below still run for every
+        // client — they are in-memory only.
+        let fd = client.transport.raw_fd();
+        let may_read = ready.map_or(true, |r| r.contains(&fd));
 
         // Drain-loop read: pull all available bytes from the socket in 64 KiB
         // chunks until WouldBlock, bounded by max_client_buffer_bytes.
         // When the cap is reached we stop reading; excess data stays in the
         // kernel TCP buffer and is consumed on the next tick.
         let mut skip_processing = false;
-        loop {
-            // Stop reading if we've accumulated enough for this tick.
+        while may_read {
+            // Stop reading if we've accumulated enough for this tick. The
+            // client goes into the carry set: by definition it still has
+            // backlog (kernel buffer or transport-internal), which a
+            // level-triggered fd check alone might not surface for the
+            // TLS/WS variants.
             if client.buf.len() >= max_inbound_buf {
+                carry.insert(fd);
                 break;
             }
             let mut tmp = [0u8; READ_CHUNK_BYTES];
@@ -3107,6 +2872,10 @@ fn poll_mqtt_clients(
                 Ok(n) => {
                     client.buf.extend_from_slice(&tmp[..n]);
                     client.last_received_at = std::time::Instant::now();
+                    // Active this tick — poll again next tick even without
+                    // fresh fd readiness, in case the TLS/WS layer holds
+                    // decrypted-but-unread bytes internally.
+                    carry.insert(fd);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break; // No more data available this tick
@@ -3194,191 +2963,6 @@ fn poll_mqtt_clients(
     to_remove.dedup();
     for id in to_remove {
         disconnect_client(&id, clients, pending_publishes, session_db_actions);
-    }
-}
-
-fn publish_messages_batch(
-    pending: Vec<PendingPublish>,
-    clients: &mut HashMap<String, MqttClient>,
-    session_db_actions: &mut Vec<SessionDbAction>,
-) {
-    if pending.is_empty() {
-        return;
-    }
-
-    let mut persistent = Vec::new();
-    let mut transient = Vec::new();
-
-    for p in pending {
-        if p.qos > 0 || p.retain {
-            persistent.push(p);
-        } else {
-            transient.push(p);
-        }
-    }
-
-    if !persistent.is_empty() {
-        let (to_publish, ok) = BackgroundWorker::transaction(|| {
-            let mut to_publish = Vec::new();
-            pgrx::spi::Spi::connect_mut(|client| {
-                for p in &persistent {
-                    let mut msg_id_opt: Option<i64> = None;
-
-                    // MQTT-3.3.1-6/7/10: clear pgmqtt_retained, then persist a
-                    // non-retained row at QoS 1 so the forwarded clear has DB
-                    // backing for reconnect redelivery.
-                    if p.retain && p.payload.is_empty() {
-                        let topic_ref: &str = &p.topic;
-                        let args: Vec<pgrx::datum::DatumWithOid> =
-                            vec![topic_ref.into()];
-                        let table = client.update(
-                            "DELETE FROM pgmqtt_retained WHERE topic = $1 RETURNING message_id",
-                            None,
-                            &args,
-                        )?;
-                        for row in table {
-                            if let Ok(Some(old_id)) = row.get_by_name::<i64, _>("message_id") {
-                                db_action::cleanup_orphaned_message(client, old_id)?;
-                            }
-                        }
-                        if p.qos > 0 {
-                            let msg_id = db_action::persist_message(
-                                client,
-                                &p.topic,
-                                &p.payload,
-                                p.qos,
-                                false,
-                            )?;
-                            msg_id_opt = Some(msg_id);
-                        }
-                    } else {
-                        // Normal publish: persist the message and update retained index.
-                        let msg_id = db_action::persist_message(
-                            client,
-                            &p.topic,
-                            &p.payload,
-                            p.qos,
-                            p.retain,
-                        )?;
-                        msg_id_opt = Some(msg_id);
-
-                        if p.retain {
-                            let topic_ref: &str = &p.topic;
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![topic_ref.into(), msg_id.into()];
-                            let table = client.update(
-                                "WITH old AS ( \
-                                     SELECT message_id AS old_id FROM pgmqtt_retained WHERE topic = $1 \
-                                 ), upsert AS ( \
-                                     INSERT INTO pgmqtt_retained (topic, message_id) VALUES ($1, $2) \
-                                     ON CONFLICT (topic) DO UPDATE SET message_id = EXCLUDED.message_id \
-                                     RETURNING 1 \
-                                 ) \
-                                 SELECT old_id FROM old, upsert",
-                                None,
-                                &args,
-                            )?;
-                            let mut old_msg_id: Option<i64> = None;
-                            for row in table {
-                                if let Ok(Some(id)) = row.get_by_name::<i64, _>("old_id") {
-                                    old_msg_id = Some(id);
-                                }
-                            }
-                            if let Some(old_id) = old_msg_id {
-                                if old_id != msg_id {
-                                    db_action::cleanup_orphaned_message(client, old_id)?;
-                                }
-                            }
-                        }
-                    }
-
-                    // Insert inbound-pending tracking rows (virtual subscriber).
-                    // These are committed atomically with the message so the
-                    // PUBACK reflects durable intent to process.
-                    if let Some(msg_id) = msg_id_opt {
-                        for mapping_name in &p.inbound_mappings {
-                            let args: Vec<pgrx::datum::DatumWithOid> =
-                                vec![msg_id.into(), mapping_name.as_ref().into()];
-                            client.update(
-                                "INSERT INTO pgmqtt_inbound_pending (message_id, mapping_name) \
-                                 VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                                None,
-                                &args,
-                            )?;
-                        }
-                    }
-
-                    if crate::get_debug_log_guc() {
-                        log!(
-                            "pgmqtt: pushing message from '{}' to topic '{}' with qos={}",
-                            p.log_sender,
-                            p.topic,
-                            p.qos
-                        );
-                    }
-                    to_publish.push(MqttMessage {
-                        id: msg_id_opt,
-                        topic: p.topic.clone(),
-                        payload: p.payload.clone(),
-                        qos: p.qos,
-                    });
-                }
-                Ok::<_, pgrx::spi::Error>(())
-            })?;
-            Ok::<(Vec<MqttMessage>, bool), pgrx::spi::Error>((to_publish, true))
-        })
-        .unwrap_or((Vec::new(), false));
-
-        if ok {
-            // Deliver directly to subscribers.
-            let mut cascade = Vec::new();
-            deliver_messages(&to_publish, clients, &mut cascade, session_db_actions);
-
-            // Send PUBACKs only after successful commit — MQTT at-least-once semantics.
-            for p in persistent {
-                if p.qos == 1 {
-                    if let Some(pid) = p.packet_id {
-                        if let Some(client) = clients.get_mut(&p.log_sender) {
-                            // try_write buffers on WouldBlock; a mid-PUBACK
-                            // truncation would desync the client's reader.
-                            let puback = mqtt::build_puback(pid);
-                            let _ = client.try_write(&puback);
-                            crate::metrics::inc(&crate::metrics::get().pubacks_sent);
-                        }
-                    }
-                }
-            }
-
-            // Handle will messages from cascading disconnects (rare: socket
-            // write failure during delivery).  Bounded by number of clients.
-            if !cascade.is_empty() {
-                publish_messages_batch(cascade, clients, session_db_actions);
-            }
-        }
-    }
-
-    if !transient.is_empty() {
-        let transient_msgs: Vec<MqttMessage> = transient
-            .into_iter()
-            .map(|p| {
-                log!(
-                    "pgmqtt: pushing transient message from '{}' to topic '{}' with qos=0",
-                    p.log_sender,
-                    p.topic
-                );
-                MqttMessage {
-                    id: None,
-                    topic: p.topic,
-                    payload: p.payload,
-                    qos: 0,
-                }
-            })
-            .collect();
-        let mut cascade = Vec::new();
-        deliver_messages(&transient_msgs, clients, &mut cascade, session_db_actions);
-        if !cascade.is_empty() {
-            publish_messages_batch(cascade, clients, session_db_actions);
-        }
     }
 }
 
@@ -3741,6 +3325,7 @@ fn handle_mqtt_packet(
                         client_id: client_id.clone(),
                         next_packet_id: current_pid,
                         expiry_interval: new_expiry,
+                        auth_principal: client.session.auth_principal.clone(),
                     });
                 }
             }
@@ -3823,8 +3408,8 @@ fn handle_mqtt_packet(
                 }
             }
 
-            // Optimization: skip all processing if no one is listening, not
-            // retained, and no QoS 1 inbound mappings need durable tracking.
+            // No-listener fast path: nothing can consume this publish, so
+            // skip the persist entirely.
             let has_subs = subscriptions::has_subscribers(&pub_pkt.topic);
             if !pub_pkt.retain && !has_subs && inbound_mapping_names.is_empty() {
                 if pub_pkt.qos == 1 {
@@ -3873,8 +3458,8 @@ fn handle_mqtt_packet(
     }
 }
 
-/// Sweep all sessions whose Session Expiry Interval has elapsed.
-/// Must only be called for sessions whose client is not actively connected.
+/// Sweep expired sessions from the in-memory map and tree, deleting their
+/// DB rows with them.
 fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
     let now = std::time::Instant::now();
     let mut expired_ids: Vec<String> = Vec::new();
@@ -3914,8 +3499,9 @@ fn sweep_expired_sessions(session_db_actions: &mut Vec<SessionDbAction>) {
 
 /// Deliver a batch of messages to matching subscribers.
 ///
-/// Used by both the CDC path (via `cdc_tick` return value) and the client
-/// PUBLISH path (via `publish_messages_batch`).
+/// Used by both the CDC path (bridged from the `pgmqtt_cdc` worker via
+/// `crate::shmem_bridge`) and the client PUBLISH path (via
+/// `publish_messages_batch`).
 fn deliver_messages(
     messages: &[MqttMessage],
     clients: &mut HashMap<String, MqttClient>,
@@ -3931,14 +3517,41 @@ fn deliver_messages(
     let connected: std::collections::HashSet<String> = clients.keys().cloned().collect();
     let mut to_remove = Vec::new();
 
-    for msg in messages {
-        let subscriber_ids = subscriptions::match_topic(&msg.topic, &connected);
+    // Match once per message (match_topic_split advances $share
+    // round-robin — never re-run).
+    let matches: Vec<(Vec<(String, u8)>, Vec<(String, String, u8)>)> = messages
+        .iter()
+        .map(|msg| subscriptions::match_topic_split(&msg.topic, &connected))
+        .collect();
+
+    for (msg, (regular, shared)) in messages.iter().zip(matches) {
+        // Regular matches are already deduped; the merge pass (and its
+        // HashMap) is only needed when a shared-group pick could collide
+        // with a regular match. Everything is moved, never cloned.
+        let subscriber_ids: Vec<(String, u8)> = if shared.is_empty() {
+            regular
+        } else {
+            let mut merged: HashMap<String, u8> = regular.into_iter().collect();
+            for (_group, cid, qos) in shared {
+                let entry = merged.entry(cid).or_insert(qos);
+                if qos > *entry {
+                    *entry = qos;
+                }
+            }
+            merged.into_iter().collect()
+        };
         if subscriber_ids.is_empty() {
             log!(
                 "pgmqtt: no subscribers for topic='{}' (active_filters={:?})",
                 msg.topic,
                 subscriptions::active_filters()
             );
+            // A persisted message with no subscribers never gets a
+            // session_messages row, so nothing else would reclaim it (the
+            // CDC worker can't pre-filter cross-process).
+            if let Some(message_id) = msg.id {
+                session_db_actions.push(SessionDbAction::CleanupOrphanedMessage { message_id });
+            }
         }
 
         // Batch database actions by message_id to minimize writes
@@ -4240,6 +3853,8 @@ fn parse_jwt_public_key(key_str: &str) -> Option<[u8; 32]> {
 struct JwtClaims {
     /// If present, the CONNECT client_id must match this value.
     client_id: Option<String>,
+    /// Standard subject claim, used to bind durable sessions to an identity.
+    sub: Option<String>,
     sub_claims: Vec<String>,
     pub_claims: Vec<String>,
 }
@@ -4322,8 +3937,14 @@ fn validate_jwt(token: &str, pubkey_bytes: &[u8; 32]) -> Result<JwtClaims, Strin
         })
         .unwrap_or_default();
 
+    let sub = payload
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Ok(JwtClaims {
         client_id,
+        sub,
         sub_claims,
         pub_claims,
     })
