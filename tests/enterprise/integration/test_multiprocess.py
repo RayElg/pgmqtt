@@ -348,6 +348,32 @@ def test_multiprocess_oversize_qos0_spills_to_outbox(enterprise_broker):
     assert counts == (0, 0), f"spilled QoS 0 row not reclaimed: {counts}"
 
 
+def test_multiprocess_qos0_burst_exceeding_inline_ring_is_lossless(enterprise_broker):
+    """A single transaction rendering more QoS 0 messages than the inline
+    ring holds must not drop any of them.
+
+    The shmem inline ring is a fixed 8192-slot drop-oldest buffer that only
+    the split topology has; the CDC batch budgets against its free slots and
+    spills the remainder to the durable outbox.
+    """
+    _setup_cdc_fixture_table(enterprise_broker)
+    n = 12000
+
+    sub = enterprise_broker.connect_mqtt("mp-sub-burst")
+    try:
+        _subscribe(sub, 1, "mp/q0/#", qos=0)
+        # One transaction: the batch decodes as a single unit.
+        enterprise_broker.sql(
+            f"INSERT INTO mp_events (name, val) "
+            f"SELECT 'b'||g, 'v'||g FROM generate_series(1,{n}) g"
+        )
+        got = _collect_publishes(sub, expect=n, timeout=120.0)
+    finally:
+        sub.close()
+
+    assert len(got) == n, f"QoS 0 burst lost messages: delivered {len(got)} of {n}"
+
+
 def test_multiprocess_single_transaction_burst_lossless(enterprise_broker):
     """One bulk transaction bigger than any batch/buffer: logical decoding
     replays it as a single atomic unit, so the handoff sees the whole burst
