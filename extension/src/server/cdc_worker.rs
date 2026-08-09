@@ -267,6 +267,16 @@ pub(crate) fn cdc_tick_core(
             move || -> ((Vec<MqttMessage>, usize, usize, Option<String>), bool) {
                 let mut to_publish: Vec<MqttMessage> = Vec::new();
                 let mut outbox_ids: Vec<i64> = Vec::new();
+                // Inline-ring budget for this batch: free space never
+                // shrinks under us, so inlining at most this many cannot
+                // overflow. One bulk transaction can render far more QoS 0
+                // than the ring holds; the excess spills to the outbox
+                // rather than being dropped.
+                let mut inline_budget = if matches!(mode, CdcQueueMode::OutboxQos1) {
+                    crate::shmem_bridge::inline_free_slots()
+                } else {
+                    usize::MAX
+                };
                 let mut batch_count: usize = 0;
                 let batch_end_lsn: Option<String>;
 
@@ -425,14 +435,19 @@ pub(crate) fn cdc_tick_core(
 
                                 let topic_str = rendered.topic.clone();
 
-                                // Oversize QOS 0 spills to the outbox instead
-                                // of being dropped.
+                                // QOS 0 spills to the outbox rather than
+                                // being dropped: oversize for the fixed slots,
+                                // or no ring budget left this batch.
                                 let spill_qos0 = matches!(mode, CdcQueueMode::OutboxQos1)
                                     && rendered.qos == 0
-                                    && !crate::shmem_bridge::fits_inline(
-                                        &rendered.topic,
-                                        &rendered.payload,
-                                    );
+                                    && (inline_budget == 0
+                                        || !crate::shmem_bridge::fits_inline(
+                                            &rendered.topic,
+                                            &rendered.payload,
+                                        ));
+                                if !spill_qos0 && rendered.qos == 0 {
+                                    inline_budget = inline_budget.saturating_sub(1);
+                                }
 
                                 if rendered.qos > 0 || spill_qos0 {
                                     // Subtransaction: a persist error must not

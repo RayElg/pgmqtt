@@ -151,6 +151,14 @@ pub fn push_inline(topic: &str, payload: &[u8]) -> bool {
     true
 }
 
+/// A lower bound for the life of a CDC batch — `pgmqtt_cdc` is the only
+/// producer and `pgmqtt_mqtt` only drains — so a batch inlining at most
+/// this many cannot overflow.
+pub fn inline_free_slots() -> usize {
+    let ring = INLINE_RING.share();
+    INLINE_RING_CAPACITY.saturating_sub(ring.len as usize)
+}
+
 pub fn drain_inline() -> Vec<(String, Vec<u8>)> {
     let mut ring = INLINE_RING.exclusive();
     let mut out = Vec::with_capacity(ring.len as usize);
