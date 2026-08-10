@@ -90,6 +90,9 @@ pub fn run_cdc(slot_name: &str) {
     let mut last_inbound_reload = std::time::Instant::now();
 
     let mut drain_pending = false;
+    // u64::MAX forces a first-tick drain: rows may predate this worker.
+    let mut inbound_seen = u64::MAX;
+    let mut last_inbound_sweep = std::time::Instant::now();
 
     super::load_inbound_mappings();
 
@@ -115,9 +118,16 @@ pub fn run_cdc(slot_name: &str) {
             last_inbound_reload = std::time::Instant::now();
         }
 
-        // Every tick, not gated by cdc_every_n_ticks: callers expect the
-        // target-table row promptly after the PUBACK.
-        super::process_inbound_pending();
+        // The doorbell keeps this prompt when work exists; the sweep
+        // covers rows it cannot announce (retries, crash leftovers).
+        let inbound_bell = crate::shmem_bridge::inbound_doorbell_seq();
+        if inbound_bell != inbound_seen
+            || last_inbound_sweep.elapsed() >= std::time::Duration::from_millis(100)
+        {
+            inbound_seen = inbound_bell;
+            last_inbound_sweep = std::time::Instant::now();
+            super::process_inbound_pending();
+        }
 
         if tick % crate::get_cdc_every_n_ticks_guc() == 0 || drain_pending {
             drain_pending = !cdc_tick_core(slot_name, CdcQueueMode::OutboxQos1, |messages| {

@@ -44,6 +44,25 @@ pub fn outbox_doorbell_seq() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound doorbell (pgmqtt_mqtt -> pgmqtt_cdc)
+// ---------------------------------------------------------------------------
+//
+// An empty drain still costs an SPI round trip plus a BGW transaction, so
+// the pump waits for this rather than polling. Its slower sweep covers
+// rows no doorbell announces: retries, and crash leftovers.
+
+static INBOUND_DOORBELL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pgmqtt_bridge_inbound_doorbell") };
+
+pub fn ring_inbound_doorbell() {
+    INBOUND_DOORBELL.get().fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inbound_doorbell_seq() -> u64 {
+    INBOUND_DOORBELL.get().load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
 // WAL flush request (pgmqtt_mqtt -> pgmqtt_cdc)
 // ---------------------------------------------------------------------------
 //
@@ -178,6 +197,7 @@ pub fn drain_inline() -> Vec<(String, Vec<u8>)> {
 /// `shared_preload_libraries`.
 pub fn init() {
     pg_shmem_init!(OUTBOX_DOORBELL);
+    pg_shmem_init!(INBOUND_DOORBELL);
     pg_shmem_init!(FLUSH_REQUEST);
     pg_shmem_init!(INLINE_RING);
 }

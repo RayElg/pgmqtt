@@ -477,6 +477,10 @@ pub(super) fn publish_messages_batch_deferred(
                 messages,
                 pubacks,
             });
+            // Rung after commit, so the woken pump sees the rows.
+            if persistent.iter().any(|p| !p.inbound_mappings.is_empty()) {
+                crate::shmem_bridge::ring_inbound_doorbell();
+            }
         }
     }
 
