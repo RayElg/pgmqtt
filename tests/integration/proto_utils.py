@@ -418,7 +418,7 @@ def decode_properties(buffer, offset):
         if prop_id == 0x0B: # Subscription Identifier (VarInt)
             val, offset = decode_variable_byte_integer(buffer, offset)
             props[prop_id] = val
-        elif prop_id in [0x1F, 0x03, 0x08]: # Reason String, Content Type, Response Topic (UTF-8)
+        elif prop_id in [0x1F, 0x03, 0x08, 0x12]: # Reason String, Content Type, Response Topic, Assigned Client Identifier (UTF-8)
             val, offset = decode_utf8_string(buffer, offset)
             props[prop_id] = val
         elif prop_id == 0x26: # User Property (String Pair)
@@ -441,34 +441,105 @@ def decode_properties(buffer, offset):
     return props, offset
 
 import socket
+import weakref
+
+# Per-socket partial-read stash for recv_packet. A timeout mid-packet used
+# to discard the already-consumed bytes, permanently desyncing the read
+# stream (the next call started mid-packet and parsed payload bytes as
+# fixed headers). Stashing lets the next call resume exactly where the
+# stream stalled.
+_recv_partial = weakref.WeakKeyDictionary()
+
+
 def recv_packet(s, timeout=5.0):
+    """Read exactly one MQTT packet; None on timeout/EOF.
+
+    Resumable: bytes consumed before a timeout are stashed per-socket and
+    picked up by the next call, so a slow broker can never desync the
+    stream. Never reads past the end of the current packet.
+    """
+    buf = bytearray(_recv_partial.pop(s, b''))
     s.settimeout(timeout)
     try:
-        data = s.recv(1)
-        if not data:
-            return None
-        header = data
-        multiplier = 1
-        remain_len = 0
+        while len(buf) < 1:
+            data = s.recv(1)
+            if not data:
+                return None  # EOF before a packet started
+            buf += data
+        # Remaining-length varint: byte at a time, resumable.
         while True:
+            i = 1
+            remain_len = 0
+            multiplier = 1
+            complete = False
+            while i < len(buf):
+                digit = buf[i]
+                remain_len += (digit & 127) * multiplier
+                multiplier *= 128
+                i += 1
+                if (digit & 128) == 0:
+                    complete = True
+                    break
+            if complete:
+                break
             b = s.recv(1)
-            header += b
-            digit = b[0]
-            remain_len += (digit & 127) * multiplier
-            if (digit & 128) == 0:
-                break
-            multiplier *= 128
-        payload = b''
-        while len(payload) < remain_len:
-            chunk = s.recv(remain_len - len(payload))
+            if not b:
+                return None  # EOF mid-header: stream over, partial dropped
+            buf += b
+        total = i + remain_len
+        while len(buf) < total:
+            chunk = s.recv(total - len(buf))
             if not chunk:
-                break
-            payload += chunk
-        return header + payload
+                return None  # EOF mid-body
+            buf += chunk
+        return bytes(buf)
     except socket.timeout:
+        if buf:
+            _recv_partial[s] = bytes(buf)
         return None
     except Exception:
+        if buf:
+            _recv_partial[s] = bytes(buf)
         return None
+
+
+def send_all_safe(s, data, max_stall=10.0):
+    """Write all of `data` even if the peer stalls mid-write.
+
+    `socket.sendall` under a timeout raises after possibly sending PART of
+    the buffer; callers that swallow that exception and keep writing emit a
+    misframed byte stream (the broker then logs malformed packets and drops
+    the connection). Single `send` calls have no such ambiguity — a timeout
+    means nothing was sent — so loop over `send` and track the position.
+    Returns True when everything was written, False on a stall longer than
+    `max_stall` or a dead connection (nothing partial is ever left behind
+    mid-packet unless the connection itself died).
+    """
+    view = memoryview(data)
+    pos = 0
+    deadline = None
+    old_timeout = s.gettimeout()
+    s.settimeout(0.2)
+    try:
+        while pos < len(view):
+            try:
+                sent = s.send(view[pos:])
+                if sent == 0:
+                    return False
+                pos += sent
+                deadline = None
+            except (socket.timeout, BlockingIOError):
+                import time as _time
+                now = _time.monotonic()
+                if deadline is None:
+                    deadline = now + max_stall
+                elif now >= deadline:
+                    return False
+        return True
+    except Exception:
+        return False
+    finally:
+        s.settimeout(old_timeout)
 
 def create_connect_packet(client_id, clean_start=True, properties=None, keep_alive=60,
                            will_topic=None, will_payload=None, will_qos=0, will_retain=False,

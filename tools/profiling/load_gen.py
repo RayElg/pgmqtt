@@ -42,6 +42,7 @@ from proto_utils import (  # noqa: E402
     create_subscribe_packet,
     recv_packet,
     run_psql,
+    send_all_safe,
     validate_publish,
 )
 
@@ -58,7 +59,6 @@ def _subscriber(idx, topic, qos, stop_evt, counter):
     s = _connect(f"loadgen_sub_{idx}_{os.getpid()}")
     s.sendall(create_subscribe_packet(1, topic, qos=qos))
     recv_packet(s)
-    s.settimeout(0.5)
     local = 0
     while not stop_evt.is_set():
         pkt = recv_packet(s, timeout=0.5)
@@ -70,10 +70,14 @@ def _subscriber(idx, topic, qos, stop_evt, counter):
         if qos == 1:
             try:
                 _, _, _, _, _, pid, _ = validate_publish(pkt)
-                if pid is not None:
-                    s.sendall(create_puback_packet(pid))
             except Exception:
-                pass
+                pid = None
+            # send_all_safe, never a bare sendall: a timed-out sendall can
+            # leave a PARTIAL PUBACK on the wire, and continuing to write
+            # afterwards desyncs the whole stream (the broker then logs
+            # malformed packets and drops us).
+            if pid is not None and not send_all_safe(s, create_puback_packet(pid)):
+                break
         if local % 1000 == 0:
             counter["n"] += 1000
             local = 0
@@ -98,21 +102,32 @@ def _publisher(idx, topic_prefix, qos, payload, stop_evt, counter, per_pub_rate)
     while not stop_evt.is_set():
         t = f"{topic_prefix}/p{idx}"
         try:
+            # send_all_safe: survives multi-second broker stalls and can
+            # never leave a partial packet on the wire (a timed-out sendall
+            # both kills the publisher AND truncates mid-packet).
             if qos == 0:
-                s.sendall(create_publish_packet(t, payload, qos=0))
+                if not send_all_safe(s, create_publish_packet(t, payload, qos=0)):
+                    break
             else:
-                s.sendall(create_publish_packet(t, payload, qos=1, packet_id=pid))
+                if not send_all_safe(
+                    s, create_publish_packet(t, payload, qos=1, packet_id=pid)
+                ):
+                    break
                 pid = (pid % 65535) + 1
-                s.settimeout(0.001)
-                while True:
-                    try:
-                        ack = s.recv(4096)
-                        if not ack:
+                # Non-blocking ack drain; send_all_safe restores the
+                # socket's previous timeout, so this can't leak a 1 ms
+                # timeout into the next send.
+                s.settimeout(0)
+                try:
+                    while True:
+                        try:
+                            ack = s.recv(4096)
+                            if not ack:
+                                break
+                        except (BlockingIOError, socket.timeout):
                             break
-                    except socket.timeout:
-                        break
-                    except BlockingIOError:
-                        break
+                finally:
+                    s.settimeout(5.0)
         except Exception:
             break
         sent += 1
@@ -194,12 +209,17 @@ def run_qos(mode, duration, n_pub, n_sub, payload_bytes, per_pub_rate):
 
 def run_inbound(duration, n_pub, _payload_bytes):
     """Publish into an inbound-mapped topic so the BGW writes rows to a table."""
-    run_psql("DROP TABLE IF EXISTS loadgen_inbound CASCADE;")
+    # TRUNCATE, not DROP+CREATE: process_inbound_pending() reads a batch of
+    # pending rows without row-level locking, so a DROP of the target table
+    # while a previous run's writes are still draining crashes the BGW (the
+    # in-memory INSERT hits "relation does not exist" and the worker exits).
+    # The table's OID must stay stable across repeated runs of this function.
     run_psql(
-        "CREATE TABLE loadgen_inbound ("
+        "CREATE TABLE IF NOT EXISTS loadgen_inbound ("
         "site_id text NOT NULL, sensor_id text NOT NULL, value numeric,"
         "PRIMARY KEY (site_id, sensor_id))"
     )
+    run_psql("TRUNCATE loadgen_inbound;")
     run_psql(
         "SELECT pgmqtt_add_inbound_mapping("
         "'loadgen/{site_id}/data/{sensor_id}', 'loadgen_inbound',"
@@ -217,7 +237,8 @@ def run_inbound(duration, n_pub, _payload_bytes):
             payload = json.dumps({"value": i * 0.1}).encode()
             topic = f"loadgen/site-{idx}/data/s{i % 128}"
             try:
-                s.sendall(create_publish_packet(topic, payload, qos=0))
+                if not send_all_safe(s, create_publish_packet(topic, payload, qos=0)):
+                    break
             except Exception:
                 break
             i += 1
