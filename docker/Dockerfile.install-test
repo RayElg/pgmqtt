@@ -36,3 +36,12 @@ RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample &
 RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \
     echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pgmqtt;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
     chmod +x /docker-entrypoint-initdb.d/01-create-extension.sh
+
+# Recent point releases (16.15+, and current 17.x/18.x minors) only allow
+# logical decoding plugins listed in output_plugin_libraries; setting an
+# unknown GUC in postgresql.conf would refuse startup on older servers, so
+# apply it via ALTER SYSTEM and swallow the error where the GUC doesn't exist.
+RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" \\" >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo "  -c \"ALTER SYSTEM SET output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'\" || true" >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    chmod +x /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh

@@ -189,6 +189,16 @@ jobs:
              shared_preload_libraries = 'pgmqtt'
              wal_level = logical
              ```
+
+             Recent point releases (e.g. 16.15+) may also require:
+
+             ```
+             output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'
+             ```
+
+             If the broker logs `library "pgmqtt" may not be used as an output
+             plugin`, add that line and run `SELECT pg_reload_conf();` (no
+             restart needed).
           5. Restart PostgreSQL and create the extension:
              ```sql
              CREATE EXTENSION pgmqtt;

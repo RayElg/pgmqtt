@@ -53,7 +53,6 @@ COPY --from=builder /app/dist/usr/lib/postgresql/16/lib /usr/lib/postgresql/16/l
 RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "local   all             all                                     trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
@@ -63,6 +62,15 @@ RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample &
 RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \
     echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pgmqtt;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
     chmod +x /docker-entrypoint-initdb.d/01-create-extension.sh
+
+# Recent point releases (16.15+, and current 17.x/18.x minors) only allow
+# logical decoding plugins listed in output_plugin_libraries; setting an
+# unknown GUC in postgresql.conf would refuse startup on older servers, so
+# apply it via ALTER SYSTEM and swallow the error where the GUC doesn't exist.
+RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" \\" >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo "  -c \"ALTER SYSTEM SET output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'\" || true" >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    chmod +x /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh
 
 
 # Expose ports: 5432 PostgreSQL | 8080 HTTP healthcheck | 1883 MQTT TCP | 9001 MQTT WebSocket
