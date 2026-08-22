@@ -53,6 +53,7 @@ COPY --from=builder /app/dist/usr/lib/postgresql/16/lib /usr/lib/postgresql/16/l
 RUN echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_wal_senders = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "shared_preload_libraries = 'pgmqtt'" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "log_min_messages = warning" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "local   all             all                                     trust" >> /usr/share/postgresql/pg_hba.conf.sample && \
