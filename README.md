@@ -8,6 +8,24 @@ With `pgmqtt`, your database changes (`INSERT`, `UPDATE`, `DELETE`) are automati
 
 Ensure that `wal_level = logical` is set inside your `postgresql.conf` for the logical decoding output plugin to capture CDC events properly.
 
+Recent PostgreSQL point releases only allow logical decoding output plugins that are explicitly trusted via `output_plugin_libraries`. On such servers pgmqtt's background worker exits at startup with
+
+```
+ERROR:  library "pgmqtt" may not be used as an output plugin
+```
+
+Fix it by adding the library to the list in your `postgresql.conf` and reloading — no restart required. Edit the config file rather than using `ALTER SYSTEM`: on affected builds `ALTER SYSTEM` re-writes this value wrapped in extra quotes, which breaks the match again.
+
+```
+output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'
+```
+
+```sql
+SELECT pg_reload_conf();
+```
+
+If the broker was crash-looping before the fix, restart PostgreSQL afterwards so the background worker is re-registered.
+
 ### Outbound: PostgreSQL changes → MQTT
 
 Map a table so that every `INSERT`, `UPDATE`, or `DELETE` is published as an MQTT message:

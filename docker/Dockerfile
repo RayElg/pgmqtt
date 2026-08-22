@@ -63,6 +63,17 @@ RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/01-create-extension.sh && \
     echo 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS pgmqtt;"' >> /docker-entrypoint-initdb.d/01-create-extension.sh && \
     chmod +x /docker-entrypoint-initdb.d/01-create-extension.sh
 
+# Recent point releases (16.15+, and current 17.x/18.x minors) only allow
+# logical decoding plugins listed in output_plugin_libraries; setting an
+# unknown GUC in postgresql.conf would refuse startup on older servers, so
+# apply it via ALTER SYSTEM and swallow the error where the GUC doesn't exist.
+RUN echo '#!/bin/bash' > /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo 'if psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \' >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo '    "SELECT 1 FROM pg_settings WHERE name = '\''output_plugin_libraries'\''" | grep -q 1; then' >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo '  printf "\noutput_plugin_libraries = '\''pgoutput, test_decoding, pgmqtt'\''\n" >> "$PGDATA/postgresql.conf"' >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    echo 'fi' >> /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh && \
+    chmod +x /docker-entrypoint-initdb.d/02-output-plugin-libraries.sh
+
 
 # Expose ports: 5432 PostgreSQL | 8080 HTTP healthcheck | 1883 MQTT TCP | 9001 MQTT WebSocket
 EXPOSE 5432 8080 1883 9001
