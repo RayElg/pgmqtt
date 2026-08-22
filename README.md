@@ -14,7 +14,7 @@ Recent PostgreSQL point releases only allow logical decoding output plugins that
 ERROR:  library "pgmqtt" may not be used as an output plugin
 ```
 
-Fix it by adding the library to the list in your `postgresql.conf` (or with `ALTER SYSTEM`) and reloading — no restart required:
+Fix it by adding the library to the list in your `postgresql.conf` and reloading — no restart required. Edit the config file rather than using `ALTER SYSTEM`: on affected builds `ALTER SYSTEM` re-writes this value wrapped in extra quotes, which breaks the match again.
 
 ```
 output_plugin_libraries = 'pgoutput, test_decoding, pgmqtt'
