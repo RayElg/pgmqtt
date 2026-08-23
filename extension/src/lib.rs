@@ -1001,7 +1001,7 @@ fn pgmqtt_metrics() -> TableIterator<
                 m!("pubacks_received",       "total",        "PUBACK packets received from clients");
                 m!("subscribe_ops",          "total",        "SUBSCRIBE operations");
                 m!("unsubscribe_ops",        "total",        "UNSUBSCRIBE operations");
-                m!("cdc_events_processed",   "total",        "WAL events decoded from CDC slot");
+                m!("cdc_events_processed",   "total",        "Mapped WAL changes decoded from CDC slot");
                 m!("cdc_msgs_published",     "total",        "Messages emitted from CDC pipeline");
                 m!("cdc_render_errors",      "total",        "CDC template render errors");
                 m!("cdc_slot_errors",        "total",        "CDC replication slot errors");

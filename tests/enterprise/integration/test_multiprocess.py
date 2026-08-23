@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 import psycopg2
 import pytest
@@ -37,6 +38,10 @@ from proto_utils import (  # noqa: E402
 )
 
 IMAGE = "pgmqtt-enterprise-postgres"
+
+# Session Expiry Interval (CONNECT property) — keeps a disconnected session
+# durable across the restart some tests here perform.
+PROP_SESSION_EXPIRY = 0x11
 
 pytestmark = pytest.mark.skipif(
     not signing_key_available(),
@@ -514,3 +519,151 @@ def test_community_boot_single_worker(community_broker):
     topics = {t for (t, _p, _q) in got}
     assert topics == {"mp/q1/beta", "mp/q0/beta"}, got
     assert community_broker.sql("SELECT count(*) FROM pgmqtt_cdc_outbox")[0][0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Inbound completion vs deferred delivery (message-reclamation ownership)
+# ---------------------------------------------------------------------------
+
+
+def _setup_inbound_fixture(broker: Broker, table: str, topic_root: str, mapping: str):
+    broker.sql(f"DROP TABLE IF EXISTS {table}")
+    broker.sql(f"CREATE TABLE {table} (id serial PRIMARY KEY, device text)")
+    try:
+        broker.sql(f"SELECT pgmqtt_remove_inbound_mapping('{mapping}')")
+    except Exception:
+        pass
+    broker.sql(
+        f"SELECT pgmqtt_add_inbound_mapping("
+        f"'{topic_root}', '{table}', "
+        f"'{{\"device\": \"{{device}}\"}}'::jsonb, "
+        f"'insert', NULL, 'public', '{mapping}')"
+    )
+    # Both workers refresh their inbound mapping caches on a ~500 ms cadence.
+    time.sleep(2)
+
+
+@pytest.fixture(scope="module")
+def restartable_broker():
+    """A dedicated broker that survives a full postmaster restart.
+
+    auto_remove=False is required for `docker restart` to keep the data
+    directory; see Broker.restart."""
+    if not _image_available():
+        pytest.skip(f"docker image {IMAGE} not available")
+    token = generate_test_license(
+        customer="mp-restart-test", days=1, features=["multiprocess", "metrics"]
+    )
+    broker = Broker(
+        "pgmqtt-test-multiprocess-restart",
+        15497,
+        11897,
+        token,
+        auto_remove=False,
+    )
+    broker.start()
+    yield broker
+    broker.stop()
+
+
+def test_inbound_mapped_publish_survives_restart_for_durable_subscriber(
+    restartable_broker,
+):
+    """Regression: inbound completion must not reclaim a message whose
+    delivery rows are still deferred in the socket worker.
+
+    While the subscriber is offline its queued delivery lives only in
+    pgmqtt_session_messages — so if the CDC worker's pump deletes the
+    message row before that insert commits (the insert FK-violates and is
+    dropped), a restart loses the redelivery entirely. The restart is what
+    makes DB state authoritative: without it, the broker's in-memory queue
+    would mask the loss."""
+    broker = restartable_broker
+    _setup_inbound_fixture(broker, "mp_race", "mprace/{device}", "mp_race_map")
+
+    sub = broker.connect_mqtt(
+        "race-sub", clean_start=False, properties={PROP_SESSION_EXPIRY: 300}
+    )
+    try:
+        _subscribe(sub, 1, "mprace/#", qos=1)
+        sub.sendall(create_disconnect_packet(0))
+    finally:
+        sub.close()
+
+    pub = broker.connect_mqtt("race-pub")
+    try:
+        pub.sendall(
+            create_publish_packet("mprace/dev9", b"1", qos=1, packet_id=901)
+        )
+        puback = recv_packet(pub, timeout=10.0)
+        assert puback is not None, "no PUBACK for inbound-mapped publish"
+        validate_puback(puback, 901)
+    finally:
+        pub.close()
+
+    deadline = time.time() + 15
+    rows = []
+    while time.time() < deadline:
+        rows = broker.sql("SELECT device FROM mp_race")
+        if rows:
+            break
+        time.sleep(0.5)
+    assert rows == [("dev9",)], f"inbound row not pumped: {rows}"
+
+    broker.restart()
+
+    sub2 = broker.connect_mqtt(
+        "race-sub", clean_start=False, properties={PROP_SESSION_EXPIRY: 300}
+    )
+    try:
+        got = _collect_publishes(sub2, expect=1, timeout=20.0)
+    finally:
+        sub2.close()
+    assert got == [("mprace/dev9", b"1", 1)], (
+        f"durable subscriber lost the message across restart: {got}"
+    )
+
+
+def test_unreferenced_inbound_message_is_eventually_reclaimed(enterprise_broker):
+    """No subscriber ever connects: the message row must still be reclaimed
+    after the pending row is consumed. The delivery-side cleanup can fire
+    while pgmqtt_inbound_pending still holds its reference (the CDC worker
+    has not pumped it yet); that attempt must retry rather than orphan the
+    row forever."""
+    broker = enterprise_broker
+    suffix = uuid4().hex[:8]
+    table = f"mp_leak_{suffix}"
+    topic = f"mpleak{suffix}/ghost"
+    mapping = f"mp_leak_{suffix}"
+    _setup_inbound_fixture(broker, table, f"mpleak{suffix}/{{device}}", mapping)
+
+    pub = broker.connect_mqtt("leak-pub")
+    try:
+        pub.sendall(create_publish_packet(topic, b"x", qos=1, packet_id=902))
+        puback = recv_packet(pub, timeout=10.0)
+        assert puback is not None, "no PUBACK for inbound-mapped publish"
+        validate_puback(puback, 902)
+    finally:
+        pub.close()
+
+    deadline = time.time() + 20
+    counts = None
+    while time.time() < deadline:
+        counts = (
+            broker.sql(f"SELECT count(*) FROM {table}")[0][0],
+            broker.sql(
+                "SELECT count(*) FROM pgmqtt_inbound_pending "
+                f"WHERE mapping_name = '{mapping}'"
+            )[0][0],
+            broker.sql(
+                f"SELECT count(*) FROM pgmqtt_messages WHERE topic = '{topic}'"
+            )[0][0],
+        )
+        if counts == (1, 0, 0):
+            break
+        time.sleep(0.5)
+    assert counts == (1, 0, 0), (
+        f"inbound message not reclaimed after pending consumption: {counts}"
+    )
+
+    broker.sql(f"SELECT pgmqtt_remove_inbound_mapping('{mapping}')")

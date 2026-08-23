@@ -827,7 +827,17 @@ fn process_inbound_pending() {
                     None,
                     &[message_id.into(), mapping_name.as_str().into()],
                 )?;
-                db_action::cleanup_orphaned_message(client, message_id)?;
+                // The message row itself is NOT reclaimed here: this can run
+                // before the publisher's delivery rows commit — across
+                // processes in the multiprocess topology (the pump's sync
+                // commit is itself what flushes the socket worker's async
+                // commit loose), and across ticks in standalone (delivery
+                // actions land at tick end). Deleting it here strands that
+                // INSERT on an FK violation and silently drops an
+                // already-PUBACKed QoS 1 delivery. Reclamation belongs to
+                // whichever worker delivers; see
+                // SessionDbAction::CleanupOrphanedMessage, which retries
+                // until this pending row is gone.
                 Ok(RowOutcome::Ok {
                     message_id,
                     mapping_name,
@@ -995,7 +1005,9 @@ fn dead_letter_inbound(
                 None,
                 &[message_id.into(), mapping_name.into()],
             )?;
-            db_action::cleanup_orphaned_message(client, message_id)?;
+            // Dead-lettering settles the inbound contract only. The message
+            // may still be awaiting deferred broker delivery (see the pump's
+            // success path); delivery-side reclaim owns the row.
             Ok::<_, pgrx::spi::Error>(())
         });
     });
@@ -1536,9 +1548,9 @@ fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
             process_inbound_pending();
         }
 
-        // Session expiry: every worker sweeps its own in-memory map; in
-        // multi-worker, slot 0 additionally runs the DB-authoritative sweep
-        // for sessions whose owner lost its copy.
+        // Session expiry is driven purely from the in-memory map — there is
+        // no DB-side sweeper. Safe because startup loads every pgmqtt_sessions
+        // row back into the map (restarting the expiry timer).
         if last_session_sweep.elapsed() >= Duration::from_millis(500) {
             sweep_expired_sessions(&mut session_db_actions);
             last_session_sweep = std::time::Instant::now();
@@ -1583,10 +1595,16 @@ fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
 
     for (id, mut client) in clients.drain() {
         // MQTT 5.0 §3.14: server MUST send DISCONNECT before closing the network connection.
-        let _ = client.transport.write_all(&mqtt::build_disconnect(
+        // One non-blocking flush attempt each side of it: bytes buffered earlier (the
+        // deferred PUBACKs just released) must precede the DISCONNECT on the wire, and a
+        // backpressured client must not be able to stall shutdown, so this stays
+        // best-effort — try_write re-buffers rather than truncating mid-packet.
+        let _ = client.flush_write_buf();
+        let _ = client.try_write(&mqtt::build_disconnect(
             mqtt::reason::SERVER_SHUTTING_DOWN,
             client.v5(),
         ));
+        let _ = client.flush_write_buf();
 
         // Server-initiated disconnect triggers the will message (MQTT 5.0 §3.1.3.3).
         // The client did NOT send a normal DISCONNECT, so the will fires.
@@ -2537,7 +2555,7 @@ fn dispatch_admin_command(
     use crate::admin_commands::Command;
     match cmd {
         Command::DisconnectClient { client_id, reason } => {
-            if let Some(client) = clients.get_mut(&client_id) {
+            let was_connected = if let Some(client) = clients.get_mut(&client_id) {
                 let _ = client
                     .transport
                     .write_all(&mqtt::build_disconnect(reason, client.v5()));
@@ -2547,19 +2565,36 @@ fn dispatch_admin_command(
                     reason
                 );
                 disconnect_client(&client_id, clients, pending_publishes, session_db_actions);
+                true
             } else {
+                false
+            };
+            // 0x8E discards the session outright, so it also applies to a
+            // client that is offline but still durable. The DeleteSession is
+            // pushed after disconnect_client so it supersedes the
+            // MarkDisconnected queued for a non-zero expiry interval.
+            if reason == 0x8E {
+                let had_session = with_sessions(|s| s.remove(&client_id)).is_some();
+                if was_connected || had_session {
+                    subscriptions::remove_client(&client_id);
+                    session_db_actions.push(SessionDbAction::DeleteSession {
+                        client_id: client_id.clone(),
+                    });
+                    log!(
+                        "pgmqtt admin: discarding session state for '{}' (reason 0x8e)",
+                        client_id
+                    );
+                } else {
+                    log!(
+                        "pgmqtt admin: disconnect_client '{}': no such client",
+                        client_id
+                    );
+                }
+            } else if !was_connected {
                 log!(
                     "pgmqtt admin: disconnect_client '{}': no such client",
                     client_id
                 );
-            }
-            // Takeover: the client now lives elsewhere — a copy kept here
-            // would go stale and keep matching/queueing.
-            if reason == 0x8E {
-                subscriptions::remove_client(&client_id);
-                with_sessions(|s| {
-                    s.remove(&client_id);
-                });
             }
         }
         Command::DisconnectRole { role_name, reason } => {
@@ -2669,10 +2704,10 @@ fn dispatch_admin_command(
     }
 }
 
-/// Apply an ACL reload to offline durable sessions: every worker's tree
-/// holds every DB subscription, so a revoked filter must be pruned on
-/// non-owner workers too or the replica keeps queueing under it. Only
-/// `role:` principals — JWT claims are re-checked on reconnect.
+/// Apply an ACL reload to offline durable sessions: the subscription tree
+/// holds every DB subscription, connected or not, so a revoked filter must
+/// be pruned there too or QoS 1 keeps queueing under it. Only `role:`
+/// principals — JWT claims are re-checked on reconnect.
 fn prune_offline_role_sessions(
     clients: &HashMap<String, MqttClient>,
     target: Option<&str>,
@@ -3546,12 +3581,6 @@ fn deliver_messages(
                 msg.topic,
                 subscriptions::active_filters()
             );
-            // A persisted message with no subscribers never gets a
-            // session_messages row, so nothing else would reclaim it (the
-            // CDC worker can't pre-filter cross-process).
-            if let Some(message_id) = msg.id {
-                session_db_actions.push(SessionDbAction::CleanupOrphanedMessage { message_id });
-            }
         }
 
         // Batch database actions by message_id to minimize writes
@@ -3712,8 +3741,18 @@ fn deliver_messages(
         }
 
         // Execute batch insert if there are entries for this message
-        if !batch_entries.is_empty() {
-            if let Some(msg_id) = msg.id {
+        if let Some(msg_id) = msg.id {
+            if batch_entries.is_empty() {
+                // No session_messages row means nothing else ever reclaims
+                // this message (the CDC worker can't pre-filter subscribers
+                // cross-process). Empty entries covers both "no match" and
+                // "matched but nothing queued" — granted QoS 0, queue cap,
+                // vanished session. The reclaim itself is NOT EXISTS-guarded,
+                // so retained / inbound-pending / outbox rows still survive.
+                session_db_actions.push(SessionDbAction::CleanupOrphanedMessage {
+                    message_id: msg_id,
+                });
+            } else {
                 session_db_actions.push(SessionDbAction::InsertMessageBatch {
                     message_id: msg_id,
                     entries: batch_entries,

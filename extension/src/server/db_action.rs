@@ -7,6 +7,16 @@
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::datum::DatumWithOid;
 use pgrx::spi;
+use std::sync::Mutex;
+
+/// Message ids whose reclaim found every reference gone except an
+/// unconsumed `pgmqtt_inbound_pending` row. Drained back onto the next
+/// executed batch: the pump always terminates a pending row (successful
+/// write, retry, or dead-letter all delete it), so entries clear within
+/// its bounded backoff window. Capped defensively — overflow means
+/// pending rows are sticking, which the inbound metrics already surface.
+static DEFERRED_RECLAIMS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+const DEFERRED_RECLAIMS_CAP: usize = 10_000;
 
 /// Persist a message to `pgmqtt_messages`, returning the generated ID.
 ///
@@ -118,7 +128,8 @@ pub enum SessionDbAction {
         topic_filter: String,
     },
     /// Reclaim a persisted message with no subscribers at delivery time
-    /// (no-op while still referenced).
+    /// (no-op while still referenced; retried later when the only reference
+    /// is a not-yet-consumed inbound_pending row — see DEFERRED_RECLAIMS).
     CleanupOrphanedMessage {
         message_id: i64,
     },
@@ -147,6 +158,13 @@ pub fn execute_session_db_actions_async(actions: Vec<SessionDbAction>) {
 }
 
 fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: bool) {
+    let mut actions = actions;
+    {
+        let mut queue = DEFERRED_RECLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+        for message_id in queue.drain(..) {
+            actions.push(SessionDbAction::CleanupOrphanedMessage { message_id });
+        }
+    }
     if actions.is_empty() {
         return;
     }
@@ -201,7 +219,11 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
             dropped,
             actions.len()
         );
-        crate::metrics::inc(&m.db_batches_committed);
+        // Only a batch whose every action landed counts as committed; the
+        // dropped ones are already reported through db_*_errors.
+        if dropped == 0 {
+            crate::metrics::inc(&m.db_batches_committed);
+        }
     });
 }
 
@@ -365,6 +387,35 @@ fn apply_action(
         }
         SessionDbAction::CleanupOrphanedMessage { message_id } => {
             cleanup_orphaned_message(client, *message_id)?;
+            // A surviving row is usually legitimate: fan-out keeps it
+            // referenced via session_messages until ACKs land, and those
+            // ACKs carry their own reclaim. The one case nothing follows up
+            // on is a lone inbound_pending reference — this action raced the
+            // CDC worker's pump (multiprocess) or simply ran first in the
+            // same tick. Defer rather than orphan the row.
+            let blocked_by_pending_only: bool = client
+                .select(
+                    "SELECT EXISTS (SELECT 1 FROM pgmqtt_messages WHERE id = $1) \
+                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages \
+                                    WHERE message_id = $1) \
+                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained \
+                                    WHERE message_id = $1) \
+                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1) \
+                     AND EXISTS (SELECT 1 FROM pgmqtt_inbound_pending \
+                                 WHERE message_id = $1)",
+                    None,
+                    &[(*message_id).into()],
+                )?
+                .first()
+                .get_one::<bool>()?
+                .unwrap_or(false);
+            if blocked_by_pending_only {
+                let mut queue =
+                    DEFERRED_RECLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+                if queue.len() < DEFERRED_RECLAIMS_CAP && !queue.contains(message_id) {
+                    queue.push(*message_id);
+                }
+            }
         }
         SessionDbAction::DrainCdcOutbox { ids } => {
             let args: Vec<DatumWithOid> = vec![ids.clone().into()];

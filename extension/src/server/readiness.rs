@@ -150,7 +150,13 @@ impl ReadinessPoller {
     pub(crate) fn ready_set(&mut self) -> Option<HashSet<i32>> {
         #[cfg(target_os = "linux")]
         {
-            let epfd = self.epfd?;
+            let Some(epfd) = self.epfd else {
+                // Nothing consumes carry-over in fallback mode, but the read
+                // pass still fills it — drop it or it accumulates every fd
+                // number the worker ever reads from.
+                self.carry.clear();
+                return None;
+            };
             let mut ready = std::mem::take(&mut self.carry);
             ready.extend(self.always.iter().copied());
 
@@ -195,6 +201,7 @@ impl ReadinessPoller {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            self.carry.clear();
             None
         }
     }

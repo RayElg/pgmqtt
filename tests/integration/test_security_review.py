@@ -3,8 +3,8 @@
 Community-broker coverage (the multiprocess-only fixes are covered in
 tests/enterprise/integration/test_multiprocess.py):
 
-- Client IDs longer than the cross-worker command cap (128 bytes) are
-  rejected at CONNECT instead of being admitted but unaddressable.
+- CONNECT imposes no client-id length limit: ids at and beyond the 128-byte
+  boundary an earlier design would have capped at are still accepted.
 - Empty client IDs get broker-unique identifiers, returned to MQTT 5
   clients in the CONNACK Assigned Client Identifier property.
 - Durable sessions are bound to the authenticated principal: the same
@@ -54,10 +54,8 @@ from test_utils import get_db_conn, run_sql  # noqa: E402
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 
-CLIENT_ID_CAP = 128  # shmem_bridge::CMD_ARG_CAP
+CLIENT_ID_BOUNDARY = 128  # boundary only: the broker enforces no such limit
 RC_SUCCESS = 0x00
-RC_CLIENT_IDENTIFIER_NOT_VALID = 0x85
-V3_IDENTIFIER_REJECTED = 0x02
 PROP_ASSIGNED_CLIENT_ID = 0x12
 PROP_SESSION_EXPIRY = 0x11
 
@@ -139,22 +137,22 @@ def _poll_sql_value(query, want, timeout=15.0):
 # ---------------------------------------------------------------------------
 
 
-def test_client_id_at_cap_accepted():
-    s, _present, rc, _props = _connect("c" * CLIENT_ID_CAP)
+def test_client_id_at_boundary_accepted():
+    s, _present, rc, _props = _connect("c" * CLIENT_ID_BOUNDARY)
     s.close()
     assert rc == RC_SUCCESS
 
 
-def test_client_id_over_cap_accepted_single_worker_v5():
+def test_client_id_over_boundary_accepted_v5():
     """The broker imposes no client-id length limit — pre-0.5.0 clients
     depend on long ids being accepted."""
-    s, _present, rc, _props = _connect("c" * (CLIENT_ID_CAP + 1))
+    s, _present, rc, _props = _connect("c" * (CLIENT_ID_BOUNDARY + 1))
     s.close()
     assert rc == RC_SUCCESS, hex(rc)
 
 
-def test_client_id_over_cap_accepted_single_worker_v311():
-    s, _present, rc, _props = _connect("c" * (CLIENT_ID_CAP + 1), protocol_version=4)
+def test_client_id_over_boundary_accepted_v311():
+    s, _present, rc, _props = _connect("c" * (CLIENT_ID_BOUNDARY + 1), protocol_version=4)
     s.close()
     assert rc == RC_SUCCESS, hex(rc)
 

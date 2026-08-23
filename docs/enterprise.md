@@ -360,9 +360,9 @@ Inline-ring drops increment the `cdc_bridge_dropped` counter (see [Observability
 
 ### Asynchronous group commit
 
-In the multiprocess topology, `pgmqtt_mqtt` commits its write transactions (client QoS 1 publish persistence, retained-message updates, session bookkeeping, QoS 0 inbound writes) with `synchronous_commit = off`, so the socket loop never waits on an fsync. **Durability guarantees are unchanged**: client-visible effects — the PUBACK to the publisher and QoS ≥ 1 delivery to subscribers — are deferred until `pg_current_wal_flush_lsn()` passes the transaction's commit record, i.e. until the write is physically on disk, exactly the same point at which the single-process broker sends them.
+PIn the multiprocess topology, `pgmqtt_mqtt` commits its write transactions (client QoS 1 publish persistence, retained-message updates, session bookkeeping, QoS 0 inbound writes) with `synchronous_commit = off`, so the socket loop never waits on an fsync. **Durability guarantees are unchanged**: client-visible effects — the PUBACK to the publisher and QoS ≥ 1 delivery to subscribers — are deferred until `pg_current_wal_flush_lsn()` passes the transaction's commit record, i.e. until the write is physically on disk, exactly the same point at which the single-process broker sends them.
 
-The WAL flush itself is driven from off the socket loop: under CDC or inbound load, the `pgmqtt_cdc` worker's own synchronous commits advance the flush pointer for free (group commit); when nothing else is flushing, `pgmqtt_mqtt` signals `pgmqtt_cdc` through shared memory and it issues one small synchronous commit that flushes everything at once. If a deferred batch outlives that round trip (~4 ticks — e.g. the CDC worker is restarting), `pgmqtt_mqtt` pays one synchronous flush itself, so the worst case is bounded at roughly the pre-split behavior. In practice a QoS 1 PUBACK arrives 2–5 ticks after the publish, and one fsync covers every write from every pipeline in that window rather than each transaction paying its own.
+The WAL flush itself is driven from off the socket loop: under CDC or inbound load, the `pgmqtt_cdc` worker's own synchronous commits advance the flush pointer for free (group commit); when nothing else is flushing, `pgmqtt_mqtt` signals `pgmqtt_cdc` through shared memory and it issues one small synchronous commit that flushes everything at once. If a deferred batch outlives that round trip (~4 ticks — e.g. the CDC worker is restarting), `pgmqtt_mqtt` pays one synchronous flush itself, so the worst case is bounded at roughly the pre-split behavior. In practice a QoS 1 PUBACK arrives typically 1–3 ticks after the publish (see [limitations.md](limitations.md)), and one fsync covers every write from every pipeline in that window rather than each transaction paying its own.
 
 > **Tuning:** setting `wal_writer_delay = '10ms'` (PostgreSQL setting, default 200 ms) lets the WAL writer pick up the asynchronous commits almost immediately, which both lowers the QoS 1 PUBACK median to parity with single-process mode and makes the beacon/fallback paths nearly irrelevant. The WAL writer hibernates when idle, so the shorter delay costs nothing on a quiet server. Measured on a 4-core host: p50 ≈ 13 ms, p99 ≈ 26 ms with `10ms`, versus p50 ≈ 18 ms with the default.
 
@@ -440,7 +440,7 @@ The flush interval, retention, and all other behavior are controlled via GUCs (s
 | | `pubacks_received` | counter | PUBACK packets received |
 | Subscriptions | `subscribe_ops` | counter | SUBSCRIBE operations |
 | | `unsubscribe_ops` | counter | UNSUBSCRIBE operations |
-| CDC | `cdc_events_processed` | counter | WAL events decoded from the CDC slot |
+| CDC | `cdc_events_processed` | counter | Mapped WAL changes decoded from the CDC slot (excludes commit markers and unmapped tables) |
 | | `cdc_msgs_published` | counter | Messages emitted from CDC pipeline |
 | | `cdc_render_errors` | counter | Template rendering failures (bad mapping config) |
 | | `cdc_slot_errors` | counter | Replication slot I/O errors |

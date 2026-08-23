@@ -387,15 +387,17 @@ impl DeferredQueue {
                 && d.queued_at.elapsed() >= flush_fallback_after()
         }) {
             if wal::force_flush() {
-                // A successful flush covers every earlier commit, including
-                // batches whose watermark capture failed outright.
+                // Every batch already queued committed before this flush, so
+                // all of them are durable — no LSN comparison needed. Not
+                // gating on the read-back keeps a failing `read_lsn` from
+                // parking the queue (and re-flushing) forever.
                 for d in self.queue.iter_mut() {
-                    if d.watermark == wal::WATERMARK_UNCONFIRMED {
-                        d.watermark = 0;
-                    }
+                    d.watermark = 0;
                 }
+                flush = flush.or(Some(0));
+            } else {
+                flush = wal::read_lsn("pg_current_wal_flush_lsn()");
             }
-            flush = wal::read_lsn("pg_current_wal_flush_lsn()");
         }
         while self
             .queue

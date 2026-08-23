@@ -459,8 +459,8 @@ pub fn has_subscribers(topic: &str) -> bool {
 /// their granted QoS. Regular matches come back deduped (highest QoS wins);
 /// shared-group picks are kept separate as `(group_filter, member_id, qos)`
 /// — one member per matching group, round-robin preferring members in
-/// `connected_clients` — so multi-worker delivery can gate each group on a
-/// cluster-wide claim. Advances the groups' round-robin state.
+/// `connected_clients` — because a shared subscription delivers each message
+/// to exactly one member of the group. Advances the groups' round-robin state.
 pub fn match_topic_split(
     topic: &str,
     connected_clients: &HashSet<String>,

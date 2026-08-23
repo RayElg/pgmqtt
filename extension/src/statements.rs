@@ -60,12 +60,13 @@ pub fn prepare_hot_path_statements() {
 
         let del_orphan_msg = client
             .prepare_mut(
-                // The pgmqtt_cdc_outbox check keeps a row alive while any
-                // worker's delivery cursor still has it pending: references
-                // (session_messages) are only created at delivery time, so a
-                // fast ACK on one worker could otherwise reap a message
-                // another worker has not delivered yet. The slot-0 GC
-                // reclaims once every cursor has passed.
+                // An outbox row IS a reference: session_messages rows only
+                // appear at delivery, so between the CDC worker's enqueue
+                // and the mqtt worker's drain nothing else keeps the message
+                // alive — and cleanup can run in either process (inbound
+                // completion in pgmqtt_cdc, delivery/retain in pgmqtt_mqtt).
+                // The drain deletes the outbox row in the same transaction
+                // that inserts the delivery rows, so there is no gap.
                 "DELETE FROM pgmqtt_messages \
                  WHERE id = $1 \
                    AND NOT EXISTS \

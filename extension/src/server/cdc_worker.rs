@@ -315,10 +315,6 @@ pub(crate) fn cdc_tick_core(
                         batch_end_lsn = last;
                         if n > 0 {
                             log!("pgmqtt: slot batch fetched {} raw logical messages", n);
-                            crate::metrics::add(
-                                &crate::metrics::shared_cdc().events_processed,
-                                n as u64,
-                            );
                         }
                     }
                     Err(e) => {
@@ -336,6 +332,18 @@ pub(crate) fn cdc_tick_core(
                 // transaction, keeping the checkpoint consistent with
                 // confirmed_flush_lsn.
                 let events = ring_buffer::drain();
+
+                // Counted from the ring, not from the peek row count: the peek
+                // also returns one COMMIT marker per decoded transaction
+                // (emitted solely to give the slot an exact advance boundary),
+                // which would make this track cluster-wide commit traffic
+                // rather than CDC load.
+                if !events.is_empty() {
+                    crate::metrics::add(
+                        &crate::metrics::shared_cdc().events_processed,
+                        events.len() as u64,
+                    );
+                }
 
                 for event in &events {
                     match event {

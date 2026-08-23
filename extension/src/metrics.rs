@@ -610,7 +610,7 @@ impl MetricsSnapshot {
                 "pgmqtt_cdc_events_processed_total",
                 "counter",
                 self.cdc_events_processed,
-                "WAL events decoded from CDC slot",
+                "Mapped WAL changes decoded from CDC slot",
             ),
             (
                 "pgmqtt_cdc_messages_published_total",
