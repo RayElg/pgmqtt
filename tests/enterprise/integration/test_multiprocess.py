@@ -43,6 +43,11 @@ IMAGE = "pgmqtt-enterprise-postgres"
 # durable across the restart some tests here perform.
 PROP_SESSION_EXPIRY = 0x11
 
+# The split is gated by BOTH the license feature and this opt-in (decided at
+# startup): brokers under test must pass it on the postgres command line,
+# next to the license key.
+EXPERIMENTAL_MULTIPROCESS_CONF = "pgmqtt.experimental_multiprocess=on"
+
 pytestmark = pytest.mark.skipif(
     not signing_key_available(),
     reason="PGMQTT_TEST_SIGNING_KEY not set",
@@ -246,7 +251,13 @@ def enterprise_broker():
     token = generate_test_license(
         customer="mp-test", days=1, features=["multiprocess", "metrics"]
     )
-    broker = Broker("pgmqtt-test-multiprocess", 15499, 11899, token)
+    broker = Broker(
+        "pgmqtt-test-multiprocess",
+        15499,
+        11899,
+        token,
+        extra_conf=[EXPERIMENTAL_MULTIPROCESS_CONF],
+    )
     broker.start()
     yield broker
     broker.stop()
@@ -560,10 +571,55 @@ def restartable_broker():
         11897,
         token,
         auto_remove=False,
+        extra_conf=[EXPERIMENTAL_MULTIPROCESS_CONF],
     )
     broker.start()
     yield broker
     broker.stop()
+
+
+@pytest.fixture(scope="module")
+def licensed_guc_off_broker():
+    """Multiprocess license present, experimental GUC at its off default."""
+    if not _image_available():
+        pytest.skip(f"docker image {IMAGE} not available")
+    token = generate_test_license(
+        customer="mp-gate-test", days=1, features=["multiprocess", "metrics"]
+    )
+    broker = Broker("pgmqtt-test-multiprocess-gate", 15496, 11896, token)
+    broker.start()
+    yield broker
+    broker.stop()
+
+
+def test_multiprocess_requires_experimental_guc(licensed_guc_off_broker):
+    """The license feature alone must not split the process: without the
+    opt-in GUC the broker boots combined, with CDC running inline in the
+    socket worker (outbox untouched) — enterprise license, community shape."""
+    broker = licensed_guc_off_broker
+
+    workers = broker.worker_types()
+    assert workers == {"pgmqtt_mqtt"}, f"unexpected split: {workers}"
+
+    status, features = broker.sql("SELECT status, features FROM pgmqtt_license_status()")[0]
+    assert status == "active"
+    assert "multiprocess" in features, features
+
+    setting = broker.sql(
+        "SELECT current_setting('pgmqtt.experimental_multiprocess')"
+    )[0][0]
+    assert setting == "off"
+
+    _setup_cdc_fixture_table(broker)
+    sub = broker.connect_mqtt("mp-gate-sub")
+    try:
+        _subscribe(sub, 1, "mp/#", qos=1)
+        broker.sql("INSERT INTO mp_events (name, val) VALUES ('gate', 'inline')")
+        got = _collect_publishes(sub, expect=2)
+    finally:
+        sub.close()
+    assert {t for (t, _p, _q) in got} == {"mp/q1/gate", "mp/q0/gate"}, got
+    assert broker.sql("SELECT count(*) FROM pgmqtt_cdc_outbox")[0][0] == 0
 
 
 def test_inbound_mapped_publish_survives_restart_for_durable_subscriber(

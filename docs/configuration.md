@@ -78,9 +78,11 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 |-----|------|---------|-------------|
 | `pgmqtt.license_key` | string | `""` | Signed enterprise license token. Empty = Community mode (1,000-connection cap, no enterprise features). |
 
-Hot-reloadable — updated token takes effect after `pg_reload_conf()` without restarting.
+| `pgmqtt.experimental_multiprocess` | bool | `off` | — | Experimental opt-in for the dedicated `pgmqtt_cdc` worker: the split starts only when the license has the `multiprocess` feature **and** this is `on`. Decided once at startup (`postmaster` context — a reload cannot change it); toggling either gate requires a full PostgreSQL restart. See [enterprise.md → Multi-Process CDC](enterprise.md#multi-process-cdc). |
 
-> **Exception: the `multiprocess` feature.** Process topology (whether the dedicated `pgmqtt_cdc` worker exists) is decided once at PostgreSQL startup, because background workers can only be registered while the server is starting. Adding or removing `multiprocess` from the license therefore requires a **full PostgreSQL restart** — `pg_reload_conf()` updates the license for every other feature check but cannot start or stop the second worker. See [enterprise.md → Multi-Process CDC](enterprise.md#multi-process-cdc).
+Hot-reloadable — updated tokens take effect after `pg_reload_conf()` without restarting.
+
+> **Exception: the `multiprocess` feature.** Process topology (whether the dedicated `pgmqtt_cdc` worker exists) is decided once at PostgreSQL startup — license feature plus `pgmqtt.experimental_multiprocess`, both read while the server is starting, because background workers can only be registered then. Changing either therefore requires a **full PostgreSQL restart** — `pg_reload_conf()` updates the license for every other feature check but cannot start or stop the second worker. See [enterprise.md → Multi-Process CDC](enterprise.md#multi-process-cdc).
 
 ---
 

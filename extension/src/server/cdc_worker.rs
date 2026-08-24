@@ -22,8 +22,7 @@ const MAX_DRAIN_BATCHES_PER_TICK: usize = 4;
 /// pin restart_lsn/WAL retention forever. Each advance persists slot state,
 /// so it runs at most once per interval.
 const IDLE_ADVANCE_INTERVAL_SECS: i64 = 10;
-static LAST_IDLE_ADVANCE_SECS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
+static LAST_IDLE_ADVANCE_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 fn idle_advance_due() -> bool {
     let last = LAST_IDLE_ADVANCE_SECS.load(std::sync::atomic::Ordering::Relaxed);
@@ -274,125 +273,130 @@ pub(crate) fn cdc_tick_core(
 
         let ((to_publish, outbox_queued, batch_count, batch_end_lsn), batch_ok) =
             super::transaction_or_abort(
-            move || -> ((Vec<MqttMessage>, usize, usize, Option<String>), bool) {
-                let mut to_publish: Vec<MqttMessage> = Vec::new();
-                let mut outbox_ids: Vec<i64> = Vec::new();
-                // Inline-ring budget for this batch: free space never
-                // shrinks under us, so inlining at most this many cannot
-                // overflow. One bulk transaction can render far more QoS 0
-                // than the ring holds; the excess spills to the outbox
-                // rather than being dropped.
-                let mut inline_budget = if matches!(mode, CdcQueueMode::OutboxQos1) {
-                    crate::shmem_bridge::inline_free_slots()
-                } else {
-                    usize::MAX
-                };
-                let mut batch_count: usize = 0;
-                let batch_end_lsn: Option<String>;
+                move || -> ((Vec<MqttMessage>, usize, usize, Option<String>), bool) {
+                    let mut to_publish: Vec<MqttMessage> = Vec::new();
+                    let mut outbox_ids: Vec<i64> = Vec::new();
+                    // Inline-ring budget for this batch: free space never
+                    // shrinks under us, so inlining at most this many cannot
+                    // overflow. One bulk transaction can render far more QoS 0
+                    // than the ring holds; the excess spills to the outbox
+                    // rather than being dropped.
+                    let mut inline_budget = if matches!(mode, CdcQueueMode::OutboxQos1) {
+                        crate::shmem_bridge::inline_free_slots()
+                    } else {
+                        usize::MAX
+                    };
+                    let mut batch_count: usize = 0;
+                    let batch_end_lsn: Option<String>;
 
-                // Step 1: peek at most CDC_BATCH_SIZE events into
-                // ring_buffer; nothing is consumed — the caller advances
-                // the slot only after this transaction commits.
-                let peek_query = format!(
-                    "SELECT lsn::text FROM pg_logical_slot_peek_changes('{}', NULL, {})",
-                    slot_name, CDC_BATCH_SIZE
-                );
-                match Spi::connect_mut(|client| {
-                    suppress_decoding_logs(client);
-                    let mut n = 0usize;
-                    let mut last: Option<String> = None;
-                    let table = client.select(&peek_query, None, &[])?;
-                    for row in table {
-                        n += 1;
-                        if let Ok(Some(lsn)) = row.get_by_name::<String, _>("lsn") {
-                            last = Some(lsn);
-                        }
-                    }
-                    Ok::<(usize, Option<String>), spi::Error>((n, last))
-                }) {
-                    Ok((n, last)) => {
-                        batch_count = n;
-                        batch_end_lsn = last;
-                        if n > 0 {
-                            log!("pgmqtt: slot batch fetched {} raw logical messages", n);
-                        }
-                    }
-                    Err(e) => {
-                        log!("pgmqtt: error peeking slot: {:?} — skipping batch", e);
-                        crate::metrics::inc(&crate::metrics::shared_cdc().slot_errors);
-                        // Drop what the failed peek pushed — the retry
-                        // re-decodes it.
-                        let _ = ring_buffer::drain();
-                        return ((to_publish, 0, batch_count, None), false);
-                    }
-                }
-
-                // Step 2: drain ring_buffer in WAL order. MappingUpdate
-                // events update the cache and pgmqtt_slot_mappings in this
-                // transaction, keeping the checkpoint consistent with
-                // confirmed_flush_lsn.
-                let events = ring_buffer::drain();
-
-                // Counted from the ring, not from the peek row count: the peek
-                // also returns one COMMIT marker per decoded transaction
-                // (emitted solely to give the slot an exact advance boundary),
-                // which would make this track cluster-wide commit traffic
-                // rather than CDC load.
-                if !events.is_empty() {
-                    crate::metrics::add(
-                        &crate::metrics::shared_cdc().events_processed,
-                        events.len() as u64,
+                    // Step 1: peek at most CDC_BATCH_SIZE events into
+                    // ring_buffer; nothing is consumed — the caller advances
+                    // the slot only after this transaction commits.
+                    let peek_query = format!(
+                        "SELECT lsn::text FROM pg_logical_slot_peek_changes('{}', NULL, {})",
+                        slot_name, CDC_BATCH_SIZE
                     );
-                }
+                    match Spi::connect_mut(|client| {
+                        suppress_decoding_logs(client);
+                        let mut n = 0usize;
+                        let mut last: Option<String> = None;
+                        let table = client.select(&peek_query, None, &[])?;
+                        for row in table {
+                            n += 1;
+                            if let Ok(Some(lsn)) = row.get_by_name::<String, _>("lsn") {
+                                last = Some(lsn);
+                            }
+                        }
+                        Ok::<(usize, Option<String>), spi::Error>((n, last))
+                    }) {
+                        Ok((n, last)) => {
+                            batch_count = n;
+                            batch_end_lsn = last;
+                            if n > 0 {
+                                log!("pgmqtt: slot batch fetched {} raw logical messages", n);
+                            }
+                        }
+                        Err(e) => {
+                            log!("pgmqtt: error peeking slot: {:?} — skipping batch", e);
+                            crate::metrics::inc(&crate::metrics::shared_cdc().slot_errors);
+                            // Drop what the failed peek pushed — the retry
+                            // re-decodes it.
+                            let _ = ring_buffer::drain();
+                            return ((to_publish, 0, batch_count, None), false);
+                        }
+                    }
 
-                for event in &events {
-                    match event {
-                        ring_buffer::RingEvent::MappingUpdate { op, columns } => {
-                            let col = |name: &str| -> String {
-                                columns
-                                    .iter()
-                                    .find(|(k, _)| k == name)
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or_default()
-                            };
-                            let schema = col("schema_name");
-                            let table = col("table_name");
-                            let name = col("mapping_name");
+                    // Step 2: drain ring_buffer in WAL order. MappingUpdate
+                    // events update the cache and pgmqtt_slot_mappings in this
+                    // transaction, keeping the checkpoint consistent with
+                    // confirmed_flush_lsn.
+                    let events = ring_buffer::drain();
 
-                            if *op == "DELETE" {
-                                topic_map::wal_remove(&schema, &table, &name);
-                                // Only remove from the fast-path set if no other
-                                // mappings remain for this (schema, table) pair.
-                                if !topic_map::has_any_mapping(&schema, &table) {
-                                    crate::ring_buffer::mapped_table_remove(&schema, &table);
-                                }
-                                let _ = pgrx::spi::Spi::connect_mut(|client| {
-                                    client.update(
+                    // Counted from the ring, not from the peek row count: the peek
+                    // also returns one COMMIT marker per decoded transaction
+                    // (emitted solely to give the slot an exact advance boundary),
+                    // which would make this track cluster-wide commit traffic
+                    // rather than CDC load.
+                    if !events.is_empty() {
+                        crate::metrics::add(
+                            &crate::metrics::shared_cdc().events_processed,
+                            events.len() as u64,
+                        );
+                    }
+
+                    for event in &events {
+                        match event {
+                            ring_buffer::RingEvent::MappingUpdate { op, columns } => {
+                                let col = |name: &str| -> String {
+                                    columns
+                                        .iter()
+                                        .find(|(k, _)| k == name)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or_default()
+                                };
+                                let schema = col("schema_name");
+                                let table = col("table_name");
+                                let name = col("mapping_name");
+
+                                if *op == "DELETE" {
+                                    topic_map::wal_remove(&schema, &table, &name);
+                                    // Only remove from the fast-path set if no other
+                                    // mappings remain for this (schema, table) pair.
+                                    if !topic_map::has_any_mapping(&schema, &table) {
+                                        crate::ring_buffer::mapped_table_remove(&schema, &table);
+                                    }
+                                    let _ = pgrx::spi::Spi::connect_mut(|client| {
+                                        client.update(
                                         "DELETE FROM pgmqtt_slot_mappings \
                                          WHERE schema_name = $1 AND table_name = $2 AND mapping_name = $3",
                                         None,
                                         &[schema.as_str().into(), table.as_str().into(), name.as_str().into()],
                                     ).map(|_| ())
-                                });
-                                log!("pgmqtt: WAL mapping DELETE {}.{} ({})", schema, table, name);
-                            } else {
-                                // INSERT or UPDATE
-                                let topic_template = col("topic_template");
-                                let payload_template = col("payload_template");
-                                let qos: u8 = col("qos").parse().unwrap_or(0);
-                                let mapping = topic_map::TopicMapping {
-                                    name: name.clone(),
-                                    schema: schema.clone(),
-                                    table: table.clone(),
-                                    topic_template: topic_template.clone(),
-                                    payload_template: payload_template.clone(),
-                                    qos,
-                                };
-                                topic_map::wal_upsert(mapping);
-                                crate::ring_buffer::mapped_table_add(&schema, &table);
-                                let tmpl_type = col("template_type");
-                                let _ = pgrx::spi::Spi::connect_mut(|client| {
-                                    client.update(
+                                    });
+                                    log!(
+                                        "pgmqtt: WAL mapping DELETE {}.{} ({})",
+                                        schema,
+                                        table,
+                                        name
+                                    );
+                                } else {
+                                    // INSERT or UPDATE
+                                    let topic_template = col("topic_template");
+                                    let payload_template = col("payload_template");
+                                    let qos: u8 = col("qos").parse().unwrap_or(0);
+                                    let mapping = topic_map::TopicMapping {
+                                        name: name.clone(),
+                                        schema: schema.clone(),
+                                        table: table.clone(),
+                                        topic_template: topic_template.clone(),
+                                        payload_template: payload_template.clone(),
+                                        qos,
+                                    };
+                                    topic_map::wal_upsert(mapping);
+                                    crate::ring_buffer::mapped_table_add(&schema, &table);
+                                    let tmpl_type = col("template_type");
+                                    let _ = pgrx::spi::Spi::connect_mut(|client| {
+                                        client.update(
                                         "INSERT INTO pgmqtt_slot_mappings \
                                              (schema_name, table_name, mapping_name, \
                                               topic_template, payload_template, qos, template_type) \
@@ -413,164 +417,172 @@ pub(crate) fn cdc_tick_core(
                                             tmpl_type.as_str().into(),
                                         ],
                                     ).map(|_| ())
-                                });
-                                log!("pgmqtt: WAL mapping {} {}.{} ({})", op, schema, table, name);
-                            }
-                        }
-
-                        ring_buffer::RingEvent::Data(change) => {
-                            let rendered_messages = topic_map::render(
-                                &change.schema,
-                                &change.table,
-                                change.op,
-                                &change.columns,
-                            );
-
-                            if rendered_messages.is_empty() {
-                                log!(
-                                    "pgmqtt: no mapping match for {}.{}",
-                                    change.schema,
-                                    change.table
-                                );
-                                continue;
-                            }
-
-                            for rendered in rendered_messages {
-                                // DeliverAll owns the subscription state, so
-                                // unconsumable messages skip the persist (CDC
-                                // is never retained). OutboxQos1 can't see
-                                // subscribers cross-process; delivery-side
-                                // reclamation covers it.
-                                if matches!(mode, CdcQueueMode::DeliverAll)
-                                    && !crate::subscriptions::has_subscribers(&rendered.topic)
-                                {
+                                    });
                                     log!(
-                                        "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
-                                        rendered.topic
+                                        "pgmqtt: WAL mapping {} {}.{} ({})",
+                                        op,
+                                        schema,
+                                        table,
+                                        name
+                                    );
+                                }
+                            }
+
+                            ring_buffer::RingEvent::Data(change) => {
+                                let rendered_messages = topic_map::render(
+                                    &change.schema,
+                                    &change.table,
+                                    change.op,
+                                    &change.columns,
+                                );
+
+                                if rendered_messages.is_empty() {
+                                    log!(
+                                        "pgmqtt: no mapping match for {}.{}",
+                                        change.schema,
+                                        change.table
                                     );
                                     continue;
                                 }
 
-                                let topic_str = rendered.topic.clone();
+                                for rendered in rendered_messages {
+                                    // DeliverAll owns the subscription state, so
+                                    // unconsumable messages skip the persist (CDC
+                                    // is never retained). OutboxQos1 can't see
+                                    // subscribers cross-process; delivery-side
+                                    // reclamation covers it.
+                                    if matches!(mode, CdcQueueMode::DeliverAll)
+                                        && !crate::subscriptions::has_subscribers(&rendered.topic)
+                                    {
+                                        log!(
+                                        "pgmqtt cdc: no subscribers for rendered topic '{}', skipping",
+                                        rendered.topic
+                                    );
+                                        continue;
+                                    }
 
-                                // QOS 0 spills to the outbox rather than
-                                // being dropped: oversize for the fixed slots,
-                                // or no ring budget left this batch.
-                                let spill_qos0 = matches!(mode, CdcQueueMode::OutboxQos1)
-                                    && rendered.qos == 0
-                                    && (inline_budget == 0
-                                        || !crate::shmem_bridge::fits_inline(
-                                            &rendered.topic,
-                                            &rendered.payload,
-                                        ));
-                                if !spill_qos0 && rendered.qos == 0 {
-                                    inline_budget = inline_budget.saturating_sub(1);
-                                }
+                                    let topic_str = rendered.topic.clone();
 
-                                if rendered.qos > 0 || spill_qos0 {
-                                    // Subtransaction: a persist error must not
-                                    // crash the worker; the batch still aborts.
-                                    let result = with_subtransaction(|| {
-                                        pgrx::spi::Spi::connect_mut(|client| {
-                                            let msg_id = db_action::persist_message(
-                                                client,
-                                                &topic_str,
+                                    // QOS 0 spills to the outbox rather than
+                                    // being dropped: oversize for the fixed slots,
+                                    // or no ring budget left this batch.
+                                    let spill_qos0 = matches!(mode, CdcQueueMode::OutboxQos1)
+                                        && rendered.qos == 0
+                                        && (inline_budget == 0
+                                            || !crate::shmem_bridge::fits_inline(
+                                                &rendered.topic,
                                                 &rendered.payload,
-                                                rendered.qos,
-                                                false,
-                                            )?;
-                                            Ok::<_, spi::Error>(Some(msg_id))
-                                        })
-                                    });
+                                            ));
+                                    if !spill_qos0 && rendered.qos == 0 {
+                                        inline_budget = inline_budget.saturating_sub(1);
+                                    }
 
-                                    match result {
-                                        Ok(Some(msg_id)) => {
-                                            log!(
+                                    if rendered.qos > 0 || spill_qos0 {
+                                        // Subtransaction: a persist error must not
+                                        // crash the worker; the batch still aborts.
+                                        let result = with_subtransaction(|| {
+                                            pgrx::spi::Spi::connect_mut(|client| {
+                                                let msg_id = db_action::persist_message(
+                                                    client,
+                                                    &topic_str,
+                                                    &rendered.payload,
+                                                    rendered.qos,
+                                                    false,
+                                                )?;
+                                                Ok::<_, spi::Error>(Some(msg_id))
+                                            })
+                                        });
+
+                                        match result {
+                                            Ok(Some(msg_id)) => {
+                                                log!(
                                                 "pgmqtt cdc: persisted QOS {} to '{}' (msg_id={})",
                                                 rendered.qos,
                                                 rendered.topic,
                                                 msg_id
                                             );
-                                            match mode {
-                                                CdcQueueMode::OutboxQos1 => {
-                                                    outbox_ids.push(msg_id);
+                                                match mode {
+                                                    CdcQueueMode::OutboxQos1 => {
+                                                        outbox_ids.push(msg_id);
+                                                    }
+                                                    CdcQueueMode::DeliverAll => {
+                                                        to_publish.push(MqttMessage {
+                                                            id: Some(msg_id),
+                                                            topic: rendered.topic,
+                                                            payload: rendered.payload,
+                                                            qos: rendered.qos,
+                                                        });
+                                                    }
                                                 }
-                                                CdcQueueMode::DeliverAll => {
-                                                    to_publish.push(MqttMessage {
-                                                        id: Some(msg_id),
-                                                        topic: rendered.topic,
-                                                        payload: rendered.payload,
-                                                        qos: rendered.qos,
-                                                    });
-                                                }
+                                                crate::metrics::inc(
+                                                    &crate::metrics::shared_cdc().msgs_published,
+                                                );
                                             }
-                                            crate::metrics::inc(
-                                                &crate::metrics::shared_cdc().msgs_published,
-                                            );
-                                        }
-                                        other => {
-                                            log!(
+                                            other => {
+                                                log!(
                                                 "pgmqtt cdc: error persisting QOS {} to '{}': {:?} \
                                                  — batch rolls back, events retried next tick",
                                                 rendered.qos,
                                                 topic_str,
                                                 other
                                             );
-                                            crate::metrics::inc(
-                                                &crate::metrics::shared_cdc().persist_errors,
-                                            );
-                                            return ((Vec::new(), 0, batch_count, None), false);
+                                                crate::metrics::inc(
+                                                    &crate::metrics::shared_cdc().persist_errors,
+                                                );
+                                                return ((Vec::new(), 0, batch_count, None), false);
+                                            }
                                         }
+                                    } else {
+                                        // QOS 0 — fire-and-forget, pushed after commit.
+                                        to_publish.push(MqttMessage {
+                                            id: None,
+                                            topic: rendered.topic,
+                                            payload: rendered.payload,
+                                            qos: 0,
+                                        });
+                                        crate::metrics::inc(
+                                            &crate::metrics::shared_cdc().msgs_published,
+                                        );
                                     }
-                                } else {
-                                    // QOS 0 — fire-and-forget, pushed after commit.
-                                    to_publish.push(MqttMessage {
-                                        id: None,
-                                        topic: rendered.topic,
-                                        payload: rendered.payload,
-                                        qos: 0,
-                                    });
-                                    crate::metrics::inc(&crate::metrics::shared_cdc().msgs_published);
-                                }
 
-                                log!(
-                                    "pgmqtt: processed {} on {}.{} → topic='{}'",
-                                    change.op,
-                                    change.schema,
-                                    change.table,
-                                    topic_str
-                                );
+                                    log!(
+                                        "pgmqtt: processed {} on {}.{} → topic='{}'",
+                                        change.op,
+                                        change.schema,
+                                        change.table,
+                                        topic_str
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                // Step 3 (OutboxQos1): queue persisted ids in this same
-                // transaction — the handoff commits or rolls back with the
-                // message rows.
-                if !outbox_ids.is_empty() {
-                    let queued = outbox_ids.len();
-                    let insert_result = with_subtransaction(|| {
-                        pgrx::spi::Spi::connect_mut(|client| {
-                            super::outbox::enqueue(client, &outbox_ids)
-                        })
-                    });
-                    if let Err(e) = insert_result {
-                        log!(
+                    // Step 3 (OutboxQos1): queue persisted ids in this same
+                    // transaction — the handoff commits or rolls back with the
+                    // message rows.
+                    if !outbox_ids.is_empty() {
+                        let queued = outbox_ids.len();
+                        let insert_result = with_subtransaction(|| {
+                            pgrx::spi::Spi::connect_mut(|client| {
+                                super::outbox::enqueue(client, &outbox_ids)
+                            })
+                        });
+                        if let Err(e) = insert_result {
+                            log!(
                             "pgmqtt cdc: error queueing {} message ids to pgmqtt_cdc_outbox: {:?} \
                              — batch rolls back, events retried next tick",
                             queued,
                             e
                         );
-                        crate::metrics::inc(&crate::metrics::shared_cdc().persist_errors);
-                        return ((Vec::new(), 0, batch_count, None), false);
+                            crate::metrics::inc(&crate::metrics::shared_cdc().persist_errors);
+                            return ((Vec::new(), 0, batch_count, None), false);
+                        }
+                        return ((to_publish, queued, batch_count, batch_end_lsn), true);
                     }
-                    return ((to_publish, queued, batch_count, batch_end_lsn), true);
-                }
 
-                ((to_publish, 0, batch_count, batch_end_lsn), true)
-            },
-        );
+                    ((to_publish, 0, batch_count, batch_end_lsn), true)
+                },
+            );
 
         if !batch_ok {
             // Nothing was consumed; the events replay next tick — don't

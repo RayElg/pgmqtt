@@ -95,8 +95,17 @@ static HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(8080);
 // The `_PG_init` topology decision, frozen for the postmaster's life.
 // Workers inherit these by fork, so they see the registration-time values
 // regardless of later license/GUC changes.
-static BOOT_MULTIPROCESS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BOOT_MULTIPROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Experimental opt-in for the `pgmqtt_cdc` split, on top of the license
+/// feature: both must hold at `_PG_init`. `Postmaster` context on purpose —
+/// the topology is frozen for the postmaster's life anyway, so a reload
+/// changing this value can only take effect at the next restart.
+static EXPERIMENTAL_MULTIPROCESS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+pub fn get_experimental_multiprocess_guc() -> bool {
+    EXPERIMENTAL_MULTIPROCESS.get()
+}
 
 pub(crate) fn boot_multiprocess() -> bool {
     BOOT_MULTIPROCESS.load(std::sync::atomic::Ordering::Relaxed)
@@ -304,9 +313,12 @@ pub fn get_tls_key_file_guc() -> String {
 /// deadlock.
 pub(crate) const SCHEMA_MIGRATION_LOCK_KEY: i64 = 0x706D71_7400_0001; // arbitrary, "pmqt" + version
 fn ensure_tables_exist() {
-    let _ = pgrx::spi::Spi::run(&format!(
+    // A failed lock must abort the startup DDL: running it unlocked is
+    // exactly the concurrent-worker corruption this lock exists to prevent.
+    pgrx::spi::Spi::run(&format!(
         "SELECT pg_advisory_xact_lock({SCHEMA_MIGRATION_LOCK_KEY})"
-    ));
+    ))
+    .unwrap_or_else(|e| pgrx::error!("pgmqtt: failed to acquire schema migration lock: {}", e));
     init010::init_010();
     init020::init_020();
     init030::init_030();
@@ -1262,6 +1274,14 @@ pub unsafe extern "C" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::SUPERUSER_ONLY,
     );
+    GucRegistry::define_bool_guc(
+        c"pgmqtt.experimental_multiprocess",
+        c"Experimental: run the dedicated pgmqtt_cdc worker when the license has the 'multiprocess' feature (decided at startup; restart to change)",
+        c"",
+        &EXPERIMENTAL_MULTIPROCESS,
+        GucContext::Postmaster,
+        GucFlags::SUPERUSER_ONLY,
+    );
     GucRegistry::define_string_guc(
         c"pgmqtt.database",
         c"Database the MQTT+CDC background worker connects to (default 'postgres'; requires BGW restart)",
@@ -1540,13 +1560,15 @@ pub unsafe extern "C" fn _PG_init() {
     // forks any backend.
     crate::metrics::init_shared();
 
-    // Topology is decided once, here, from the license key GUC — worker
-    // registration is fixed for the postmaster's life, so unlike every
-    // other license feature this needs a full restart to change.
+    // Topology is decided once, here, from two gates read at startup: the
+    // license feature AND the experimental opt-in GUC. Worker registration
+    // is fixed for the postmaster's life, so unlike every other license
+    // feature this needs a full restart to change.
     // Community: one worker, CDC inline. Enterprise 'multiprocess': a
     // separate pgmqtt_cdc worker owns the slot and the DB-only pipelines,
     // so WAL drains and fsyncs never stall socket I/O.
-    let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess);
+    let multiprocess = crate::license::has_feature(crate::license::Feature::MultiProcess)
+        && get_experimental_multiprocess_guc();
     if multiprocess {
         crate::shmem_bridge::init();
     }

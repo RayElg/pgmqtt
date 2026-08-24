@@ -119,8 +119,10 @@ pub fn render(
 
     let mut results = Vec::new();
 
-    for mapping in mappings.iter().filter(|m| m.schema == schema && m.table == table) {
-
+    for mapping in mappings
+        .iter()
+        .filter(|m| m.schema == schema && m.table == table)
+    {
         let topic = match env.render_str(
             &mapping.topic_template,
             context! {

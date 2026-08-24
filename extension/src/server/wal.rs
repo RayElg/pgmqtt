@@ -14,7 +14,10 @@ pub(super) fn read_lsn(expr: &str) -> Option<u64> {
     let query = format!("SELECT {}::text", expr);
     BackgroundWorker::transaction(|| {
         pgrx::spi::Spi::connect(|client| {
-            client.select(&query, None, &[])?.first().get_one::<String>()
+            client
+                .select(&query, None, &[])?
+                .first()
+                .get_one::<String>()
         })
         .ok()
         .flatten()

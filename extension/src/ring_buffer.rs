@@ -139,4 +139,3 @@ pub fn is_table_mapped(schema: &str, table: &str) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .contains(&make_key(schema, table))
 }
-

@@ -2,7 +2,7 @@
 //! are queued in the transaction that persists the rows, so the handoff is
 //! as durable as the messages themselves.
 
-use super::{cdc_worker, MqttMessage, MqttClient, SessionDbAction};
+use super::{cdc_worker, MqttClient, MqttMessage, SessionDbAction};
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::log;
 use std::collections::HashMap;

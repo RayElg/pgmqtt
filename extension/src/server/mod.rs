@@ -14,10 +14,12 @@ use crate::inbound_map;
 use crate::mqtt;
 use crate::subscriptions;
 pub use cdc_worker::run_cdc;
-pub use db_action::{execute_session_db_actions, execute_session_db_actions_async, SessionDbAction};
+pub use db_action::{
+    execute_session_db_actions, execute_session_db_actions_async, SessionDbAction,
+};
+use publish::{publish_messages_batch, publish_messages_batch_deferred, PendingPublish};
 pub use session::{with_sessions, MqttMessage, MqttSession};
 pub use transport::Transport;
-use publish::{publish_messages_batch, publish_messages_batch_deferred, PendingPublish};
 
 use crate::websocket;
 use pgrx::bgworkers::BackgroundWorker;
@@ -668,7 +670,10 @@ fn execute_inbound_writes(writes: Vec<inbound_map::PendingInboundWrite>, synchro
     let ok_count = total - err_count;
     if ok_count > 0 {
         log!("pgmqtt inbound: committed {} writes", ok_count);
-        crate::metrics::add(&crate::metrics::shared_cdc().inbound_writes_ok, ok_count as u64);
+        crate::metrics::add(
+            &crate::metrics::shared_cdc().inbound_writes_ok,
+            ok_count as u64,
+        );
     }
     if err_count > 0 {
         log!("pgmqtt inbound: {} writes failed", err_count);
@@ -1297,9 +1302,13 @@ fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
         crate::statements::prepare_hot_path_statements();
     });
 
-    let Ok(mqtt_listener) =
-        topology::bind(ports.mqtt_enabled, ports.mqtt_port, "pgmqtt mqtt", "TCP", "raw TCP")
-    else {
+    let Ok(mqtt_listener) = topology::bind(
+        ports.mqtt_enabled,
+        ports.mqtt_port,
+        "pgmqtt mqtt",
+        "TCP",
+        "raw TCP",
+    ) else {
         return;
     };
     let Ok(ws_listener) = topology::bind(
@@ -1311,14 +1320,22 @@ fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
     ) else {
         return;
     };
-    let Ok(mqtts_listener) =
-        topology::bind(ports.mqtts_enabled, ports.mqtts_port, "pgmqtt mqtts", "TLS", "TLS")
-    else {
+    let Ok(mqtts_listener) = topology::bind(
+        ports.mqtts_enabled,
+        ports.mqtts_port,
+        "pgmqtt mqtts",
+        "TLS",
+        "TLS",
+    ) else {
         return;
     };
-    let Ok(wss_listener) =
-        topology::bind(ports.wss_enabled, ports.wss_port, "pgmqtt wss", "WSS", "WSS")
-    else {
+    let Ok(wss_listener) = topology::bind(
+        ports.wss_enabled,
+        ports.wss_port,
+        "pgmqtt wss",
+        "WSS",
+        "WSS",
+    ) else {
         return;
     };
     let Ok(http_listener) = topology::bind(
@@ -2715,9 +2732,7 @@ fn prune_offline_role_sessions(
 ) {
     let offline: Vec<(String, String)> = with_sessions(|s| {
         s.iter()
-            .filter(|(id, _)| {
-                !clients.contains_key(*id) && target.is_none_or(|t| t == id.as_str())
-            })
+            .filter(|(id, _)| !clients.contains_key(*id) && target.is_none_or(|t| t == id.as_str()))
             .filter_map(|(id, sess)| {
                 sess.auth_principal
                     .strip_prefix("role:")
@@ -2727,7 +2742,10 @@ fn prune_offline_role_sessions(
     });
     if offline.is_empty() {
         if let Some(t) = target {
-            log!("pgmqtt admin: reload_acls '{}': no such client or session", t);
+            log!(
+                "pgmqtt admin: reload_acls '{}': no such client or session",
+                t
+            );
         }
         return;
     }
@@ -3749,9 +3767,8 @@ fn deliver_messages(
                 // "matched but nothing queued" — granted QoS 0, queue cap,
                 // vanished session. The reclaim itself is NOT EXISTS-guarded,
                 // so retained / inbound-pending / outbox rows still survive.
-                session_db_actions.push(SessionDbAction::CleanupOrphanedMessage {
-                    message_id: msg_id,
-                });
+                session_db_actions
+                    .push(SessionDbAction::CleanupOrphanedMessage { message_id: msg_id });
             } else {
                 session_db_actions.push(SessionDbAction::InsertMessageBatch {
                     message_id: msg_id,

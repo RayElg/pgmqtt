@@ -2,8 +2,7 @@
 //! client-visible effects on the WAL flush pointer after an async commit.
 
 use super::{
-    db_action, deliver_messages, latch_interval, wal, MqttClient,
-    MqttMessage, SessionDbAction,
+    db_action, deliver_messages, latch_interval, wal, MqttClient, MqttMessage, SessionDbAction,
 };
 use crate::mqtt;
 use pgrx::log;
@@ -23,9 +22,7 @@ pub(super) struct PendingPublish {
     pub(super) inbound_mappings: Vec<Arc<str>>,
 }
 
-fn split_publishes(
-    pending: Vec<PendingPublish>,
-) -> (Vec<PendingPublish>, Vec<PendingPublish>) {
+fn split_publishes(pending: Vec<PendingPublish>) -> (Vec<PendingPublish>, Vec<PendingPublish>) {
     let mut persistent = Vec::new();
     let mut transient = Vec::new();
     for p in pending {
@@ -168,23 +165,13 @@ fn persist_publish_batch(
                         }
                     }
                     if p.qos > 0 {
-                        let msg_id = db_action::persist_message(
-                            client,
-                            &p.topic,
-                            &p.payload,
-                            p.qos,
-                            false,
-                        )?;
+                        let msg_id =
+                            db_action::persist_message(client, &p.topic, &p.payload, p.qos, false)?;
                         msg_id_opt = Some(msg_id);
                     }
                 } else {
-                    let msg_id = db_action::persist_message(
-                        client,
-                        &p.topic,
-                        &p.payload,
-                        p.qos,
-                        p.retain,
-                    )?;
+                    let msg_id =
+                        db_action::persist_message(client, &p.topic, &p.payload, p.qos, p.retain)?;
                     msg_id_opt = Some(msg_id);
 
                     if p.retain {
@@ -436,7 +423,12 @@ impl DeferredQueue {
         }
         let mut cascade = Vec::new();
         for released in self.queue.drain(..) {
-            deliver_messages(&released.messages, clients, &mut cascade, session_db_actions);
+            deliver_messages(
+                &released.messages,
+                clients,
+                &mut cascade,
+                session_db_actions,
+            );
             if flushed {
                 for (client_id, pid) in released.pubacks {
                     send_puback(clients, &client_id, pid);

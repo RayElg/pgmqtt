@@ -29,9 +29,13 @@ pub enum Feature {
     /// Split CDC slot consumption into a separate `pgmqtt_cdc` background
     /// worker process, bridged to `pgmqtt_mqtt` via shared memory
     /// (`crate::shmem_bridge`), instead of one combined process. Checked
-    /// once at `_PG_init` (decides which BGWs get registered) and again by
-    /// `pgmqtt_mqtt_worker_main` at its own startup — both reads see the
-    /// same GUC snapshot from the same postmaster boot, see lib.rs.
+    /// once at `_PG_init`, which decides which BGWs get registered and
+    /// freezes the decision for the postmaster's life
+    /// (`lib.rs::BOOT_MULTIPROCESS`): the license feature AND the
+    /// `pgmqtt.experimental_multiprocess` opt-in must both hold. Workers
+    /// inherit the decision through fork instead of re-reading either
+    /// gate, so adding or removing the feature requires a full PostgreSQL
+    /// restart.
     MultiProcess,
 }
 
@@ -240,4 +244,3 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, ()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-

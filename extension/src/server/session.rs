@@ -115,7 +115,6 @@ impl MqttSession {
     }
 }
 
-
 /// Global session store: client_id → MqttSession.
 /// Lazily initialized on first use via with_sessions().
 static SESSIONS: Mutex<Option<HashMap<String, MqttSession>>> = Mutex::new(None);

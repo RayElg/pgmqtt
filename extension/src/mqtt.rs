@@ -802,7 +802,13 @@ pub fn build_connack_with_max_packet(
     v5: bool,
     server_max_packet_size: Option<u32>,
 ) -> Vec<u8> {
-    build_connack_with_props(session_present, reason_code, v5, server_max_packet_size, None)
+    build_connack_with_props(
+        session_present,
+        reason_code,
+        v5,
+        server_max_packet_size,
+        None,
+    )
 }
 
 pub fn build_connack_with_props(

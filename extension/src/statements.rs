@@ -63,10 +63,12 @@ pub fn prepare_hot_path_statements() {
                 // An outbox row IS a reference: session_messages rows only
                 // appear at delivery, so between the CDC worker's enqueue
                 // and the mqtt worker's drain nothing else keeps the message
-                // alive — and cleanup can run in either process (inbound
-                // completion in pgmqtt_cdc, delivery/retain in pgmqtt_mqtt).
-                // The drain deletes the outbox row in the same transaction
-                // that inserts the delivery rows, so there is no gap.
+                // alive. The drain deletes the outbox row in the same
+                // transaction that inserts the delivery rows, so there is
+                // no gap.
+                //
+                // RETURNING lets cleanup_orphaned_message tell "reclaimed"
+                // from "still referenced" without a second query.
                 "DELETE FROM pgmqtt_messages \
                  WHERE id = $1 \
                    AND NOT EXISTS \
@@ -76,7 +78,8 @@ pub fn prepare_hot_path_statements() {
                    AND NOT EXISTS \
                      (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1) \
                    AND NOT EXISTS \
-                     (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1)",
+                     (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1) \
+                 RETURNING true",
                 &[PgOid::from_untagged(pgrx::pg_sys::INT8OID)],
             )?
             .keep();

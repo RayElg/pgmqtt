@@ -28,7 +28,11 @@ pub fn persist_message(
     qos: u8,
     retain: bool,
 ) -> Result<i64, spi::Error> {
-    let payload_arg: Option<&[u8]> = if payload.is_empty() { None } else { Some(payload) };
+    let payload_arg: Option<&[u8]> = if payload.is_empty() {
+        None
+    } else {
+        Some(payload)
+    };
     let spi_args: Vec<DatumWithOid> = vec![
         topic.into(),
         payload_arg.into(),
@@ -49,21 +53,27 @@ pub fn persist_message(
     Err(spi::Error::SpiError(spi::SpiErrorCodes::NoAttribute))
 }
 
-/// Delete a message from `pgmqtt_messages` if it has no remaining references
-/// (no session_messages, no inbound_pending) and is not retained.
+/// Reclaim a message from `pgmqtt_messages` once nothing references it
+/// (no session_messages, no retained row, no outbox row, no unconsumed
+/// inbound_pending entry).
 ///
 /// Safe to call unconditionally — does nothing if references still exist.
+/// A row whose only remaining reference is a not-yet-consumed
+/// `pgmqtt_inbound_pending` entry is parked in [`DEFERRED_RECLAIMS`] for a
+/// retry on a later batch instead of being orphaned: every caller of this
+/// function can race the pump that terminates that pending row (across
+/// processes in the multiprocess topology, or by action ordering within one
+/// tick), and after the pump is done nothing else revisits the id.
 pub fn cleanup_orphaned_message(
     client: &mut spi::SpiClient<'_>,
     message_id: i64,
 ) -> Result<(), spi::Error> {
     let args: Vec<DatumWithOid> = vec![message_id.into()];
-    let result = match crate::statements::with_plans(|p| {
-        client.update(&p.del_orphan_msg, None, &args)
-    }) {
-        Some(r) => r,
-        None => client.update(
-            "DELETE FROM pgmqtt_messages \
+    let result =
+        match crate::statements::with_plans(|p| client.update(&p.del_orphan_msg, None, &args)) {
+            Some(r) => r,
+            None => client.update(
+                "DELETE FROM pgmqtt_messages \
              WHERE id = $1 \
                AND NOT EXISTS \
                  (SELECT 1 FROM pgmqtt_session_messages WHERE message_id = $1) \
@@ -72,13 +82,48 @@ pub fn cleanup_orphaned_message(
                AND NOT EXISTS \
                  (SELECT 1 FROM pgmqtt_retained WHERE message_id = $1) \
                AND NOT EXISTS \
-                 (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1)",
+                 (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1) \
+             RETURNING true",
+                None,
+                &args,
+            ),
+        };
+    if !result?.is_empty() {
+        return Ok(());
+    }
+
+    // The row survived. Legitimate while fan-out keeps it referenced via
+    // session_messages until ACKs land (those ACKs carry their own reclaim),
+    // or while a retained/outbox row exists. The one case nothing follows up
+    // on is a lone inbound_pending reference — defer rather than orphan.
+    let blocked_by_pending_only: bool = client
+        .select(
+            "SELECT EXISTS (SELECT 1 FROM pgmqtt_messages WHERE id = $1) \
+             AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages \
+                            WHERE message_id = $1) \
+             AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained \
+                            WHERE message_id = $1) \
+             AND NOT EXISTS (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1) \
+             AND EXISTS (SELECT 1 FROM pgmqtt_inbound_pending \
+                         WHERE message_id = $1)",
             None,
             &args,
-        ),
-    };
-    result?;
+        )?
+        .first()
+        .get_one::<bool>()?
+        .unwrap_or(false);
+    if blocked_by_pending_only {
+        defer_reclaim(message_id);
+    }
     Ok(())
+}
+
+/// Queue an id for a reclaim retry on a later batch (see [`DEFERRED_RECLAIMS`]).
+fn defer_reclaim(message_id: i64) {
+    let mut queue = DEFERRED_RECLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    if queue.len() < DEFERRED_RECLAIMS_CAP && !queue.contains(&message_id) {
+        queue.push(message_id);
+    }
 }
 
 /// Batched database operation: insert/update/delete session, message, or subscription.
@@ -93,13 +138,9 @@ pub enum SessionDbAction {
         auth_principal: String,
     },
     /// Mark a session as disconnected (set disconnected_at = now).
-    MarkDisconnected {
-        client_id: String,
-    },
+    MarkDisconnected { client_id: String },
     /// Delete a session and cascade-delete its messages.
-    DeleteSession {
-        client_id: String,
-    },
+    DeleteSession { client_id: String },
     /// Batch insert multiple session_messages rows for the same message_id (one per client).
     InsertMessageBatch {
         message_id: i64,
@@ -112,10 +153,7 @@ pub enum SessionDbAction {
         packet_id: u16,
     },
     /// Delete a message row (client ACKed QoS 1).
-    DeleteMessage {
-        client_id: String,
-        message_id: i64,
-    },
+    DeleteMessage { client_id: String, message_id: i64 },
     /// Insert a subscription row.
     InsertSubscription {
         client_id: String,
@@ -130,14 +168,10 @@ pub enum SessionDbAction {
     /// Reclaim a persisted message with no subscribers at delivery time
     /// (no-op while still referenced; retried later when the only reference
     /// is a not-yet-consumed inbound_pending row — see DEFERRED_RECLAIMS).
-    CleanupOrphanedMessage {
-        message_id: i64,
-    },
+    CleanupOrphanedMessage { message_id: i64 },
     /// Dequeue delivered outbox ids — commits with the delivery state, so
     /// an uncommitted tick re-delivers.
-    DrainCdcOutbox {
-        ids: Vec<i64>,
-    },
+    DrainCdcOutbox { ids: Vec<i64> },
 }
 
 /// Execute all queued DB actions in one transaction. The batch runs in one
@@ -211,7 +245,10 @@ fn execute_session_db_actions_inner(actions: Vec<SessionDbAction>, synchronous: 
             if one.is_err() {
                 dropped += 1;
                 crate::metrics::inc(action_error_metric(&m, action));
-                pgrx::log!("pgmqtt: dropped DB action after batch failure: {:?}", action);
+                pgrx::log!(
+                    "pgmqtt: dropped DB action after batch failure: {:?}",
+                    action
+                );
             }
         }
         pgrx::log!(
@@ -236,8 +273,9 @@ fn action_error_metric<'a>(
         SessionDbAction::UpsertSession { .. }
         | SessionDbAction::MarkDisconnected { .. }
         | SessionDbAction::DeleteSession { .. } => &m.db_session_errors,
-        SessionDbAction::InsertSubscription { .. }
-        | SessionDbAction::DeleteSubscription { .. } => &m.db_subscription_errors,
+        SessionDbAction::InsertSubscription { .. } | SessionDbAction::DeleteSubscription { .. } => {
+            &m.db_subscription_errors
+        }
         _ => &m.db_message_errors,
     }
 }
@@ -285,7 +323,11 @@ fn apply_action(
         }
         SessionDbAction::DeleteSession { client_id } => {
             let args: Vec<DatumWithOid> = vec![client_id.as_str().into()];
-            client.update("DELETE FROM pgmqtt_sessions WHERE client_id = $1", None, &args)?;
+            client.update(
+                "DELETE FROM pgmqtt_sessions WHERE client_id = $1",
+                None,
+                &args,
+            )?;
             // CASCADE on pgmqtt_sessions deletes this client's pgmqtt_session_messages
             // rows. Messages that now have no remaining session_messages are cleaned up
             // by the DeleteMessage action when each subscriber ACKs. A global sweep
@@ -299,9 +341,8 @@ fn apply_action(
                 let pid_arg = packet_id.map(|p| p as i32);
                 let args: Vec<DatumWithOid> =
                     vec![(*message_id).into(), cid.as_str().into(), pid_arg.into()];
-                match crate::statements::with_plans(|p| {
-                    client.update(&p.ins_sess_msg, None, &args)
-                }) {
+                match crate::statements::with_plans(|p| client.update(&p.ins_sess_msg, None, &args))
+                {
                     Some(r) => r,
                     None => client.update(
                         "INSERT INTO pgmqtt_session_messages \
@@ -340,8 +381,7 @@ fn apply_action(
             client_id,
             message_id,
         } => {
-            let del_args: Vec<DatumWithOid> =
-                vec![client_id.as_str().into(), (*message_id).into()];
+            let del_args: Vec<DatumWithOid> = vec![client_id.as_str().into(), (*message_id).into()];
             match crate::statements::with_plans(|p| client.update(&p.del_sess_msg, None, &del_args))
             {
                 Some(r) => r,
@@ -387,35 +427,6 @@ fn apply_action(
         }
         SessionDbAction::CleanupOrphanedMessage { message_id } => {
             cleanup_orphaned_message(client, *message_id)?;
-            // A surviving row is usually legitimate: fan-out keeps it
-            // referenced via session_messages until ACKs land, and those
-            // ACKs carry their own reclaim. The one case nothing follows up
-            // on is a lone inbound_pending reference — this action raced the
-            // CDC worker's pump (multiprocess) or simply ran first in the
-            // same tick. Defer rather than orphan the row.
-            let blocked_by_pending_only: bool = client
-                .select(
-                    "SELECT EXISTS (SELECT 1 FROM pgmqtt_messages WHERE id = $1) \
-                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_session_messages \
-                                    WHERE message_id = $1) \
-                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_retained \
-                                    WHERE message_id = $1) \
-                     AND NOT EXISTS (SELECT 1 FROM pgmqtt_cdc_outbox WHERE id = $1) \
-                     AND EXISTS (SELECT 1 FROM pgmqtt_inbound_pending \
-                                 WHERE message_id = $1)",
-                    None,
-                    &[(*message_id).into()],
-                )?
-                .first()
-                .get_one::<bool>()?
-                .unwrap_or(false);
-            if blocked_by_pending_only {
-                let mut queue =
-                    DEFERRED_RECLAIMS.lock().unwrap_or_else(|p| p.into_inner());
-                if queue.len() < DEFERRED_RECLAIMS_CAP && !queue.contains(message_id) {
-                    queue.push(*message_id);
-                }
-            }
         }
         SessionDbAction::DrainCdcOutbox { ids } => {
             let args: Vec<DatumWithOid> = vec![ids.clone().into()];

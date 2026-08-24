@@ -334,7 +334,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 
 ## Multi-Process CDC
 
-Requires an enterprise license with the `multiprocess` feature, present **at PostgreSQL startup**.
+Requires an enterprise license with the `multiprocess` feature **and** the experimental opt-in `pgmqtt.experimental_multiprocess = on`, both present **at PostgreSQL startup** (e.g. on the `postgres` command line or in `postgresql.conf` before boot). Either gate alone boots the combined single-process broker; both are read once while the server starts — background workers can only be registered then — so changing either requires a full PostgreSQL restart.
 
 ### Overview
 
@@ -360,7 +360,7 @@ Inline-ring drops increment the `cdc_bridge_dropped` counter (see [Observability
 
 ### Asynchronous group commit
 
-PIn the multiprocess topology, `pgmqtt_mqtt` commits its write transactions (client QoS 1 publish persistence, retained-message updates, session bookkeeping, QoS 0 inbound writes) with `synchronous_commit = off`, so the socket loop never waits on an fsync. **Durability guarantees are unchanged**: client-visible effects — the PUBACK to the publisher and QoS ≥ 1 delivery to subscribers — are deferred until `pg_current_wal_flush_lsn()` passes the transaction's commit record, i.e. until the write is physically on disk, exactly the same point at which the single-process broker sends them.
+In the multiprocess topology, `pgmqtt_mqtt` commits its write transactions (client QoS 1 publish persistence, retained-message updates, session bookkeeping, QoS 0 inbound writes) with `synchronous_commit = off`, so the socket loop never waits on an fsync. **Durability guarantees are unchanged**: client-visible effects — the PUBACK to the publisher and QoS ≥ 1 delivery to subscribers — are deferred until `pg_current_wal_flush_lsn()` passes the transaction's commit record, i.e. until the write is physically on disk, exactly the same point at which the single-process broker sends them.
 
 The WAL flush itself is driven from off the socket loop: under CDC or inbound load, the `pgmqtt_cdc` worker's own synchronous commits advance the flush pointer for free (group commit); when nothing else is flushing, `pgmqtt_mqtt` signals `pgmqtt_cdc` through shared memory and it issues one small synchronous commit that flushes everything at once. If a deferred batch outlives that round trip (~4 ticks — e.g. the CDC worker is restarting), `pgmqtt_mqtt` pays one synchronous flush itself, so the worst case is bounded at roughly the pre-split behavior. In practice a QoS 1 PUBACK arrives typically 1–3 ticks after the publish (see [limitations.md](limitations.md)), and one fsync covers every write from every pipeline in that window rather than each transaction paying its own.
 

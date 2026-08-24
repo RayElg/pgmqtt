@@ -137,7 +137,11 @@ pub(crate) fn resume_session_origin() {
         pgrx::spi::Spi::connect_mut(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = vec![name.as_str().into()];
             client
-                .update("SELECT pg_replication_origin_session_setup($1)", None, &args)
+                .update(
+                    "SELECT pg_replication_origin_session_setup($1)",
+                    None,
+                    &args,
+                )
                 .map(|_| ())
         })
         .is_ok()
@@ -145,6 +149,9 @@ pub(crate) fn resume_session_origin() {
     if ok {
         SESSION_ORIGIN_SUSPENDED.store(false, Ordering::Relaxed);
     } else {
-        log!("pgmqtt: failed to re-attach replication origin '{}' — will retry", name);
+        log!(
+            "pgmqtt: failed to re-attach replication origin '{}' — will retry",
+            name
+        );
     }
 }
