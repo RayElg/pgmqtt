@@ -413,12 +413,19 @@ pgmqtt_disconnect_client(
 
 Returns the inserted command row's `id`. Execution is asynchronous: the BGW drains the queue on a fixed ~100 ms cadence. The Will message, if any, fires — except when the client's current `pub_claims` / `pgmqtt_acls` no longer cover the Will topic (e.g. after a `pgmqtt_reload_acls`), in which case it is silently dropped.
 
-The default `reason_code` is `0x87` (NOT_AUTHORIZED). Pass a different MQTT 5 reason code per [§3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208) if needed (e.g. `0x8E` SESSION_TAKEN_OVER). MQTT 3.1.1 has no server→client DISCONNECT packet, so 3.1.1 clients see the socket close without a reason code.
+The default `reason_code` is `0x87` (NOT_AUTHORIZED). Pass a different MQTT 5 reason code per [§3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208) if needed. MQTT 3.1.1 has no server→client DISCONNECT packet, so 3.1.1 clients see the socket close without a reason code.
+
+Every reason code except `0x8E` is a pass-through: the client is disconnected and its durable session is retained per the session expiry interval it connected with.
+
+⚠️ **`0x8E` (SESSION_TAKEN_OVER) additionally discards the session.** The subscriptions and any queued QoS 1 messages are deleted from memory and from `pgmqtt_sessions` / `pgmqtt_subscriptions` / `pgmqtt_session_messages`, regardless of the session expiry interval. This is irreversible — the client's next CONNECT gets `session_present = false` and nothing queued for it while offline is redelivered. It applies to a client that is currently offline but still durable, so it can be used to discard an abandoned session without waiting for expiry. Use any other reason code to kick a client without destroying its session.
 
 **Example:**
 ```sql
 -- Compromised device — kick now, rotate password elsewhere.
 SELECT pgmqtt_disconnect_client('device-42');
+
+-- Abandoned session — kick and discard the queued backlog.
+SELECT pgmqtt_disconnect_client('device-42', 142);  -- 0x8E
 ```
 
 ---
@@ -437,7 +444,7 @@ pgmqtt_disconnect_role(
 
 Returns the inserted command row's `id`. Anonymous and JWT-authenticated clients are unaffected.
 
-Kicked clients with a persistent session (`session_expiry_interval > 0`) keep their session and subscriptions. On reconnect, persisted subscriptions are re-validated against the role's *current* `pgmqtt_acls` and any rows no longer covered are pruned. If you want to fully expire the session as well, also delete the row from `pgmqtt_sessions`.
+Kicked clients with a persistent session (`session_expiry_interval > 0`) keep their session and subscriptions — including under `0x8E`, which is a plain pass-through here and does *not* discard sessions the way `pgmqtt_disconnect_client` does. On reconnect, persisted subscriptions are re-validated against the role's *current* `pgmqtt_acls` and any rows no longer covered are pruned. If you want to fully expire the sessions as well, delete the rows from `pgmqtt_sessions`, or call `pgmqtt_disconnect_client(id, 142)` per client.
 
 **Example:**
 ```sql

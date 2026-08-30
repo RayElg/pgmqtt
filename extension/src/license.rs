@@ -26,6 +26,17 @@ pub enum Feature {
     Jwt,
     Metrics,
     Acl,
+    /// Split CDC slot consumption into a separate `pgmqtt_cdc` background
+    /// worker process, bridged to `pgmqtt_mqtt` via shared memory
+    /// (`crate::shmem_bridge`), instead of one combined process. Checked
+    /// once at `_PG_init`, which decides which BGWs get registered and
+    /// freezes the decision for the postmaster's life
+    /// (`lib.rs::BOOT_MULTIPROCESS`): the license feature AND the
+    /// `pgmqtt.experimental_multiprocess` opt-in must both hold. Workers
+    /// inherit the decision through fork instead of re-reading either
+    /// gate, so adding or removing the feature requires a full PostgreSQL
+    /// restart.
+    MultiProcess,
 }
 
 impl Feature {
@@ -35,6 +46,7 @@ impl Feature {
             Feature::Jwt => "jwt",
             Feature::Metrics => "metrics",
             Feature::Acl => "acl",
+            Feature::MultiProcess => "multiprocess",
         }
     }
 }
@@ -82,7 +94,7 @@ fn active_public_key() -> &'static [u8; 32] {
 }
 
 /// Known feature names for validation.
-const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "acl"];
+const KNOWN_FEATURES: &[&str] = &["tls", "jwt", "metrics", "acl", "multiprocess"];
 
 fn validate_license_with_key(token: &str, pubkey_bytes: &[u8; 32]) -> LicenseStatus {
     let token = token.trim();
@@ -232,4 +244,3 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, ()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-

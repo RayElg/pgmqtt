@@ -34,6 +34,12 @@ pub struct MqttSession {
     pub receive_maximum: u16,
     /// Sum of queued payload bytes; gated on `pgmqtt.max_queue_bytes_per_client`.
     pub queue_bytes: usize,
+    /// Authenticated principal that owns this session ("role:{name}",
+    /// "jwt:...", or "anon"). A CONNECT reusing the client_id under a
+    /// *different* principal must not resume this session — its queued and
+    /// inflight payloads belong to the previous identity. "" marks a
+    /// pre-upgrade session (resumable once, then stamped).
+    pub auth_principal: String,
 }
 
 impl MqttSession {
@@ -47,6 +53,7 @@ impl MqttSession {
             disconnected_at: None,
             receive_maximum: 65535,
             queue_bytes: 0,
+            auth_principal: String::new(),
         }
     }
 
@@ -107,7 +114,6 @@ impl MqttSession {
             .collect()
     }
 }
-
 
 /// Global session store: client_id → MqttSession.
 /// Lazily initialized on first use via with_sessions().

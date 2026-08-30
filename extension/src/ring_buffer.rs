@@ -54,7 +54,7 @@ impl RingBuffer {
         if cap > 0 && self.buf.len() >= cap {
             self.buf.pop_front();
             self.dropped += 1;
-            crate::metrics::inc(&crate::metrics::get().cdc_ring_buffer_dropped);
+            crate::metrics::inc(&crate::metrics::shared_cdc().ring_buffer_dropped);
             if self.dropped % 100 == 1 {
                 pgrx::log!(
                     "pgmqtt CDC ring buffer at cap {} — dropped {} events \
@@ -139,4 +139,3 @@ pub fn is_table_mapped(schema: &str, table: &str) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .contains(&make_key(schema, table))
 }
-

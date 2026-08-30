@@ -140,11 +140,16 @@ impl TrieNode {
                 self.hash_subscribers.insert(client_id.to_string(), qos);
             }
             "+" => {
-                let child = self.plus_child.get_or_insert_with(|| Box::new(TrieNode::new()));
+                let child = self
+                    .plus_child
+                    .get_or_insert_with(|| Box::new(TrieNode::new()));
                 child.insert(&segments[1..], client_id, qos);
             }
             seg => {
-                let child = self.children.entry(seg.to_string()).or_insert_with(TrieNode::new);
+                let child = self
+                    .children
+                    .entry(seg.to_string())
+                    .or_insert_with(TrieNode::new);
                 child.insert(&segments[1..], client_id, qos);
             }
         }
@@ -195,14 +200,18 @@ impl TrieNode {
         if !is_dollar {
             for (cid, qos) in &self.hash_subscribers {
                 let e = results.entry(cid.clone()).or_insert(*qos);
-                if *qos > *e { *e = *qos; }
+                if *qos > *e {
+                    *e = *qos;
+                }
             }
         }
 
         if segments.is_empty() {
             for (cid, qos) in &self.subscribers {
                 let e = results.entry(cid.clone()).or_insert(*qos);
-                if *qos > *e { *e = *qos; }
+                if *qos > *e {
+                    *e = *qos;
+                }
             }
             return;
         }
@@ -234,11 +243,15 @@ impl TrieNode {
         let seg = segments[0];
         let rest = &segments[1..];
         if let Some(child) = self.children.get(seg) {
-            if child.has_match(rest, false) { return true; }
+            if child.has_match(rest, false) {
+                return true;
+            }
         }
         if !is_dollar {
             if let Some(child) = &self.plus_child {
-                if child.has_match(rest, false) { return true; }
+                if child.has_match(rest, false) {
+                    return true;
+                }
             }
         }
         false
@@ -247,17 +260,33 @@ impl TrieNode {
     /// Collect all active filter strings (for diagnostics).
     fn collect_filters(&self, prefix: &str, out: &mut Vec<String>) {
         if !self.subscribers.is_empty() {
-            out.push(if prefix.is_empty() { String::new() } else { prefix.to_string() });
+            out.push(if prefix.is_empty() {
+                String::new()
+            } else {
+                prefix.to_string()
+            });
         }
         if !self.hash_subscribers.is_empty() {
-            out.push(if prefix.is_empty() { "#".to_string() } else { format!("{prefix}/#") });
+            out.push(if prefix.is_empty() {
+                "#".to_string()
+            } else {
+                format!("{prefix}/#")
+            });
         }
         for (seg, child) in &self.children {
-            let next = if prefix.is_empty() { seg.clone() } else { format!("{prefix}/{seg}") };
+            let next = if prefix.is_empty() {
+                seg.clone()
+            } else {
+                format!("{prefix}/{seg}")
+            };
             child.collect_filters(&next, out);
         }
         if let Some(child) = &self.plus_child {
-            let next = if prefix.is_empty() { "+".to_string() } else { format!("{prefix}/+") };
+            let next = if prefix.is_empty() {
+                "+".to_string()
+            } else {
+                format!("{prefix}/+")
+            };
             child.collect_filters(&next, out);
         }
     }
@@ -407,7 +436,8 @@ pub fn client_filters(client_id: &str) -> Vec<String> {
 /// Return subscription counts for all clients in a single lock acquisition.
 pub fn subscription_counts() -> std::collections::HashMap<String, usize> {
     with_state(|state| {
-        state.client_to_filters
+        state
+            .client_to_filters
             .iter()
             .map(|(id, filters)| (id.clone(), filters.len()))
             .collect()
@@ -455,37 +485,32 @@ pub fn has_subscribers(topic: &str) -> bool {
     })
 }
 
-/// Find all client IDs whose topic filters match a concrete topic, with their granted QoS.
-///
-/// For regular subscriptions: returns all matching clients (deduped, highest QoS wins).
-/// For shared subscriptions: returns exactly one client per matching group (round-robin,
-/// preferring connected clients).
-///
-/// `connected_clients` is the set of currently-connected client IDs, used to prefer
-/// online members when selecting from a shared group.
-pub fn match_topic(topic: &str, connected_clients: &HashSet<String>) -> Vec<(String, u8)> {
+/// Find all client IDs whose topic filters match a concrete topic, with
+/// their granted QoS. Regular matches come back deduped (highest QoS wins);
+/// shared-group picks are kept separate as `(group_filter, member_id, qos)`
+/// — one member per matching group, round-robin preferring members in
+/// `connected_clients` — because a shared subscription delivers each message
+/// to exactly one member of the group. Advances the groups' round-robin state.
+pub fn match_topic_split(
+    topic: &str,
+    connected_clients: &HashSet<String>,
+) -> (Vec<(String, u8)>, Vec<(String, String, u8)>) {
     with_state(|state| {
         let mut matched: HashMap<String, u8> = HashMap::new();
-
-        // Regular subscriptions via trie.
         let segments: Vec<&str> = topic.split('/').collect();
         let is_dollar = topic.starts_with('$');
         state.trie.match_topic(&segments, is_dollar, &mut matched);
 
-        // Shared subscriptions: one client per matching group (linear scan
-        // is fine — shared groups are typically few).
-        for sg in state.shared_groups.values() {
+        let mut shared = Vec::new();
+        for (group_filter, sg) in state.shared_groups.iter() {
             if mqtt::topic_matches_filter(topic, &sg.filter) {
                 if let Some((cid, qos)) = sg.next_member(|c| connected_clients.contains(c)) {
-                    let entry = matched.entry(cid).or_insert(qos);
-                    if qos > *entry {
-                        *entry = qos;
-                    }
+                    shared.push((group_filter.to_string(), cid, qos));
                 }
             }
         }
 
-        matched.into_iter().collect()
+        (matched.into_iter().collect(), shared)
     })
 }
 
@@ -514,18 +539,12 @@ mod tests {
             parse_shared_filter("$share/group1/sensor/+/data"),
             Some(("group1", "sensor/+/data"))
         );
-        assert_eq!(
-            parse_shared_filter("$share/g/topic"),
-            Some(("g", "topic"))
-        );
+        assert_eq!(parse_shared_filter("$share/g/topic"), Some(("g", "topic")));
         assert_eq!(
             parse_shared_filter("$share/mygroup/a/b/c"),
             Some(("mygroup", "a/b/c"))
         );
-        assert_eq!(
-            parse_shared_filter("$share/g/#"),
-            Some(("g", "#"))
-        );
+        assert_eq!(parse_shared_filter("$share/g/#"), Some(("g", "#")));
 
         // Invalid: empty group name.
         assert_eq!(parse_shared_filter("$share//topic"), None);

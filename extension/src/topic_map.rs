@@ -119,8 +119,10 @@ pub fn render(
 
     let mut results = Vec::new();
 
-    for mapping in mappings.iter().filter(|m| m.schema == schema && m.table == table) {
-
+    for mapping in mappings
+        .iter()
+        .filter(|m| m.schema == schema && m.table == table)
+    {
         let topic = match env.render_str(
             &mapping.topic_template,
             context! {
@@ -137,7 +139,7 @@ pub fn render(
                     mapping.name,
                     e
                 );
-                crate::metrics::inc(&crate::metrics::get().cdc_render_errors);
+                crate::metrics::inc(&crate::metrics::shared_cdc().render_errors);
                 continue;
             }
         };
@@ -158,7 +160,7 @@ pub fn render(
                     mapping.name,
                     e
                 );
-                crate::metrics::inc(&crate::metrics::get().cdc_render_errors);
+                crate::metrics::inc(&crate::metrics::shared_cdc().render_errors);
                 continue;
             }
         };

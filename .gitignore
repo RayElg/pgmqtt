@@ -19,3 +19,6 @@ venv/
 # Profiling artifacts
 tools/profiling/out/
 tools/profiling/FlameGraph/
+
+# Benchmark artifacts (raw sweep output; large, machine-specific)
+tools/benchmark/results/
