@@ -39,6 +39,34 @@ fn latch_interval() -> Duration {
     Duration::from_millis(crate::get_tick_interval_ms_guc() as u64)
 }
 
+/// Flushes this worker's pending table statistics, which autovacuum reads.
+///
+/// Background workers do not run the `PostgresMain` idle loop that does this for regular
+/// backends. `force = false` flushes at most once per second without waiting on stats
+/// locks; a forced flush every 10 s covers counts left pending by an idle worker. Must be
+/// called outside a transaction.
+pub(crate) fn report_stats() {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    const IDLE_INTERVAL: Duration = Duration::from_secs(10);
+    thread_local! {
+        static LAST_FORCED: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    let now = Instant::now();
+    let force = LAST_FORCED.with(|last| match last.get() {
+        Some(t) if now.duration_since(t) < IDLE_INTERVAL => false,
+        _ => {
+            last.set(Some(now));
+            true
+        }
+    });
+    unsafe {
+        pgrx::pg_sys::pgstat_report_stat(force);
+    }
+}
+
 /// Timeout for HTTP client read/write operations.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1395,6 +1423,7 @@ fn run_loop(ports: crate::PortConfig, mut cdc_mode: CdcMode) {
     // (Standalone only; the Bridged CDC worker carries its own).
     let mut cdc_drain_pending = false;
     while BackgroundWorker::wait_latch(Some(latch_interval())) {
+        report_stats();
         tick = tick.wrapping_add(1);
 
         if BackgroundWorker::sighup_received() {

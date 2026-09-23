@@ -96,6 +96,7 @@ pub fn run_cdc(slot_name: &str) {
     super::load_inbound_mappings();
 
     while BackgroundWorker::wait_latch(Some(super::latch_interval())) {
+        super::report_stats();
         tick = tick.wrapping_add(1);
 
         if BackgroundWorker::sighup_received() {
