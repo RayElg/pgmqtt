@@ -1717,6 +1717,11 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
     cb.filter_by_origin_cb = Some(pg_decode_filter_by_origin);
 }
 
+#[cfg(feature = "pg19")]
+use pg_sys::ReplOriginId as ReplicationOriginId;
+#[cfg(not(feature = "pg19"))]
+use pg_sys::RepOriginId as ReplicationOriginId;
+
 /// Skip decoding the workers' own WAL (message persistence, outbox and
 /// session bookkeeping): `pg_decode_change` would drop it by table name
 /// anyway, but this rejects it before reorder-buffer processing. The one
@@ -1731,7 +1736,7 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
 #[pg_guard]
 unsafe extern "C-unwind" fn pg_decode_filter_by_origin(
     _ctx: *mut pg_sys::LogicalDecodingContext,
-    origin_id: pg_sys::RepOriginId,
+    origin_id: ReplicationOriginId,
 ) -> bool {
     // 0 == InvalidRepOriginId (a #define, not in the generated bindings):
     // a record with no origin is an ordinary local write.
@@ -1894,22 +1899,22 @@ unsafe fn extract_columns(
 
     // ReorderBufferTupleBuf layout changed in PG 17: the `tuple` field was removed
     // and the HeapTupleData fields are now directly on the struct.
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     let heap_tuple_data = pg_sys::HeapTupleData {
         t_len: (*tuple).t_len,
         t_self: (*tuple).t_self,
         t_tableOid: (*tuple).t_tableOid,
         t_data: (*tuple).t_data,
     };
-    #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+    #[cfg(not(any(feature = "pg17", feature = "pg18", feature = "pg19")))]
     let heap_tuple_data = (*tuple).tuple;
 
     let heap_tuple = &heap_tuple_data;
 
     for i in 0..natts {
-        #[cfg(feature = "pg18")]
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
         let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
-        #[cfg(not(feature = "pg18"))]
+        #[cfg(not(any(feature = "pg18", feature = "pg19")))]
         let attr = &(*tupdesc).attrs.as_slice(natts)[i];
 
         // Skip dropped columns
