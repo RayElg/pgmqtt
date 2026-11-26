@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
 
 # Install cargo-pgrx
 # Using the specific version to match Cargo.toml
-RUN cargo install --locked cargo-pgrx --version 0.16.1
+RUN cargo install --locked cargo-pgrx --version 0.20.1
 
 # Initialize pgrx for Postgres 16 using the system installation
 # This avoids compiling Postgres from source
@@ -38,7 +38,7 @@ COPY extension/src ./src
 COPY extension/pgmqtt.control ./
 
 # Build the extension package
-RUN cargo pgrx package && \
+RUN cargo pgrx package --no-default-features --features pg16 --pg-config /usr/lib/postgresql/16/bin/pg_config && \
     mkdir -p /app/dist && \
     cp -r target/release/pgmqtt-pg16/* /app/dist/
 

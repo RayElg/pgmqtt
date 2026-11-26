@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-pgrx (must match Cargo.toml version)
-RUN cargo install --locked cargo-pgrx --version 0.16.1
+RUN cargo install --locked cargo-pgrx --version 0.20.1
 
 # Initialize pgrx for the target PG version using the system installation
 RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
